@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Установка ассистента на сервер (Ubuntu/Debian) и запуск как службы systemd.
+# Запускается автоматически из deploy.bat; вручную: bash install.sh
+set -e
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
+SERVICE=sometroy
+echo "==> Папка бота: $DIR"
+
+echo "==> Устанавливаю Python (если ещё нет)..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq python3 python3-venv python3-pip >/dev/null
+
+echo "==> Устанавливаю библиотеки бота..."
+python3 -m venv venv
+venv/bin/pip install -q --upgrade pip
+venv/bin/pip install -q -r requirements.txt
+
+if [ ! -f settings.env ]; then
+    echo "!! Нет файла settings.env — заполните его и запустите снова."
+    exit 1
+fi
+sed -i 's/\r$//' settings.env  # убираем виндовые переводы строк
+
+# Сертификат для программы на компьютере: создаётся один раз, на IP сервера
+PUBLIC_IP="${1:-$(hostname -I | awk '{print $1}')}"
+PORT="$(grep -E '^DESKTOP_PORT=' settings.env | cut -d= -f2)"; PORT="${PORT:-8443}"
+mkdir -p tls
+if [ ! -f tls/cert.pem ] || ! openssl x509 -in tls/cert.pem -noout -text | grep -q "IP Address:$PUBLIC_IP"; then
+    echo "==> Создаю сертификат для программы на компьютере (IP $PUBLIC_IP)..."
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 \
+        -keyout tls/key.pem -out tls/cert.pem -subj "/CN=Troy" \
+        -addext "subjectAltName=IP:$PUBLIC_IP" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+        -addext "extendedKeyUsage=serverAuth" 2>/dev/null
+    chmod 600 tls/key.pem
+fi
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+    ufw allow "$PORT/tcp" >/dev/null && echo "==> Открыл порт $PORT в ufw"
+fi
+
+echo "==> Проверяю ключи и доступ к сервисам..."
+venv/bin/python bot.py --check || echo "!! Проверка нашла проблемы (см. выше). Бот всё равно будет запущен."
+
+echo "==> Настраиваю автозапуск..."
+cat > /etc/systemd/system/$SERVICE.service <<EOF
+[Unit]
+Description=SomeTroy personal assistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=$DIR
+ExecStart="$DIR/venv/bin/python" "$DIR/bot.py"
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+MemoryMax=250M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable $SERVICE >/dev/null 2>&1
+systemctl restart $SERVICE
+sleep 6
+
+echo
+if systemctl is-active --quiet $SERVICE; then
+    echo "==> ГОТОВО: ассистент работает. Напишите ему в Telegram."
+else
+    echo "!! Бот не запустился. Последние строки лога:"
+fi
+echo "---------------- лог ----------------"
+journalctl -u $SERVICE -n 15 --no-pager -o cat || true
+echo "-------------------------------------"
+echo "Лог:          journalctl -u $SERVICE -f"
+echo "Перезапуск:   systemctl restart $SERVICE"
+echo "Память:       systemctl status $SERVICE"

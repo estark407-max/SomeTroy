@@ -32,7 +32,7 @@
 
 ## Статус
 
-🚧 В разработке. План — в [docs/PLAN.md](docs/PLAN.md).
+🚧 В разработке. Уже можно поставить вручную — [docs/INSTALL.md](docs/INSTALL.md). План — в [docs/PLAN.md](docs/PLAN.md).
 
 ## Авторы
 

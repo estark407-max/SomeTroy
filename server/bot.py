@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""Личный ассистент в Telegram на Groq.
+
+Понимает текст, голосовые, фото и PDF. Ставит напоминания (сам пишет в нужное время),
+ищет в интернете, записывает идеи по проектам в приватный репозиторий GitHub.
+Отвечает только владельцу (ALLOWED_USER_ID).
+
+Запуск:
+    python bot.py          # работает постоянно
+    python bot.py --check  # проверить ключи и доступ к Telegram, Groq, GitHub
+"""
+import argparse
+import base64
+import calendar
+import hashlib
+import hmac
+import json
+import logging
+import os
+import re
+import random
+import secrets
+import sqlite3
+import subprocess
+import threading
+import time
+from contextlib import closing
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+from dotenv import load_dotenv
+
+import bitrix
+import desktop_api
+
+BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / "settings.env")
+
+
+def env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+TELEGRAM_TOKEN = env("TELEGRAM_TOKEN")
+TELEGRAM_PROXY = env("TELEGRAM_PROXY")
+ALLOWED_USER_ID = env("ALLOWED_USER_ID")
+USER_NAME = env("USER_NAME")
+BOT_NAME = env("BOT_NAME", "Трой")
+
+GROQ_API_KEY = env("GROQ_API_KEY")
+GROQ_MODEL = env("GROQ_MODEL", "qwen/qwen3.8-27b")                  # понимает картинки и функции
+GROQ_FALLBACK_MODEL = env("GROQ_FALLBACK_MODEL", "openai/gpt-oss-120b")
+GROQ_SEARCH_MODEL = env("GROQ_SEARCH_MODEL", "openai/gpt-oss-120b")  # со встроенным поиском в интернете
+GROQ_STT_MODEL = env("GROQ_STT_MODEL", "whisper-large-v3-turbo")     # распознавание голосовых
+GROQ_PROXY = env("GROQ_PROXY")
+# Цепочка моделей: у каждой модели Groq свой лимит, упёрлась одна — берём следующую
+GROQ_MODELS = [m.strip() for m in env(
+    "GROQ_MODELS", f"{GROQ_MODEL},{GROQ_FALLBACK_MODEL},llama-3.3-70b-versatile,openai/gpt-oss-20b").split(",") if m.strip()]
+GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))
+VISION_MODELS = {m.strip() for m in env("VISION_MODELS", "qwen/qwen3.8-27b,mistral-small-latest").split(",")}
+# Запасной провайдер — Mistral (бесплатный режим без карты). Пусто — не используется
+MISTRAL_API_KEY = env("MISTRAL_API_KEY")
+MISTRAL_MODEL = env("MISTRAL_MODEL", "mistral-small-latest")
+
+GITHUB_TOKEN = env("GITHUB_TOKEN")
+GITHUB_REPO = env("GITHUB_REPO")          # владелец/репозиторий
+GITHUB_BRANCH = env("GITHUB_BRANCH", "main")
+
+BITRIX_WEBHOOK = env("BITRIX_WEBHOOK")    # https://портал.bitrix24.ru/rest/1/xxxxxxxx/
+
+DESKTOP_PORT = int(env("DESKTOP_PORT", "8443"))
+
+TZ_NAME = env("TIMEZONE", "Europe/Moscow")
+TZ = ZoneInfo(TZ_NAME)
+HISTORY_MESSAGES = int(env("HISTORY_MESSAGES", "10"))
+HISTORY_CHARS = int(env("HISTORY_CHARS", "500"))     # длинные старые ответы в истории обрезаем — экономим лимит
+
+DB_FILE = BASE / "assistant.db"
+TLS_DIR = BASE / "tls"
+LOCAL_IDEAS_DIR = BASE / "ideas"           # если GitHub не настроен
+MAX_FILE_MB = 19                           # Telegram отдаёт ботам файлы до 20 МБ
+
+log = logging.getLogger("assistant")
+
+WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+REPEATS = ["none", "daily", "weekdays", "weekly", "monthly", "yearly"]
+REPEAT_RU = {"none": "", "daily": "каждый день", "weekdays": "по будням", "weekly": "каждую неделю",
+             "monthly": "каждый месяц", "yearly": "каждый год"}
+
+
+def make_session(proxy: str = "") -> requests.Session:
+    s = requests.Session()
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    s.headers["User-Agent"] = "sometroy/0.1"
+    return s
+
+
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def fmt_dt(dt: datetime) -> str:
+    return f"{dt:%d.%m.%Y %H:%M}, {WEEKDAYS[dt.weekday()]}"
+
+
+def split_text(text: str, limit: int = 4000) -> List[str]:
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text.strip():
+        chunks.append(text)
+    return chunks or ["…"]
+
+
+# ───────────────────────── Telegram ─────────────────────────
+
+class TelegramError(RuntimeError):
+    def __init__(self, method: str, code, description: Optional[str]):
+        self.code = code
+        self.description = description or ""
+        super().__init__(f"Telegram {method}: {code} {self.description}")
+
+
+class Telegram:
+    def __init__(self, token: str):
+        self.token = token
+        self.api = f"https://api.telegram.org/bot{token}/"
+        self.s = make_session(TELEGRAM_PROXY)
+
+    def call(self, method: str, timeout: int = 60, **kwargs):
+        for _ in range(5):
+            r = self.s.post(self.api + method, timeout=timeout, **kwargs)
+            try:
+                data = r.json()
+            except ValueError:
+                raise TelegramError(method, r.status_code, f"HTTP {r.status_code}")
+            if data.get("ok"):
+                return data["result"]
+            retry = data.get("parameters", {}).get("retry_after")
+            if r.status_code == 429 and retry:
+                time.sleep(retry + 1)
+                continue
+            raise TelegramError(method, data.get("error_code", r.status_code), data.get("description"))
+        raise TelegramError(method, 429, "слишком много повторов")
+
+    def send(self, chat_id: str, text: str, buttons: Optional[list] = None) -> None:
+        # Без parse_mode: модель может прислать любые символы, и Telegram не споткнётся о разметку
+        chunks = split_text(text)
+        for i, chunk in enumerate(chunks):
+            data = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": "true"}
+            if buttons and i == len(chunks) - 1:
+                data["reply_markup"] = json.dumps({"inline_keyboard": buttons}, ensure_ascii=False)
+            self.call("sendMessage", data=data)
+
+    def typing(self, chat_id: str) -> None:
+        try:
+            self.call("sendChatAction", timeout=10, data={"chat_id": chat_id, "action": "typing"})
+        except Exception:
+            pass
+
+    def download(self, file_id: str) -> bytes:
+        info = self.call("getFile", data={"file_id": file_id})
+        r = self.s.get(f"https://api.telegram.org/file/bot{self.token}/{info['file_path']}", timeout=120)
+        r.raise_for_status()
+        return r.content
+
+
+class KeepTyping:
+    """Показывает «печатает…», пока бот думает (Telegram гасит статус через 5 секунд)."""
+
+    def __init__(self, tg: Telegram, chat_id: str):
+        self.tg, self.chat_id, self.stop = tg, chat_id, threading.Event()
+
+    def __enter__(self):
+        def loop():
+            while not self.stop.is_set():
+                self.tg.typing(self.chat_id)
+                self.stop.wait(4.5)
+        threading.Thread(target=loop, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+
+
+# ───────────────────────── База: напоминания и история ─────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS reminders (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    due     INTEGER NOT NULL,
+    text    TEXT NOT NULL,
+    repeat  TEXT NOT NULL DEFAULT 'none',
+    active  INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_sessions (
+    token_hash TEXT PRIMARY KEY,
+    device     TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    created    INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pc_commands (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    device  TEXT,
+    action  TEXT NOT NULL,
+    arg     TEXT NOT NULL DEFAULT '',
+    choices TEXT NOT NULL DEFAULT '',
+    status  TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    result  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS history (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    role    TEXT NOT NULL,
+    text    TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+);
+"""
+
+
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_FILE, timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db() -> None:
+    with closing(db()) as con, con:
+        con.executescript(SCHEMA)
+        # старые обмены «открой X» → «Выбери компьютер.» учили модель отвечать без вызова функции — убираем их
+        con.execute("DELETE FROM history WHERE id IN (SELECT h.id + 0 FROM history h WHERE h.role = 'assistant' AND "
+                    "(h.text LIKE 'Выбери компьютер%' OR h.text LIKE 'Есть: %') UNION "
+                    "SELECT h.id - 1 FROM history h WHERE h.role = 'assistant' AND "
+                    "(h.text LIKE 'Выбери компьютер%' OR h.text LIKE 'Есть: %'))")
+
+
+def add_history(chat_id: str, role: str, text: str) -> None:
+    with closing(db()) as con, con:
+        con.execute("INSERT INTO history(chat_id, role, text, ts) VALUES (?,?,?,?)",
+                    (chat_id, role, text, int(time.time())))
+        con.execute("DELETE FROM history WHERE chat_id=? AND id NOT IN "
+                    "(SELECT id FROM history WHERE chat_id=? ORDER BY id DESC LIMIT 200)", (chat_id, chat_id))
+
+
+def get_history(chat_id: str) -> list:
+    with closing(db()) as con:
+        rows = con.execute("SELECT role, text FROM history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                           (chat_id, HISTORY_MESSAGES)).fetchall()
+    rows = list(reversed(rows))
+    while rows and rows[0]["role"] not in ("user", "pc_user"):   # разговор должен начинаться с пользователя
+        rows.pop(0)
+    def cut(t: str) -> str:
+        return t if len(t) <= HISTORY_CHARS else t[:HISTORY_CHARS] + "…"
+    out: list = []
+    for r in rows:
+        role, text = r["role"], r["text"]
+        if role == "pc_reply":       # не «Выбери компьютер.» — иначе модель повторяет эту фразу без вызова функции
+            text = "[передал команду компьютеру через pc_command]"
+        elif role == "pc_result":
+            text = f"[результат с компьютера: {text}]"
+        role = "user" if role in ("user", "pc_user") else "assistant"
+        if out and out[-1]["role"] == role:                       # подряд два ответа — склеиваем
+            out[-1]["content"] += "\n" + cut(text)
+        else:
+            out.append({"role": role, "content": cut(text)})
+    return out
+
+
+def clear_history(chat_id: str) -> None:
+    with closing(db()) as con, con:
+        con.execute("DELETE FROM history WHERE chat_id=?", (chat_id,))
+
+
+def parse_when(when: str) -> datetime:
+    when = when.strip().replace("T", " ")
+    for f in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(when[:19], f)
+            if f == "%Y-%m-%d":
+                dt = dt.replace(hour=9)
+            return dt.replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    raise ValueError(f"не понял время «{when}», нужен формат ГГГГ-ММ-ДД ЧЧ:ММ")
+
+
+def next_due(dt: datetime, repeat: str) -> Optional[datetime]:
+    if repeat == "daily":
+        return dt + timedelta(days=1)
+    if repeat == "weekdays":
+        n = dt + timedelta(days=1)
+        while n.weekday() >= 5:
+            n += timedelta(days=1)
+        return n
+    if repeat == "weekly":
+        return dt + timedelta(weeks=1)
+    if repeat == "monthly":
+        y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+        return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
+    if repeat == "yearly":
+        y = dt.year + 1
+        return dt.replace(year=y, day=min(dt.day, calendar.monthrange(y, dt.month)[1]))
+    return None
+
+
+def add_reminder(chat_id: str, when: str, text: str, repeat: str = "none") -> str:
+    repeat = repeat if repeat in REPEATS else "none"
+    dt = parse_when(when)
+    if dt <= now_local() and repeat == "none":
+        return f"Ошибка: {fmt_dt(dt)} уже прошло. Уточни время."
+    while dt <= now_local():
+        dt = next_due(dt, repeat)
+    with closing(db()) as con, con:
+        cur = con.execute("INSERT INTO reminders(chat_id, due, text, repeat) VALUES (?,?,?,?)",
+                          (chat_id, int(dt.timestamp()), text, repeat))
+    rep = f" ({REPEAT_RU[repeat]})" if repeat != "none" else ""
+    return f"Напоминание №{cur.lastrowid} поставлено на {fmt_dt(dt)}{rep}: {text}"
+
+
+def list_reminders(chat_id: str) -> str:
+    with closing(db()) as con:
+        rows = con.execute("SELECT * FROM reminders WHERE chat_id=? AND active=1 ORDER BY due",
+                           (chat_id,)).fetchall()
+    if not rows:
+        return "Активных напоминаний нет."
+    lines = []
+    for r in rows:
+        rep = f" ({REPEAT_RU[r['repeat']]})" if r["repeat"] != "none" else ""
+        lines.append(f"№{r['id']} — {fmt_dt(datetime.fromtimestamp(r['due'], TZ))}{rep}: {r['text']}")
+    return "\n".join(lines)
+
+
+def delete_reminder(chat_id: str, rid: int) -> str:
+    with closing(db()) as con, con:
+        cur = con.execute("UPDATE reminders SET active=0 WHERE id=? AND chat_id=? AND active=1", (rid, chat_id))
+    return f"Напоминание №{rid} удалено." if cur.rowcount else f"Напоминания №{rid} нет среди активных."
+
+
+EVENTS: list = []                  # напоминания для программы на компьютере: {"id", "ts", "text"}
+EVENTS_LOCK = threading.Lock()
+
+
+def push_event(text: str) -> None:
+    with EVENTS_LOCK:
+        EVENTS.append({"id": (EVENTS[-1]["id"] + 1) if EVENTS else 1, "ts": int(time.time()), "text": text})
+        del EVENTS[:-100]
+
+
+def events_after(after: int) -> list:
+    with EVENTS_LOCK:
+        return [e for e in EVENTS if e["id"] > after]
+
+
+def reminder_loop(stop: threading.Event) -> None:
+    tg = Telegram(TELEGRAM_TOKEN)   # своя сессия: requests.Session не любит несколько потоков
+    pushed: set = set()
+    while not stop.is_set():
+        try:
+            now = int(time.time())
+            with closing(db()) as con:
+                rows = con.execute("SELECT * FROM reminders WHERE active=1 AND due<=?", (now,)).fetchall()
+            for r in rows:
+                if r["chat_id"] == ALLOWED_USER_ID and (r["id"], r["due"]) not in pushed:
+                    pushed.add((r["id"], r["due"]))   # на компьютер — один раз, даже если Telegram недоступен
+                    push_event(f"⏰ {r['text']}")
+                try:
+                    tg.send(r["chat_id"], f"⏰ {r['text']}")
+                except requests.RequestException as e:
+                    log.warning("Нет связи с Telegram, напоминание №%s отправлю позже: %s", r["id"], e)
+                    continue
+                except TelegramError as e:
+                    log.error("Не отправил напоминание №%s: %s", r["id"], e)
+                nxt = next_due(datetime.fromtimestamp(r["due"], TZ), r["repeat"])
+                while nxt and nxt.timestamp() <= now:   # пропущенные (бот был выключен) не дублируем
+                    nxt = next_due(nxt, r["repeat"])
+                with closing(db()) as con, con:
+                    if nxt:
+                        con.execute("UPDATE reminders SET due=? WHERE id=?", (int(nxt.timestamp()), r["id"]))
+                    else:
+                        con.execute("UPDATE reminders SET active=0 WHERE id=?", (r["id"],))
+        except Exception:
+            log.exception("Ошибка в цикле напоминаний")
+        stop.wait(15)
+
+
+# ───────────────────────── Идеи (GitHub или локальная папка) ─────────────────────────
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9а-яё]+", "-", name.strip().lower()).strip("-")
+    return s[:60] or "inbox"
+
+
+class Ideas:
+    def __init__(self):
+        self.github = bool(GITHUB_TOKEN and GITHUB_REPO)
+        self.s = make_session()
+        if self.github:
+            self.s.headers.update({"Authorization": f"Bearer {GITHUB_TOKEN}",
+                                   "Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28"})
+        self._projects: List[str] = []
+        self._projects_at = 0.0
+
+    def _url(self, path: str) -> str:
+        return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    def _get(self, path: str):
+        """(текст, sha) или (None, None), если файла нет."""
+        if not self.github:
+            p = LOCAL_IDEAS_DIR / path
+            return (p.read_text(encoding="utf-8"), None) if p.exists() else (None, None)
+        r = self.s.get(self._url(path), params={"ref": GITHUB_BRANCH}, timeout=30)
+        if r.status_code == 404:
+            return None, None
+        r.raise_for_status()
+        data = r.json()
+        return base64.b64decode(data["content"]).decode("utf-8"), data["sha"]
+
+    def _put(self, path: str, text: str, sha: Optional[str], message: str) -> None:
+        if not self.github:
+            p = LOCAL_IDEAS_DIR / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            return
+        body = {"message": message, "branch": GITHUB_BRANCH,
+                "content": base64.b64encode(text.encode("utf-8")).decode()}
+        if sha:
+            body["sha"] = sha
+        r = self.s.put(self._url(path), json=body, timeout=30)
+        if r.status_code == 409:
+            raise RuntimeError("conflict")
+        r.raise_for_status()
+
+    def projects(self) -> List[str]:
+        if time.time() - self._projects_at < 600:
+            return self._projects
+        try:
+            if self.github:
+                r = self.s.get(self._url("projects"), params={"ref": GITHUB_BRANCH}, timeout=30)
+                items = r.json() if r.status_code == 200 else []
+                names = [i["name"] for i in items if isinstance(i, dict) and i.get("name", "").endswith(".md")]
+            else:
+                d = LOCAL_IDEAS_DIR / "projects"
+                names = [p.name for p in d.glob("*.md")] if d.exists() else []
+            self._projects = sorted(n[:-3] for n in names)
+            self._projects_at = time.time()
+        except Exception as e:
+            log.warning("Не получил список проектов: %s", e)
+        return self._projects
+
+    def save(self, project: str, text: str) -> str:
+        slug = slugify(project)
+        path = f"projects/{slug}.md"
+        stamp = now_local().strftime("%Y-%m-%d %H:%M")
+        for attempt in range(3):
+            content, sha = self._get(path)
+            if content is None:
+                content = f"# {project.strip() or slug}\n\n"
+            if not content.endswith("\n"):
+                content += "\n"
+            content += f"- {stamp} — {text.strip()}\n"
+            try:
+                self._put(path, content, sha, f"Идея: {slug}")
+                break
+            except RuntimeError:   # файл успели изменить — перечитываем
+                time.sleep(1)
+        else:
+            return "Ошибка: не удалось записать идею, попробуй ещё раз."
+        self._projects_at = 0
+        where = "в GitHub" if self.github else "на сервере"
+        return f"Записано {where} в проект «{slug}»."
+
+    def read(self, project: str) -> str:
+        content, _ = self._get(f"projects/{slugify(project)}.md")
+        if content is None:
+            return f"Проекта «{slugify(project)}» пока нет. Есть: {', '.join(self.projects()) or 'ничего'}."
+        return content[-6000:]
+
+
+# ───────────────────────── Groq ─────────────────────────
+
+class LLMError(RuntimeError):
+    def __init__(self, status: int, message: str, provider: str = "Groq"):
+        self.status = status
+        self.text = message
+        super().__init__(f"{provider} {status}: {message}")
+
+
+class Groq:
+    API = "https://api.groq.com/openai/v1/"
+    NAME = "Groq"
+    MAX_TOKENS_FIELD = "max_completion_tokens"
+
+    def __init__(self, key: str = "", proxy: str = ""):
+        self.s = make_session(proxy or GROQ_PROXY)
+        self.s.headers["Authorization"] = f"Bearer {key or GROQ_API_KEY}"
+
+    def _raise(self, r: requests.Response):
+        try:
+            msg = r.json().get("error", {})
+            msg = msg.get("message", r.text[:300]) if isinstance(msg, dict) else (r.json().get("message") or r.text[:300])
+        except ValueError:
+            msg = r.text[:300]
+        raise LLMError(r.status_code, msg, self.NAME)
+
+    def prepare(self, messages: list) -> list:
+        return messages
+
+    def chat(self, model: str, messages: list, tools: Optional[list] = None, **extra) -> dict:
+        body = {"model": model, "messages": self.prepare(messages), "temperature": 0.4,
+                self.MAX_TOKENS_FIELD: 2048, **extra}
+        if tools:
+            body["tools"] = tools
+        for attempt in range(2):
+            r = self.s.post(self.API + "chat/completions", json=body, timeout=180)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]
+            if r.status_code in (500, 502, 503) and attempt == 0:
+                time.sleep(3)
+                continue
+            self._raise(r)
+        raise LLMError(503, "сервис недоступен")
+
+    def transcribe(self, audio: bytes, filename: str) -> str:
+        r = self.s.post(self.API + "audio/transcriptions", timeout=180,
+                        data={"model": GROQ_STT_MODEL, "language": "ru", "response_format": "json"},
+                        files={"file": (filename, audio)})
+        if r.status_code != 200:
+            self._raise(r)
+        return (r.json().get("text") or "").strip()
+
+    def models(self) -> List[str]:
+        r = self.s.get(self.API + "models", timeout=30)
+        if r.status_code != 200:
+            self._raise(r)
+        return [m["id"] for m in r.json().get("data", [])]
+
+
+class Mistral(Groq):
+    """Запасной провайдер: тот же формат запросов (как у OpenAI)."""
+    API = "https://api.mistral.ai/v1/"
+    NAME = "Mistral"
+    MAX_TOKENS_FIELD = "max_tokens"
+
+    def __init__(self):
+        super().__init__(MISTRAL_API_KEY, GROQ_PROXY)
+
+    def prepare(self, messages: list) -> list:
+        out = []
+        for m in messages:
+            if isinstance(m.get("content"), list):   # картинка у Mistral — строкой
+                m = {**m, "content": [{"type": "image_url", "image_url": p["image_url"]["url"]}
+                                      if p.get("type") == "image_url" else p for p in m["content"]]}
+            out.append(m)
+        return out
+
+
+RETRY_RE = re.compile(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", re.I)
+
+
+class Router:
+    """Выбор модели: по очереди Groq-модели, затем Mistral; помнит, какая модель «на перерыве»."""
+
+    def __init__(self, groq: Groq):
+        self.groq = groq
+        self.mistral = Mistral() if MISTRAL_API_KEY else None
+        self.cool: dict = {}        # модель -> до какого времени не трогать
+        self.last: Optional[tuple] = None   # (провайдер, модель, время) — кто отвечал последним
+        self.errors: dict = {}              # модель -> (время, код, текст) последней ошибки
+
+    def chain(self) -> list:
+        items = [(self.groq, m) for m in GROQ_MODELS]
+        if self.mistral:
+            items.append((self.mistral, MISTRAL_MODEL))
+        return items
+
+    def candidates(self, vision: bool, skip: set) -> list:
+        now = time.time()
+        free = [(p, m) for p, m in self.chain() if self.cool.get(m, 0) <= now and m not in skip]
+        if vision:   # с картинкой — сначала модели, которые видят
+            free.sort(key=lambda pm: pm[1] not in VISION_MODELS)
+        return free
+
+    def status(self) -> str:
+        now = time.time()
+        lines = []
+        for p, m in self.chain():
+            left = self.cool.get(m, 0) - now
+            state = "свободна" if left <= 0 else (f"перерыв ещё {int(left // 60)} мин" if left >= 60
+                                                  else f"перерыв ещё {int(left)} с")
+            lines.append(f"- {getattr(p, 'NAME', '')} {m}: {state}")
+            if m in self.errors and now - self.errors[m][0] < 6 * 3600:
+                t, code, text = self.errors[m]
+                lines.append(f"    последняя ошибка {datetime.fromtimestamp(t, TZ):%H:%M}: {code} {text}")
+        if not self.mistral:
+            lines.append("- Mistral: не подключён (нет MISTRAL_API_KEY)")
+        last = (f"Последним отвечал: {self.last[0]} {self.last[1]} в "
+                f"{datetime.fromtimestamp(self.last[2], TZ):%H:%M}") if self.last else "С запуска ещё никто не отвечал."
+        return "Модели Троя (по порядку):\n" + "\n".join(lines) + "\n\n" + last + "\n\n" + pcs_status()
+
+    def describe(self, provider, model) -> str:
+        names = ", ".join(f"{getattr(p, 'NAME', '')} {m}" for p, m in self.chain())
+        return (f"\n\nО себе (если спросят): ты — {BOT_NAME}, ассистент, который по очереди использует модели: {names}. "
+                f"Этот ответ пишет {getattr(provider, 'NAME', '')} {model}. Если модель упирается в бесплатный лимит, "
+                f"{BOT_NAME} автоматически переключается на следующую.")
+
+    def wait_hint(self) -> int:
+        now = time.time()
+        waits = [max(0, self.cool.get(m, 0) - now) for _, m in self.chain()]
+        return int(min(waits)) if waits else 60
+
+    def penalize(self, model: str, e: LLMError) -> None:
+        self.errors[model] = (time.time(), e.status, (e.text or "")[:140])
+        if e.status == 429:
+            m = RETRY_RE.search(e.text or "")
+            sec = 60.0
+            if m and any(m.groups()):
+                sec = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0) + 2
+            if "per day" in (e.text or "") or "TPD" in (e.text or "") or "RPD" in (e.text or ""):
+                sec = max(sec, 600)
+            self.cool[model] = time.time() + sec
+            log.warning("%s на перерыве %d с: %s", model, sec, (e.text or "")[:120])
+        elif e.status in (500, 502, 503):
+            self.cool[model] = time.time() + 30
+
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def clean_answer(text: Optional[str]) -> str:
+    return THINK_RE.sub("", text or "").strip()
+
+
+def pdf_text(data: bytes) -> str:
+    from io import BytesIO
+    from pypdf import PdfReader
+    reader = PdfReader(BytesIO(data))
+    text = "\n".join((p.extract_text() or "") for p in reader.pages[:30]).strip()
+    return text[:30000]
+
+
+def fn(name: str, description: str, props: Optional[dict] = None, required: Optional[list] = None) -> dict:
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": props or {}, "required": required or []}}}
+
+
+TOOLS = [
+    fn("create_reminder", "Поставить напоминание. Бот сам пришлёт сообщение в указанное время.", {
+        "when": {"type": "string", "description": "Местное время срабатывания, формат ГГГГ-ММ-ДД ЧЧ:ММ"},
+        "text": {"type": "string", "description": "Что напомнить, коротко, от второго лица"},
+        "repeat": {"type": "string", "enum": REPEATS,
+                   "description": "Повтор: none — один раз, daily, weekdays (пн–пт), weekly, monthly, yearly"}},
+       ["when", "text"]),
+    fn("list_reminders", "Показать активные напоминания с номерами."),
+    fn("delete_reminder", "Удалить напоминание по номеру.", {"id": {"type": "integer"}}, ["id"]),
+    fn("save_idea", "Записать идею или заметку в файл проекта (его потом читает Claude на рабочих сессиях).", {
+        "project": {"type": "string",
+                    "description": "Имя проекта латиницей через дефис (как в списке существующих) или inbox"},
+        "text": {"type": "string", "description": "Идея словами пользователя, без потери деталей"}},
+       ["project", "text"]),
+    fn("read_ideas", "Прочитать записанные идеи проекта.", {"project": {"type": "string"}}, ["project"]),
+    fn("web_search", "Поиск в интернете: цены, где купить, адреса, часы работы, расписания, новости, курсы, "
+                     "погода и всё, что могло измениться.",
+       {"query": {"type": "string", "description": "Подробный поисковый запрос с городом/страной, если важно"}},
+       ["query"]),
+]
+
+BITRIX_TOOLS = [fn(*t) for t in bitrix.TOOLS]
+PC_ACTIONS = {"shutdown": "выключить компьютер", "restart": "перезагрузить компьютер", "sleep": "отправить в сон",
+              "lock": "заблокировать экран", "open_app": "открыть", "close_app": "закрыть",
+              "play_pause": "пауза / продолжить", "next_track": "следующий трек", "prev_track": "предыдущий трек",
+              "volume_up": "громче", "volume_down": "тише", "mute": "выключить / включить звук",
+              "find_app": "найти программу"}
+PC_CONFIRM = {"shutdown", "restart"}
+PC_TOOL = fn("pc_command", "Управление компьютером, где запущена программа Трой: питание, открыть/закрыть программу, "
+                           "музыка и громкость. shutdown и restart — ТОЛЬКО после «да» пользователя.", {
+    "action": {"type": "string", "enum": [a for a in PC_ACTIONS if a != "find_app"]},
+    "app": {"type": "string", "description": "для open_app/close_app: название программы как в меню Пуск "
+                                             "(Telegram, Google Chrome, Блокнот, Word, Steam…)"},
+    "device": {"type": "string", "description": "имя компьютера, только если пользователь назвал его явно"}},
+    ["action"])
+# Пасхалка: Трой назван в честь Троя Маклюра из «Симпсонов» — и представляется так же
+WHO_RE = re.compile(r"^\s*(?:\S+[,!]\s*)?(?:кто ты|ты кто|кто ты такой|ты кто такой|представься|представьтесь|"
+                    r"как тебя зовут|расскажи о себе|who are you)\s*[?!.]*\s*$", re.I)
+MCCLURE_FILMS = [
+    "«Напоминание на завтра в 9:00»", "«Где купить термопасту подешевле»", "«Выключи комп, я спать»",
+    "«Погода на выходные»", "«Задача в Битриксе до понедельника»", "«Следующий трек»",
+    "«Идея для проекта, записанная в 3 часа ночи»", "«Открой хром и Яндекс Музыку»",
+    "«Сколько сделок закрыли в октябре»", "«Заблокируй комп, я отошёл»", "«Перезагрузить? Ответь „да“»",
+    "«Голосовое на ходу»", "«Пароль для приложения»", "«Выбери компьютер»",
+]
+
+
+def mcclure(text: str) -> Optional[str]:
+    """«Кто ты?» → «Привет, я Трой! Возможно, вы помните меня по таким фильмам, как …»"""
+    text = re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I)
+    if not WHO_RE.match(text.replace("ё", "е").replace("Ё", "Е")):
+        return None
+    a, b = random.sample(MCCLURE_FILMS, 2)
+    return (f"Привет, я {BOT_NAME}! Возможно, вы помните меня по таким фильмам, как {a} и {b}.\n\n"
+            "Я твой помощник: напоминания, поиск, идеи для проектов"
+            + (", Битрикс24" if BITRIX_WEBHOOK else "") + (", котёл" if BOILER_ON else "")
+            + " и управление компьютерами — текстом и голосом.")
+
+
+# Котёл: только чтение — из автоматики котла (/opt/boiler-auto) на этом же сервере
+BOILER_DIR = os.getenv("BOILER_DIR", "/opt/boiler-auto")   # модуль для котлов DM350 с автоматикой boiler-auto
+BOILER_TOOL = fn("boiler_info", "Котёл (только чтение): status — работает ли, теплоноситель, уставка, топливо в "
+                                "бункере, улица, режим отопления, погодная автоматика; loads — загрузки бункера "
+                                "(мешки, кг, деньги) за период.", {
+    "what": {"type": "string", "enum": ["status", "loads"]},
+    "date_from": {"type": "string", "description": "для loads: с какой даты, YYYY-MM-DD"},
+    "date_to": {"type": "string", "description": "для loads: по какую дату включительно, YYYY-MM-DD"}},
+    ["what"])
+BOILER_ON = os.path.exists(os.path.join(BOILER_DIR, "boiler_auto.py"))
+BOILER_HINT_RE = re.compile(r"кот[её]л|котл|бункер|мешк|топлив|теплонос|уставк|отоплен|батаре", re.I)
+BOILER_RULES = """
+- Котёл: boiler_info. Только смотришь — управлять котлом ты не можешь (для этого приложение «КотелТройка»).
+  «Как котёл», «работает ли», «сколько топлива» — what=status. «Сколько мешков / потратили на топливо за …» —
+  what=loads с датами периода. Отвечай коротко, суммы с разделителями тысяч."""
+# Читаем данные котла, запуская его же код отдельным процессом. Запись в его файлы отключена,
+# поэтому Трой ничего не может изменить в автоматике котла.
+_BOILER_SCRIPT = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import boiler_auto as b
+mem = {}
+def no_write(path, data):
+    if path == b.STATE_FILE and isinstance(data, dict) and data.get("token"):
+        mem["token"] = data["token"]
+b.write_json = no_write
+_load = b.load_state
+b.load_state = lambda: dict(_load(), **({"token": mem["token"]} if mem.get("token") else {}))
+what, frm, to = sys.argv[2], sys.argv[3] or None, sys.argv[4] or None
+out = b.report_text() if what == "status" else b.loads_period(frm, to)
+print(json.dumps(out, ensure_ascii=False))
+"""
+
+
+def boiler_info(what: str, frm: str = "", to: str = "") -> str:
+    if not os.path.exists(os.path.join(BOILER_DIR, "boiler_auto.py")):
+        return "Автоматика котла на сервере не найдена."
+    for d in (frm, to):
+        if d and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            return "Ошибка: даты в виде YYYY-MM-DD."
+    try:
+        r = subprocess.run(["/usr/bin/env", "python3", "-B", "-c", _BOILER_SCRIPT, BOILER_DIR, what, frm or "", to or ""],
+                           cwd=BOILER_DIR, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "Котёл не ответил за минуту — сервер котла, видимо, недоступен."
+    if r.returncode != 0:
+        log.warning("Котёл: %s", r.stderr[-500:])
+        return "Не получилось прочитать данные котла."
+    data = json.loads(r.stdout.strip().splitlines()[-1])
+    if what == "status":
+        return data
+    s = data.get("summary") or {}
+    lines = [f"Загрузки бункера {frm or 'с начала учёта'} — {to or 'сегодня'}: загрузок {s.get('count', 0)}, "
+             f"{s.get('bags', 0)} мешков, {s.get('kg', 0)} кг, {s.get('cost', 0)} ₽."]
+    for i in (data.get("items") or [])[:15]:
+        lines.append(f"- {i.get('date')}: {i.get('count')} × {i.get('weight')} кг, {i.get('cost')} ₽")
+    if len(data.get("items") or []) > 15:
+        lines.append(f"…и ещё {len(data['items']) - 15}")
+    return "\n".join(lines)
+
+
+# прямое поручение компьютеру — модель обязана вызвать pc_command, а не просто ответить
+PC_ORDER_RE = re.compile(r"\b(?:открой|запусти|включи|закрой|выключи|перезагрузи|усыпи|заблокируй|переключи|"
+                         r"поставь на паузу|пауза|громче|тише|следующ\w*|предыдущ\w*)\b", re.I)
+PC_HINT_RE = re.compile(r"компьют|браузер|хром|chrome|edge|\bкомп\b|\bпк\b|ноут|выключ|перезагр|усып|\bсон\b|спящ|блокир|открой|запусти|"
+                        r"закрой|трек|песн|музык|громк|громч|тише|тиш[ео]|пауз|звук|плеер|прилож|программ|диспетчер", re.I)
+# Простые команды компьютеру понимаем сами, без модели: надёжно, мгновенно и без расхода лимитов
+_PC_OBJ = r"(?:\s+(?:мой\s+|этот\s+)?(?:комп\w*|пк|ноут\w*|экран|систему))?"
+PC_FAST = [
+    (re.compile(r"^(?:выключи|выключить|выруби|отключи)\s+(?:мой\s+|этот\s+)?(?:комп\w*|пк|ноут\w*)$"), "shutdown", None),
+    (re.compile(r"^(?:перезагрузи|перезагрузить|перезапусти|ребутни|рестартни)" + _PC_OBJ + "$"), "restart", None),
+    (re.compile(r"^(?:заблокируй|заблокировать|блокируй|блокировка|залочь)" + _PC_OBJ + "$"), "lock", None),
+    (re.compile(r"^(?:усыпи|усыпить|в сон|спать|спящий режим|отправь в сон|переведи в сон|отправь" + _PC_OBJ +
+                r"\s+в сон|переведи" + _PC_OBJ + r"\s+в сон)" + _PC_OBJ + "$"), "sleep", None),
+    (re.compile(r"^(?:выключи|отключи|убери|вырубай|выруби)\s+звук$|^(?:без звука|заглуши(?:\s+звук)?|включи звук|"
+                r"верни звук|мьют|mute)$"), "mute", None),
+    (re.compile(r"^(?:следующ\w*|дальше|некст|next|скипни|пропусти)(?:\s+(?:трек|песн\w*|композици\w*|музык\w*))?$|"
+                r"^(?:переключи|смени)\s+(?:трек|песн\w*|композици\w*)$"), "next_track", None),
+    (re.compile(r"^(?:предыдущ\w*|прошл\w*|верни|назад)(?:\s+(?:трек|песн\w*|композици\w*))?$"), "prev_track", None),
+    (re.compile(r"^(?:пауза|на паузу|поставь на паузу|продолжи(?:ть)?(?:\s+музык\w*)?|плей|play|стоп|"
+                r"(?:останови|выключи|включи|поставь)\s+музык\w*|воспроизвед\w*)$"), "play_pause", None),
+    (re.compile(r"^(?:громче|погромче|ещ[её] громче|прибавь(?:\s+(?:звук|громкость))?|увеличь\s+громкость|"
+                r"сделай\s+(?:по)?громче)$"), "volume_up", None),
+    (re.compile(r"^(?:тише|потише|ещ[её] тише|убавь(?:\s+(?:звук|громкость))?|уменьши\s+громкость|"
+                r"сделай\s+(?:по)?тише)$"), "volume_down", None),
+    (re.compile(r"^(?:открой|запусти|включи|открыть|запустить)\s+(?!сайт|ссылк|страниц|файл|папк)(.{2,40})$"), "open_app", 1),
+    (re.compile(r"^(?:закрой|закрыть|заверши|завершить|выключи|вырубай|выруби)\s+(?!комп|пк|ноут|звук)(.{2,40})$"),
+     "close_app", 1),
+]
+
+
+# как латинская буква может прозвучать или быть написана по-русски: «office-pc» = «офис пс» = «оффис пк»
+_SOUNDS = {"a": "аэе", "b": "б", "c": "кцс", "d": "д", "e": "еэи", "f": "ф", "g": "гж", "h": "х", "i": "иайы",
+           "j": "джй", "k": "к", "l": "л", "m": "м", "n": "н", "o": "оа", "p": "п", "q": "к", "r": "р", "s": "сз",
+           "t": "т", "u": "уюа", "v": "в", "w": "ву", "x": "кс", "y": "йиы", "z": "зс"}
+_SOUND_MULTI = {"j": ["дж"], "x": ["кс"], "i": ["ай"], "u": ["ю"]}
+_SPOKEN = {"pc": ["пи\\s*си", "писи", "пэ\\s*ка", "пэ\\s*сэ"], "nb": ["нб", "ноут"]}
+
+
+def _letter_rx(ch: str, prev: str) -> str:
+    alts = [re.escape(ch)] + list(_SOUNDS.get(ch, "")) + _SOUND_MULTI.get(ch, [])
+    rx = "(?:" + "|".join(sorted(set(alts), key=len, reverse=True)) + ")"
+    return rx + "?" if ch == prev else rx          # «eez» можно сказать как «ез»
+
+
+def device_rx(device: str) -> str:
+    """Как имя компьютера может прозвучать в сообщении: «OFFICE-PC» = «office pc», «officepc», «офис пс», «оффис пк»."""
+    parts = []
+    for tok in re.findall(r"[a-zа-я]+|\d+", device.lower().replace("ё", "е")):
+        if re.fullmatch(r"[a-z]+", tok):
+            letters = "".join(_letter_rx(ch, tok[i - 1] if i else "") for i, ch in enumerate(tok))
+            if len(tok) > 3 and tok.endswith("e"):          # немая «e» на конце: «office» = «офис»
+                letters += "?"
+            alts = [letters] + _SPOKEN.get(tok, [])
+            parts.append("(?:" + "|".join(alts) + ")")
+        else:
+            parts.append(re.escape(tok))
+    return r"[\s\-_]*".join(parts)
+
+
+_PREFIX = r"(?:(?<![\w-])(?:на|у|для|в)\s+)?(?:(?:компьютер\w*|комп\w*|пк|ноут\w*)\s+)?"
+
+
+def device_span(t: str):
+    """(имя компьютера, совпадение в тексте) — если в тексте назван один из компьютеров в сети."""
+    for d in sorted(PRESENCE, key=len, reverse=True):
+        m = re.search(_PREFIX + r"(?<![\w-])" + device_rx(d) + r"(?![\w-])", t)
+        if m:
+            return d, m
+    # «на зеоне», «на work»: одна отличительная часть имени, если она есть только у одного компьютера
+    hits = {}
+    for d in PRESENCE:
+        for tok in re.findall(r"[a-z]{3,}", d.lower()):
+            if tok in ("desktop", "laptop", "user", "home", "work") and len(PRESENCE) > 1 and tok != d.lower():
+                continue
+            m = re.search(_PREFIX + r"(?<![\w-])" + device_rx(tok) + r"\w{0,3}(?![\w-])", t)
+            # часть имени — только «на офисе» или «выключи офис» (иначе «открой office studio» ушло бы не туда)
+            if m and (re.match(r"\s*(?:на|у|для|в|комп|пк|ноут)", m.group(0)) or
+                      len((t[:m.start()] + " " + t[m.end():]).split()) == 1):
+                hits[d] = m
+    if len(hits) == 1:
+        return next(iter(hits.items()))
+    return "", None
+
+
+def find_device(text: str) -> str:
+    """Имя компьютера из тех, что в сети, если оно названо в тексте."""
+    return device_span(text.lower().replace("ё", "е"))[0]
+
+
+def pc_fast_match(text: str):
+    """«Трой, заблокируй комп!» → ("lock", ""). Не похоже на простую команду → None."""
+    t = re.sub(r"^\[голосовое\]\s*", "", text.strip(), flags=re.I).lower().replace("ё", "е")
+    t = re.sub(rf"^(?:{re.escape(BOT_NAME.lower())}|трой|эй|слушай)[\s,!.:—-]+", "", t)
+    t = re.sub(r"\b(?:пожалуйста|плиз|please|быстро|мне)\b", " ", t)
+    t = re.sub(r"[.!?,]+$", "", re.sub(r"\s+", " ", t)).strip(" ,")
+    if BOILER_HINT_RE.search(t):
+        return None
+    device, m = device_span(t)              # «выключи office pc», «открой телеграм на офисном»
+    if device:
+        t = re.sub(r"\s+", " ", t[:m.start()] + " " + t[m.end():]).strip(" ,")
+        if len(t.split()) == 1:                # остался один глагол — значит, речь о самом компьютере
+            t += " комп"
+    if not t or len(t.split()) > 6:
+        return None
+    for rx, action, group in PC_FAST:
+        m = rx.match(t)
+        if m:
+            arg = m.group(group).strip() if group else ""
+            if action in ("open_app", "close_app") and len(arg.split()) > 4:
+                return None
+            return action, arg, device
+    return None
+
+
+# Функции Битрикса (это ~2000 токенов) отправляем модели, только когда разговор про Битрикс
+BITRIX_HINT_RE = re.compile(r"битрикс|bitrix|crm|црм|задач|сделк|лид[аыуов ]|лид$|воронк|клиент|контакт|компани[яию]|"
+                            r"продаж|выручк|менеджер|аналитик|отч[её]т|коллег|сотрудник|чат|непрочитан|"
+                            r"сообщени[ея] (?:ане|ивану|коллег)|ответь [А-ЯЁ]|напиши [А-ЯЁ]", re.I)
+# «Трой, пароль для приложения: Abc123» — перехватываем до модели, пароль в Groq не уходит
+PASSWORD_RE = re.compile(r"^\s*(?:\S+[,!]\s*)?(?:(?:новый|смени|поменяй|установи|задай|поставь)\s+)?пароль\s+"
+                         r"(?:для|от|на|в)\s+(?:приложени\w*|программ\w*|десктоп\w*|компьютер\w*|клиент\w*)"
+                         r"(?:\s*[:=—–-]\s*|\s+(?:на\s+|это\s+)?)(\S+)\s*$", re.I)
+BITRIX_WRITE = {"bitrix_task_create", "bitrix_task_complete", "bitrix_task_comment", "bitrix_send_message",
+                "bitrix_crm_create", "bitrix_crm_update"}
+YES_RE = re.compile(r"^(\[голосовое\]\s*)?(да|ага|угу|ок|окей|ok|yes|давай|отправляй|отправь|отправить|подтверждаю|"
+                    r"верно|делай|создавай|создай|закрывай|согласен|го|поехали|выполняй|всё верно|все верно)\b",
+                    re.I)
+
+
+def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = False, boiler_on: bool = False) -> str:
+    now = now_local()
+    who = f" пользователя по имени {USER_NAME}" if USER_NAME else ""
+    return f"""Тебя зовут {BOT_NAME}. Ты — личный помощник{who} (в Telegram и в программе на компьютере). Отвечай всегда по-русски, коротко и по делу.
+Обращение по имени («{BOT_NAME}, …») — просто обращение к тебе, отвечай на суть. Представляйся этим именем, если спросят.
+Пиши обычным текстом: без Markdown, звёздочек, решёток и таблиц, Telegram их не отрисует. Списки — через «-».
+
+Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS[now.weekday()]}, часовой пояс {TZ_NAME}.
+
+Правила:
+- Напоминания: вызывай create_reminder. «Через 20 минут», «в пятницу», «завтра утром» переводи в точное время
+  от текущего момента («утром» — 09:00, «днём» — 13:00, «вечером» — 19:00). Если непонятно, на когда, — спроси.
+  После создания подтверди дату, день недели и время.
+- Идеи и заметки для проектов («идея», «запиши», «для проекта …»): вызывай save_idea.
+  Существующие проекты: {', '.join(projects) if projects else 'пока нет'}.
+  Подбирай подходящий по смыслу. Если не ясно, к какому, — пиши в inbox.
+  Новый проект заводи, только если пользователь явно назвал новый.
+- Всё, что могло измениться (цены, наличие, где купить, адреса, часы работы, расписания, новости, курсы валют),
+  ищи через web_search, а не отвечай по памяти. Указывай источники ссылками.
+- Сообщения с пометкой [голосовое] — это расшифровка речи пользователя: отвечай на смысл, не пересказывай.
+  В расшифровке бывают ошибки распознавания — понимай по смыслу.
+- Фото и документы: сделай то, о чём просит подпись. Без подписи — коротко скажи, что там, и чем можешь помочь.
+- Если не уверен в факте — так и скажи.{BITRIX_RULES if bitrix_on else ""}{PC_RULES if pc_on else ""}{BOILER_RULES if boiler_on else ""}"""
+
+
+PC_RULES = """
+- Компьютеры, где запущен Трой: pc_command. Выключение и перезагрузку — только после «да» (спроси «Выключаю?»).
+  Остальное (сон, блокировка, открыть/закрыть программу, музыка, громкость) — сразу. Если компьютеров несколько,
+  пользователю покажут кнопки выбора — просто скажи «Выбери компьютер». device передавай, только если его назвали.
+  Ты МОЖЕШЬ открывать и закрывать на компьютере любые программы, включая браузер (app: "браузер", "хром"…).
+  Несколько программ — одним вызовом через «и» (app: "хром и яндекс музыка").
+  Каждая новая просьба про компьютер («а браузер?», «это оно», «и телеграм») — снова вызов pc_command; слова без
+  вызова ничего не делают. Если программа не нашлась, а пользователь подтверждает похожую — открой похожую."""
+
+
+BITRIX_RULES = """
+- Битрикс24 (портал пользователя, ты действуешь от его имени): задачи, чаты, CRM, аналитика — функции bitrix_*.
+  Чтение (списки, поиск, аналитика) делай сразу. Любое изменение — создать или закрыть задачу, комментарий,
+  отправить сообщение, создать или изменить запись CRM — сначала покажи, что именно сделаешь (получатель и точный
+  текст, поля), спроси «Делаю?» и вызывай функцию только после ответа «да».
+  Для сотрудника сначала найди его ID через bitrix_find_user. Для нестандартной аналитики используй bitrix_read
+  (например crm.deal.list с filter/select) и сам посчитай итоги. Суммы показывай с разделителями тысяч."""
+
+
+class Assistant:
+    def __init__(self):
+        self.llm = Groq()
+        self.router = Router(self.llm)
+        self.ideas = Ideas()
+        self.bx = bitrix.Bitrix(BITRIX_WEBHOOK) if BITRIX_WEBHOOK else None
+        self.lock = threading.Lock()     # Telegram и программа на компьютере — по очереди
+        self.pc_used = False
+        self.user_text = ""
+        self.channel = "telegram"
+        self.pc_choice: Optional[dict] = None
+        self.pending_power: dict = {}    # chat_id -> (action, когда спросили) — ждём «да» на выключение
+
+    def web_search(self, query: str) -> str:
+        messages = [
+            {"role": "system", "content": f"Найди в интернете актуальный ответ и изложи факты кратко: цены, адреса, "
+                                          f"даты, названия, со ссылками на источники. Сегодня {now_local():%Y-%m-%d}. "
+                                          f"Отвечай по-русски."},
+            {"role": "user", "content": query}]
+        # gpt-oss иногда выдаёт битый вызов поиска (Groq отвечает 400 «Parsing failed») — пробуем ещё раз и запасную
+        attempts = [(GROQ_SEARCH_MODEL, "low"), (GROQ_SEARCH_MODEL, "medium"), ("openai/gpt-oss-20b", "low")]
+        last: Optional[Exception] = None
+        for model, effort in attempts:
+            try:
+                msg = self.llm.chat(model, messages, tools=[{"type": "browser_search"}], reasoning_effort=effort)
+                text = clean_answer(msg.get("content"))
+                if text:
+                    return text
+            except LLMError as e:
+                last = e
+                log.warning("Поиск (%s): %s", model, e)
+                if e.status == 429:
+                    break
+        return ("ПОИСК НЕ УДАЛСЯ" + (f" ({last})" if last else "") +
+                ". Скажи пользователю, что сейчас не получилось поискать, и предложи повторить через минуту; "
+                "не выдумывай цены и наличие.")
+
+    def execute(self, chat_id: str, name: str, args: dict) -> str:
+        try:
+            if name == "create_reminder":
+                return add_reminder(chat_id, str(args.get("when", "")), str(args.get("text", "")),
+                                    str(args.get("repeat") or "none"))
+            if name == "list_reminders":
+                return list_reminders(chat_id)
+            if name == "delete_reminder":
+                return delete_reminder(chat_id, int(args.get("id", 0)))
+            if name == "save_idea":
+                return self.ideas.save(str(args.get("project") or "inbox"), str(args.get("text", "")))
+            if name == "read_ideas":
+                return self.ideas.read(str(args.get("project") or "inbox"))
+            if name == "web_search":
+                return self.web_search(str(args.get("query", "")))
+            if name == "boiler_info":
+                return boiler_info(str(args.get("what") or "status"), str(args.get("date_from") or ""),
+                                   str(args.get("date_to") or ""))
+            if name == "pc_command":
+                return self.pc_command(chat_id, args)
+            if name.startswith("bitrix_"):
+                if not self.bx:
+                    return "Ошибка: Битрикс24 не подключён (нет BITRIX_WEBHOOK в настройках)."
+                if name in BITRIX_WRITE and not YES_RE.match(self.user_text.strip()):
+                    return ("НЕ ВЫПОЛНЕНО: сначала покажи пользователю, что именно будет сделано "
+                            "(получатель, точный текст, поля), и спроси подтверждение. "
+                            "Вызови функцию снова только после его ответа «да».")
+                return bitrix.execute(self.bx, name, args)
+            return f"Ошибка: неизвестная функция {name}"
+        except Exception as e:
+            log.exception("Функция %s упала", name)
+            return f"Ошибка: {e}"
+
+    @staticmethod
+    def strip_images(messages: list) -> list:
+        """Запасная модель не видит картинки — заменяем их пометкой."""
+        out = []
+        for m in messages:
+            if isinstance(m.get("content"), list):
+                texts = [p["text"] for p in m["content"] if p.get("type") == "text"]
+                if any(p.get("type") == "image_url" for p in m["content"]):
+                    texts.insert(0, "[фото — эта модель его не видит, попроси прислать позже]")
+                m = {**m, "content": "\n".join(texts)}
+            out.append(m)
+        return out
+
+    def pc_command(self, chat_id: str, args: dict) -> str:
+        action = str(args.get("action") or "")
+        if action not in PC_ACTIONS:
+            return f"Ошибка: неизвестное действие {action}"
+        if action in PC_CONFIRM and not YES_RE.match(self.user_text.strip()):
+            return "НЕ ВЫПОЛНЕНО: сначала спроси пользователя «Выключаю?» / «Перезагружаю?» и вызови снова после «да»."
+        app = str(args.get("app") or "").strip()
+        if action in ("open_app", "close_app") and not app:
+            return "Ошибка: укажи app — какую программу открыть или закрыть."
+        device = str(args.get("device") or "").strip()
+        if app and find_device(app):
+            self.pc_used = True
+            return (f"Ошибка: «{app}» — это компьютер, а не программа. Уточни у пользователя, что сделать с ним: "
+                    "выключить, перезагрузить, усыпить или заблокировать.")
+        # модель любит «помнить» прошлый выбор — компьютер без кнопок, только если его назвали в ЭТОМ сообщении
+        named = find_device(self.user_text) or (device if device and device.lower() in self.user_text.lower() else "")
+        device = named if device and named else ""
+        text, choice = pc_create(action, app, device, self.channel, chat_id)
+        self.pc_used = True
+        if choice:
+            self.pc_choice = choice
+        return text
+
+    def fast_pc(self, chat_id: str) -> Optional[str]:
+        """Простые команды компьютеру — без модели."""
+        pending = getattr(self, "pending_power", {}).pop(chat_id, None)
+        if pending and time.time() - pending[1] < 90 and YES_RE.match(self.user_text.strip()):
+            text, choice = pc_create(pending[0], "", pending[2], self.channel, chat_id)
+            self.pc_choice, self.pc_used = choice, True
+            return text.replace(" Результат придёт отдельным сообщением.", "")
+        hit = pc_fast_match(self.user_text)
+        if not hit:
+            return None
+        action, arg, device = hit
+        log.info("Команда компьютеру без модели: %s %s %s", action, arg, device)
+        if action in PC_CONFIRM:
+            if not hasattr(self, "pending_power"):
+                self.pending_power = {}
+            self.pending_power[chat_id] = (action, time.time(), device)
+            self.pc_used = True
+            where = device or "компьютер"
+            return (f"Выключить {where}?" if action == "shutdown" else f"Перезагрузить {where}?") + " Ответь «да»."
+        text, choice = pc_create(action, arg, device, self.channel, chat_id)
+        self.pc_choice, self.pc_used = choice, True
+        if choice:
+            return "Выбери компьютер."
+        if text.startswith("Команда"):
+            return f"Есть: {pc_label(action, arg)}" + (f" на {device}." if device else ".")
+        return text
+
+    def run(self, chat_id: str, content, channel: str = "telegram") -> str:
+        with self.lock:
+            self.channel = channel
+            self.pc_choice, self.pc_used = None, False
+            self.user_text = content if isinstance(content, str) else " ".join(
+                p.get("text", "") for p in content if p.get("type") == "text")
+            if isinstance(content, str):
+                hello = mcclure(self.user_text)
+                if hello:
+                    return hello
+                fast = self.fast_pc(chat_id)
+                if fast:
+                    return fast
+            return self._run(chat_id, content)
+
+    @staticmethod
+    def flatten_tools(messages: list) -> list:
+        """При смене модели посреди шагов: вызовы функций → обычный текст (чтобы не выполнить их второй раз)."""
+        out, done = [], []
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                continue
+            if m.get("role") == "tool":
+                done.append(m["content"][:1500])
+                continue
+            out.append(m)
+        if done:
+            out.append({"role": "assistant", "content": "Уже выполнено (повторно не вызывать):\n" + "\n".join(done)})
+            out.append({"role": "user", "content": "Продолжай: ответь пользователю по результатам выше."})
+        return out
+
+    def bitrix_needed(self, history: list) -> bool:
+        if not self.bx:
+            return False
+        recent = [self.user_text] + [h["content"] for h in history[-4:] if isinstance(h.get("content"), str)]
+        return any(BITRIX_HINT_RE.search(t or "") for t in recent)
+
+    def _run(self, chat_id: str, content) -> str:
+        history = get_history(chat_id)
+        use_bx = self.bitrix_needed(history)
+        recent = [self.user_text] + [h["content"] for h in history[-2:] if isinstance(h.get("content"), str)]
+        use_pc = any(PC_HINT_RE.search(t or "") for t in recent)
+        use_boiler = BOILER_ON and any(BOILER_HINT_RE.search(t or "") for t in recent)
+        tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
+                 + ([BOILER_TOOL] if use_boiler else []))
+        messages = ([{"role": "system", "content": system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)}]
+                    + history + [{"role": "user", "content": content}])
+        has_image = isinstance(content, list)
+        must_pc = use_pc and bool(PC_ORDER_RE.search(self.user_text or ""))
+        nudged = False
+        skip: set = set()
+        provider, model = None, None
+        last_err: Optional[LLMError] = None
+        for _ in range(12):
+            cands = self.router.candidates(has_image, skip)
+            if not cands:
+                if last_err and last_err.status != 429:
+                    raise last_err
+                raise LLMError(429, f"все модели на перерыве, ~{max(1, self.router.wait_hint() // 60)} мин")
+            if (provider, model) != cands[0]:
+                if model is not None:
+                    log.info("Переключаюсь на %s", cands[0][1])
+                    messages = self.flatten_tools(messages)
+                provider, model = cands[0]
+            send = messages if model in VISION_MODELS else self.strip_images(messages)
+            send = [{**send[0], "content": send[0]["content"] + self.router.describe(provider, model)}] + send[1:]
+            try:
+                msg = provider.chat(model, send, tools)
+                self.router.last = (getattr(provider, "NAME", ""), model, time.time())
+            except LLMError as e:
+                if e.status in (400, 404, 413, 422, 429, 500, 502, 503):
+                    self.router.penalize(model, e)
+                    skip.add(model)          # в этом сообщении к ней больше не возвращаемся
+                    last_err = e
+                    log.warning("%s", e)
+                    continue
+                raise
+            calls = msg.get("tool_calls") or []
+            if (not calls and not self.pc_used and not nudged
+                    and (must_pc or "передал команду" in (msg.get("content") or ""))):
+                nudged = True
+                log.info("Модель ответила без pc_command — прошу вызвать функцию")
+                messages.append({"role": "assistant", "content": msg.get("content") or ""})
+                messages.append({"role": "user", "content":
+                                 "Команда НЕ выполнена: ты не вызвал функцию pc_command. Слова не управляют компьютером. "
+                                 "Вызови pc_command сейчас (без поля device, если я не назвал компьютер)."})
+                continue
+            if not calls and "передал команду" in (msg.get("content") or "") and not self.pc_used:
+                return "Не понял, что сделать на компьютере. Скажи прямо, например: «открой браузер»."
+            if not calls:
+                return clean_answer(msg.get("content")) or "Модель вернула пустой ответ. Попробуй переформулировать."
+            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
+            for c in calls:
+                name = c["function"]["name"]
+                try:
+                    args = json.loads(c["function"].get("arguments") or "{}") or {}
+                except ValueError:
+                    args = {}
+                log.info("Функция: %s %s", name, json.dumps(args, ensure_ascii=False)[:200])
+                messages.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": self.execute(chat_id, name, args)})
+        return "Запутался в шагах — попробуй сформулировать иначе."
+
+
+# ───────────────────────── Бот ─────────────────────────
+
+HELP = """Я {name}, твой помощник. Пиши текстом, голосом, присылай фото или PDF.
+
+Например:
+- «напомни завтра в 9 позвонить в управляйку»
+- «каждый понедельник в 10 напоминай про отчёт»
+- «идея для котла: показывать температуру на главном экране»
+- «где купить термопасту и почём»
+- фото ценника, квитанции, схемы — с вопросом в подписи
+- «что у меня по задачам в битриксе», «сколько сделок закрыли в октябре по менеджерам»
+
+Команды:
+/reminders — мои напоминания
+/ideas — проекты с идеями, /ideas имя — идеи проекта
+/new — начать разговор с чистого листа
+/password новый_пароль — пароль для программы на компьютере
+/devices — где открыта программа; /devices выйти — выйти везде
+/status — какие модели сейчас работают, какие на перерыве
+/apps слово — какие программы с этим словом Трой видит на компьютере"""
+
+
+class Bot:
+    def __init__(self, tg: Telegram, assistant: Optional["Assistant"] = None):
+        self.tg = tg
+        self.assistant = assistant or Assistant()
+
+    def command(self, chat_id: str, text: str) -> None:
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.split("@")[0].lower()
+        if cmd in ("/start", "/help"):
+            self.tg.send(chat_id, HELP.format(name=BOT_NAME))
+        elif cmd == "/new":
+            clear_history(chat_id)
+            self.tg.send(chat_id, "Начали с чистого листа. Напоминания и идеи на месте.")
+        elif cmd == "/password":
+            self.set_app_password(chat_id, arg.strip())
+        elif cmd == "/devices":
+            if arg.strip().lower() in ("выйти", "logout", "выход"):
+                n = AppAuth.logout_all()
+                self.tg.send(chat_id, f"Вышел на всех компьютерах ({n}). Там снова спросят пароль.")
+                return
+            rows = AppAuth.devices()
+            self.tg.send(chat_id, "Программа открыта:\n" + "\n".join(
+                f"- {r['device']} ({r['ip']}), вход {datetime.fromtimestamp(r['created'], TZ):%d.%m %H:%M}"
+                for r in rows) if rows else "Программа сейчас нигде не авторизована.")
+        elif cmd == "/status":
+            self.tg.send(chat_id, self.assistant.router.status())
+        elif cmd == "/apps":
+            if not arg.strip():
+                self.tg.send(chat_id, "Напиши так: /apps яндекс — покажу, какие программы с этим словом видит Трой на компьютере.")
+                return
+            text, choice = pc_create("find_app", arg.strip(), "", "telegram", chat_id)
+            if choice:
+                self.tg.send(chat_id, f"На каком компьютере искать «{arg.strip()}»?", buttons=[
+                    [{"text": f"🖥 {d}", "callback_data": f"pc:{choice['id']}:{i}"}] for i, d in enumerate(choice["devices"])])
+            else:
+                self.tg.send(chat_id, text.replace("Команда «найти программу", "Ищу «").split(" отправлена")[0] + "…")
+        elif cmd == "/reminders":
+            self.tg.send(chat_id, list_reminders(chat_id))
+        elif cmd == "/ideas":
+            if arg.strip():
+                self.tg.send(chat_id, self.assistant.ideas.read(arg))
+            else:
+                self.assistant.ideas._projects_at = 0
+                pr = self.assistant.ideas.projects()
+                self.tg.send(chat_id, "Проекты: " + ", ".join(pr) if pr else "Идей пока нет.")
+        else:
+            self.tg.send(chat_id, "Не знаю такой команды. /help — что я умею.")
+
+    def set_app_password(self, chat_id: str, password: str) -> None:
+        if not password:
+            self.tg.send(chat_id, "Напиши так: /password новый_пароль\n"
+                                  "Не короче 6 символов, без пробелов. Сообщение с паролем я сразу удалю.")
+            return
+        if len(password) < 6 or " " in password:
+            self.tg.send(chat_id, "Пароль должен быть не короче 6 символов и без пробелов. Попробуй ещё раз.")
+            return
+        n = AppAuth.set_password(password)
+        self.tg.send(chat_id, "🔑 Пароль для программы на компьютере установлен. Сообщение с ним удалил."
+                     + (f"\nВышел на всех компьютерах ({n}) — там спросят новый пароль." if n else ""))
+
+    def forget_message(self, msg: dict) -> None:
+        """Сообщение с паролем убираем из чата."""
+        try:
+            self.tg.call("deleteMessage", data={"chat_id": msg["chat"]["id"], "message_id": msg["message_id"]})
+        except Exception as e:
+            log.warning("Не удалил сообщение с паролем: %s", e)
+            try:
+                self.tg.send(str(msg["chat"]["id"]), "Не смог удалить сообщение с паролем — удали его сам.")
+            except Exception:
+                pass
+
+    def fetch(self, obj: dict) -> bytes:
+        if obj.get("file_size", 0) > MAX_FILE_MB * 1024 * 1024:
+            raise ValueError("too_big")
+        return self.tg.download(obj["file_id"])
+
+    def build_content(self, chat_id: str, msg: dict):
+        """Готовит сообщение для модели. Возвращает (content, заметка для истории) или (None, None)."""
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        texts, note, image = [], [], None
+
+        voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+        if voice:
+            name = voice.get("file_name") or ("note.mp4" if "video_note" in msg else "voice.ogg")
+            spoken = self.assistant.llm.transcribe(self.fetch(voice), name)
+            if not spoken:
+                self.tg.send(chat_id, "Не расслышал, повтори, пожалуйста.")
+                return None, None
+            texts.append(f"[голосовое] {spoken}")
+            note.append(f"[голосовое] {spoken}")
+
+        if msg.get("photo"):
+            image = ("image/jpeg", self.fetch(msg["photo"][-1]))
+            note.append("[фото]")
+
+        doc = msg.get("document")
+        if doc:
+            mime = doc.get("mime_type") or ""
+            fname = doc.get("file_name") or "файл"
+            if mime.startswith("image/"):
+                image = (mime, self.fetch(doc))
+                note.append(f"[картинка {fname}]")
+            elif mime == "application/pdf":
+                body = pdf_text(self.fetch(doc))
+                if not body:
+                    self.tg.send(chat_id, "В этом PDF нет текста — похоже, это скан. Пришли его как фото.")
+                    return None, None
+                texts.append(f"[PDF «{fname}»]\n{body}")
+                note.append(f"[PDF {fname}]")
+            else:
+                self.tg.send(chat_id, "Из файлов понимаю картинки и PDF.")
+                return None, None
+
+        if text:
+            texts.append(text)
+            note.append(text)
+        if not texts and not image:
+            self.tg.send(chat_id, "Понимаю текст, голосовые, фото и PDF.")
+            return None, None
+
+        joined = "\n\n".join(texts)
+        if not image:
+            return joined, " ".join(note)
+        data_url = f"data:{image[0]};base64,{base64.b64encode(image[1]).decode()}"
+        content = [{"type": "text", "text": joined or "Что на картинке?"},
+                   {"type": "image_url", "image_url": {"url": data_url}}]
+        return content, " ".join(note)
+
+    def handle(self, msg: dict) -> None:
+        chat_id = str(msg["chat"]["id"])
+        uid = str((msg.get("from") or {}).get("id", ""))
+        if msg["chat"].get("type") != "private":
+            return
+        if not ALLOWED_USER_ID:
+            self.tg.send(chat_id, f"Твой Telegram ID: {uid}\nВпиши в settings.env строку ALLOWED_USER_ID={uid} "
+                                  f"и перезапусти бота. До этого я никому не отвечаю.")
+            return
+        if uid != ALLOWED_USER_ID:
+            log.warning("Сообщение от чужого пользователя %s — игнорирую", uid)
+            return
+        m = PASSWORD_RE.match(msg.get("text") or "")
+        if m:
+            self.set_app_password(chat_id, m.group(1))
+            self.forget_message(msg)
+            return
+        if (msg.get("text") or "").startswith("/"):
+            if (msg.get("text") or "").lower().startswith("/password"):
+                self.forget_message(msg)
+            self.command(chat_id, msg["text"].strip())
+            return
+
+        note = "[сообщение]"
+        with KeepTyping(self.tg, chat_id):
+            try:
+                content, note = self.build_content(chat_id, msg)
+                if content is None:
+                    return
+                answer = self.assistant.run(chat_id, content)
+            except ValueError as e:
+                if str(e) != "too_big":
+                    raise
+                self.tg.send(chat_id, f"Файл больше {MAX_FILE_MB} МБ — Telegram не отдаёт ботам такие.")
+                return
+            except LLMError as e:
+                log.error("%s", e)
+                if e.status == 429:
+                    answer = (f"Бесплатные лимиты моделей сейчас исчерпаны ({e.text}). Попробуй чуть позже."
+                              if "все модели" in str(e) else "Упёрся в бесплатный лимит. Подожди минуту и повтори.")
+                else:
+                    answer = f"Groq вернул ошибку: {e}"
+            except requests.RequestException as e:
+                log.error("Сеть: %s", e)
+                answer = "Не достучался до Groq, попробуй ещё раз через минуту."
+
+        pc = getattr(self.assistant, "pc_used", False)    # команды компьютеру модели не показываем (см. get_history)
+        add_history(chat_id, "pc_user" if pc else "user", note)
+        add_history(chat_id, "pc_reply" if pc else "assistant", answer)
+        self.tg.send(chat_id, answer)
+        choice = self.assistant.pc_choice
+        if choice:
+            self.tg.send(chat_id, f"Где выполнить «{choice['label']}»?", buttons=[
+                [{"text": f"🖥 {d}", "callback_data": f"pc:{choice['id']}:{i}"}] for i, d in enumerate(choice["devices"])])
+            self.assistant.pc_choice = None
+
+    def handle_callback(self, cb: dict) -> None:
+        uid = str((cb.get("from") or {}).get("id", ""))
+        data = cb.get("data") or ""
+        msg = cb.get("message") or {}
+        reply = "Неизвестная кнопка"
+        if uid != ALLOWED_USER_ID:
+            reply = "Нет доступа"
+        elif data.startswith("pc:"):
+            try:
+                _, cid, idx = data.split(":")
+                reply = pc_choose(int(cid), int(idx))
+            except ValueError:
+                reply = "Неверная кнопка"
+            try:   # кнопки убираем, на их месте — что выбрано
+                self.tg.call("editMessageText", data={"chat_id": msg["chat"]["id"], "message_id": msg["message_id"],
+                                                      "text": reply})
+            except Exception:
+                pass
+        try:
+            self.tg.call("answerCallbackQuery", data={"callback_query_id": cb["id"], "text": reply[:180]})
+        except Exception:
+            pass
+
+    def poll_forever(self) -> None:
+        offset = None
+        while True:
+            try:
+                updates = self.tg.call("getUpdates", timeout=40, data={
+                    "timeout": 30, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])})
+            except (requests.RequestException, TelegramError) as e:
+                log.warning("getUpdates: %s", e)
+                time.sleep(5)
+                continue
+            for u in updates:
+                offset = u["update_id"] + 1
+                if u.get("callback_query"):
+                    try:
+                        self.handle_callback(u["callback_query"])
+                    except Exception:
+                        log.exception("Ошибка обработки кнопки")
+                    continue
+                msg = u.get("message")
+                if not msg:
+                    continue
+                try:
+                    self.handle(msg)
+                except Exception as e:
+                    log.exception("Ошибка при обработке сообщения")
+                    try:
+                        self.tg.send(str(msg["chat"]["id"]), f"Что-то сломалось: {e}")
+                    except Exception:
+                        pass
+
+
+# ───────────────────────── Программа на компьютере ─────────────────────────
+
+def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
+    """Команды в программе на компьютере — те же, что в Telegram (кроме пароля)."""
+    cmd, _, arg = text.strip().partition(" ")
+    cmd = cmd.lower()
+    if cmd == "/status":
+        return assistant.router.status()
+    if cmd == "/apps":
+        if not arg.strip():
+            return "Напиши так: /apps яндекс — покажу, какие программы с этим словом видит Трой на компьютере."
+        text, choice = pc_create("find_app", arg.strip(), "", "desktop", ALLOWED_USER_ID)
+        return {"reply": "Выбери компьютер.", "choice": choice} if choice else "Ищу… ответ придёт отдельным сообщением."
+    if cmd == "/reminders":
+        return list_reminders(ALLOWED_USER_ID)
+    if cmd == "/new":
+        clear_history(ALLOWED_USER_ID)
+        return "Начали с чистого листа. Напоминания и идеи на месте."
+    if cmd == "/ideas":
+        if arg.strip():
+            return assistant.ideas.read(arg)
+        assistant.ideas._projects_at = 0
+        pr = assistant.ideas.projects()
+        return "Проекты: " + ", ".join(pr) if pr else "Идей пока нет."
+    if cmd == "/devices":
+        rows = AppAuth.devices()
+        return "Программа открыта:\n" + "\n".join(
+            f"- {r['device']} ({r['ip']}), вход {datetime.fromtimestamp(r['created'], TZ):%d.%m %H:%M}" for r in rows)
+    if cmd == "/password":
+        return "Пароль меняется только в Telegram: /password новый_пароль"
+    if cmd in ("/help", "/start"):
+        return HELP.format(name=BOT_NAME)
+    return None
+
+
+def desktop_message(assistant: "Assistant", text: str, files: Optional[list]) -> str:
+    """Сообщение из программы на компьютере: тот же разговор, что и в Telegram. До 3 файлов за раз."""
+    chat_id = ALLOWED_USER_ID
+    if text.strip().startswith("/") and not files:
+        answer = desktop_command(assistant, text)
+        if answer is not None:
+            return answer
+    texts, note, images = [], [], []
+    for f in (files or [])[:3]:
+        if not f or not f.get("data"):
+            continue
+        raw = base64.b64decode(f["data"])
+        mime, name = f.get("mime") or "", f.get("name") or "файл"
+        if mime.startswith("image/"):
+            images.append((mime, raw))
+            note.append(f"[картинка {name}]")
+        elif mime == "application/pdf" or name.lower().endswith(".pdf"):
+            body = pdf_text(raw)
+            if not body:
+                return f"В «{name}» нет текста — похоже, это скан. Пришли его как картинку."
+            texts.append(f"[PDF «{name}»]\n{body}")
+            note.append(f"[PDF {name}]")
+        elif mime.startswith("audio/") or mime.startswith("video/"):
+            spoken = assistant.llm.transcribe(raw, name)
+            if not spoken:
+                return "Не расслышал, повтори, пожалуйста."
+            texts.append(f"[голосовое] {spoken}")
+            note.append(f"[голосовое] {spoken}")
+        else:
+            return f"«{name}»: из файлов понимаю картинки, PDF и аудио."
+    if text.strip():
+        texts.append(text.strip())
+        note.append(text.strip())
+    if not texts and not images:
+        return "Пустое сообщение."
+    joined = "\n\n".join(texts)
+    content = joined
+    if images:
+        content = [{"type": "text", "text": joined or "Что на картинках?"}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(r).decode()}"}}
+            for m, r in images]
+    choice = None
+    try:
+        answer = assistant.run(chat_id, content, channel="desktop")
+        choice, assistant.pc_choice = assistant.pc_choice, None
+    except LLMError as e:
+        answer = (f"Бесплатные лимиты моделей сейчас исчерпаны ({e.text}). Попробуй чуть позже." if e.status == 429
+                  else f"Ошибка модели: {e}")
+    pc = getattr(assistant, "pc_used", False)
+    add_history(chat_id, "pc_user" if pc else "user", " ".join(note))
+    add_history(chat_id, "pc_reply" if pc else "assistant", answer)
+    return {"reply": answer, "choice": choice} if choice else answer
+
+
+def desktop_history(after: int = 0) -> list:
+    """Переписка для окна программы. after — только новее этого номера (так окна на всех компьютерах
+    видят сообщения, отправленные с другого компьютера или из Telegram)."""
+    with closing(db()) as con:
+        rows = con.execute("SELECT id, role, text, ts FROM history WHERE chat_id=? AND id>? AND role != 'pc_result' "
+                           "ORDER BY id DESC LIMIT 60",
+                           (ALLOWED_USER_ID, int(after or 0))).fetchall()
+    return [{"id": r["id"], "role": "user" if r["role"] in ("user", "pc_user") else "assistant", "text": r["text"],
+             "ts": r["ts"]} for r in reversed(rows)]
+
+
+def last_history_id() -> int:
+    with closing(db()) as con:
+        row = con.execute("SELECT MAX(id) FROM history WHERE chat_id=?", (ALLOWED_USER_ID,)).fetchone()
+    return int(row[0] or 0)
+
+
+def desktop_reply(assistant: "Assistant", text: str, files: Optional[list]) -> dict:
+    """Ответ окну + номер последней записи истории: своё сообщение окно уже нарисовало, второй раз не покажет."""
+    res = desktop_message(assistant, text, files)
+    res = res if isinstance(res, dict) else {"reply": res}
+    res["hist"] = last_history_id()
+    return res
+
+
+def notify_owner(text: str) -> None:
+    try:
+        Telegram(TELEGRAM_TOKEN).send(ALLOWED_USER_ID, text)
+    except Exception as e:
+        log.warning("Не отправил уведомление: %s", e)
+
+
+class AppAuth:
+    """Вход в программу на компьютере. Пароль задаёт владелец в Telegram (/password),
+    в базе хранится только его хэш. После смены пароля все компьютеры выходят."""
+    MAX_FAILS, WINDOW, LOCK = 5, 600, 600
+
+    def __init__(self, notify=notify_owner):
+        self.notify = notify
+        self.fails: list = []
+        self.locked_until = 0.0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _hash(password: str, salt: bytes) -> str:
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000).hex()
+
+    @staticmethod
+    def _sha(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @classmethod
+    def set_password(cls, password: str) -> int:
+        salt = os.urandom(16)
+        with closing(db()) as con, con:
+            con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('app_password', ?)",
+                        (salt.hex() + ":" + cls._hash(password, salt),))
+            return con.execute("DELETE FROM app_sessions").rowcount
+
+    @staticmethod
+    def has_password() -> bool:
+        with closing(db()) as con:
+            return con.execute("SELECT 1 FROM kv WHERE key='app_password'").fetchone() is not None
+
+    @staticmethod
+    def devices() -> list:
+        with closing(db()) as con:
+            return con.execute("SELECT device, ip, created, last_seen FROM app_sessions ORDER BY last_seen DESC").fetchall()
+
+    @staticmethod
+    def logout_all() -> int:
+        with closing(db()) as con, con:
+            return con.execute("DELETE FROM app_sessions").rowcount
+
+    def login(self, password: str, device: str, ip: str):
+        with self.lock:
+            now = time.time()
+            if now < self.locked_until:
+                return None, f"Слишком много неверных попыток. Попробуй через {int(self.locked_until - now) // 60 + 1} мин."
+            with closing(db()) as con:
+                row = con.execute("SELECT value FROM kv WHERE key='app_password'").fetchone()
+            if not row:
+                return None, f"Пароль для приложения ещё не задан. Напиши {BOT_NAME}ю в Telegram: /password твой_пароль"
+            salt_hex, stored = row["value"].split(":", 1)
+            if not hmac.compare_digest(self._hash(password, bytes.fromhex(salt_hex)), stored):
+                self.fails = [t for t in self.fails if now - t < self.WINDOW] + [now]
+                time.sleep(1)
+                if len(self.fails) >= self.MAX_FAILS:
+                    self.locked_until = now + self.LOCK
+                    self.fails = []
+                    self.notify(f"⚠️ {self.MAX_FAILS} неверных паролей подряд в приложении (последний — с {ip}, "
+                                f"{device}). Вход заблокирован на 10 минут. Если это не ты — смени пароль: /password")
+                return None, "Неверный пароль"
+            self.fails = []
+            token = secrets.token_urlsafe(32)
+            with closing(db()) as con, con:
+                con.execute("INSERT INTO app_sessions VALUES (?,?,?,?,?)",
+                            (self._sha(token), device, ip, int(now), int(now)))
+        self.notify(f"🔐 Вход в приложение: {device} ({ip}). Если это не ты — смени пароль: /password")
+        return token, ""
+
+    def check(self, token: str) -> bool:
+        if not token:
+            return False
+        h = self._sha(token)
+        with closing(db()) as con, con:
+            row = con.execute("SELECT last_seen FROM app_sessions WHERE token_hash=?", (h,)).fetchone()
+            if row and time.time() - row["last_seen"] > 300:
+                con.execute("UPDATE app_sessions SET last_seen=? WHERE token_hash=?", (int(time.time()), h))
+        return row is not None
+
+    def device(self, token: str) -> str:
+        with closing(db()) as con:
+            row = con.execute("SELECT device FROM app_sessions WHERE token_hash=?", (self._sha(token),)).fetchone()
+        return row["device"] if row else ""
+
+    def logout(self, token: str) -> None:
+        with closing(db()) as con, con:
+            con.execute("DELETE FROM app_sessions WHERE token_hash=?", (self._sha(token),))
+
+
+# ───────────────────────── Управление компьютерами ─────────────────────────
+
+PRESENCE: dict = {}            # компьютер -> когда последний раз спрашивал команды
+PC_VERSION: dict = {}          # компьютер -> версия программы Трой на нём
+PC_ONLINE_SEC = 30
+
+
+def pcs_status() -> str:
+    now = time.time()
+    if not PRESENCE:
+        return "Компьютеры: ни один ещё не выходил на связь с запуска сервера (нужна программа Трой новой версии)."
+    rows = []
+    for d, t in sorted(PRESENCE.items(), key=lambda x: -x[1]):
+        ago = int(now - t)
+        state = "🟢 в сети" if ago < PC_ONLINE_SEC else "⚪ не в сети"
+        rows.append(f"- 🖥 {d}: {state}, был на связи {ago} с назад, программа {PC_VERSION.get(d, 'старая версия')}")
+    return "Компьютеры:\n" + "\n".join(rows)
+
+
+def online_pcs() -> list:
+    now = time.time()
+    return sorted(d for d, t in PRESENCE.items() if now - t < PC_ONLINE_SEC)
+
+
+def pc_label(action: str, arg: str) -> str:
+    return PC_ACTIONS.get(action, action) + (f" «{arg}»" if arg else "")
+
+
+def pc_notify(channel: str, chat_id: str, text: str) -> None:
+    """Результат — туда, откуда пришла команда."""
+    if channel == "telegram":
+        try:
+            Telegram(TELEGRAM_TOKEN).send(chat_id, text)
+        except Exception as e:
+            log.warning("Не отправил результат команды: %s", e)
+    else:
+        push_event(text)
+
+
+def pc_create(action: str, arg: str, device_hint: str, channel: str, chat_id: str):
+    online = online_pcs()
+    label = pc_label(action, arg)
+    if not online:
+        return ("Ни один компьютер с Троем сейчас не в сети. Программа Трой должна быть запущена "
+                "(можно свёрнутой в трей)."), None
+    target = None
+    if device_hint:
+        h = re.sub(r"[^\w]", "", device_hint.lower())
+        matches = [d for d in online if h and (h in re.sub(r"[^\w]", "", d.lower()) or re.sub(r"[^\w]", "", d.lower()) in h)]
+        target = matches[0] if len(matches) == 1 else None
+    if not target and len(online) == 1:
+        target = online[0]
+    now = int(time.time())
+    with closing(db()) as con, con:
+        if target:
+            con.execute("INSERT INTO pc_commands(device, action, arg, status, channel, chat_id, created) "
+                        "VALUES (?,?,?,?,?,?,?)", (target, action, arg, "pending", channel, chat_id, now))
+            return f"Команда «{label}» отправлена на компьютер {target}. Результат придёт отдельным сообщением.", None
+        cur = con.execute("INSERT INTO pc_commands(action, arg, choices, status, channel, chat_id, created) "
+                          "VALUES (?,?,?,?,?,?,?)", (action, arg, json.dumps(online), "choose", channel, chat_id, now))
+    return ("Компьютеров в сети несколько — пользователю показаны кнопки выбора. Коротко попроси выбрать компьютер.",
+            {"id": cur.lastrowid, "devices": online, "label": label})
+
+
+def pc_choose(cmd_id: int, choice) -> str:
+    """choice — номер кнопки (Telegram) или имя компьютера (программа)."""
+    with closing(db()) as con, con:
+        row = con.execute("SELECT * FROM pc_commands WHERE id=?", (cmd_id,)).fetchone()
+        if not row or row["status"] != "choose":
+            return "Этот выбор уже неактуален."
+        devices = json.loads(row["choices"] or "[]")
+        device = devices[choice] if isinstance(choice, int) and 0 <= choice < len(devices) else choice
+        if device not in devices:
+            return "Такого компьютера нет в списке."
+        if time.time() - row["created"] > 600:
+            con.execute("UPDATE pc_commands SET status='expired' WHERE id=?", (cmd_id,))
+            return "Выбор устарел (больше 10 минут). Повтори просьбу."
+        con.execute("UPDATE pc_commands SET device=?, status='pending', created=? WHERE id=?",
+                    (device, int(time.time()), cmd_id))
+    return f"🖥 {device}: {pc_label(row['action'], row['arg'])} — отправлено"
+
+
+def pc_poll(device: str, version: str = "") -> list:
+    """Компьютер спрашивает, нет ли для него команд (заодно отмечается «в сети»)."""
+    PRESENCE[device] = time.time()
+    if version:
+        PC_VERSION[device] = version
+    now = int(time.time())
+    with closing(db()) as con, con:
+        stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent') AND created < ?",
+                            (now - 120,)).fetchall()
+        for r in stale:
+            con.execute("UPDATE pc_commands SET status='expired' WHERE id=?", (r["id"],))
+        rows = con.execute("SELECT * FROM pc_commands WHERE status='pending' AND device=? ORDER BY id",
+                           (device,)).fetchall()
+        for r in rows:
+            con.execute("UPDATE pc_commands SET status='sent' WHERE id=?", (r["id"],))
+    for r in stale:
+        pc_notify(r["channel"], r["chat_id"], f"⚠️ {r['device']} не ответил на «{pc_label(r['action'], r['arg'])}» "
+                                              f"— похоже, Трой там закрыт или нет интернета.")
+    return [{"id": r["id"], "action": r["action"], "arg": r["arg"]} for r in rows]
+
+
+def pc_result(device: str, cmd_id: int, ok: bool, text: str, late: bool = False) -> None:
+    with closing(db()) as con, con:
+        row = con.execute("SELECT * FROM pc_commands WHERE id=? AND device=?", (cmd_id, device)).fetchone()
+        if late:                                           # дополнение к выполненной команде: «выключаю», «отменили»
+            if not row or row["status"] != "done":
+                return
+            if not ok:
+                con.execute("UPDATE pc_commands SET status=?, result=? WHERE id=?", ("cancelled", text[:300], cmd_id))
+        else:
+            if not row or row["status"] != "sent":
+                return
+            con.execute("UPDATE pc_commands SET status=?, result=? WHERE id=?",
+                        ("done" if ok else "failed", text[:300], cmd_id))
+    if late:                                               # записи в историю — уже после закрытия транзакции
+        if not ok:
+            POWER_WATCH.pop(cmd_id, None)
+        pc_notify(row["channel"], row["chat_id"], f"{'⏻' if ok else '↩️'} {device}: {text}")
+        add_history(row["chat_id"], "pc_result", f"{device}: {text}")
+        return
+    pc_notify(row["channel"], row["chat_id"], f"{'✅' if ok else '⚠️'} {device}: {text}")
+    add_history(row["chat_id"], "pc_result", f"{device}: {'выполнено' if ok else 'не получилось'} — {text}")
+    if ok and row["action"] in ("shutdown", "restart", "sleep"):
+        POWER_WATCH[cmd_id] = {"device": device, "action": row["action"], "channel": row["channel"],
+                               "chat_id": row["chat_id"], "t0": time.time(), "gone": False}
+
+
+# Отчёт после выключения/перезагрузки/сна: компьютер сам уже не напишет — смотрим, когда он пропал из сети
+POWER_WATCH: dict = {}
+GONE_SEC = 20          # компьютер спрашивает команды каждые 4 с; 20 с тишины — значит, выключился
+
+
+def power_watch_once(now: Optional[float] = None) -> None:
+    now = now or time.time()
+    for cmd_id, w in list(POWER_WATCH.items()):
+        d, action = w["device"], w["action"]
+        silent = now - PRESENCE.get(d, 0)
+        say = None
+        if action in ("shutdown", "sleep"):
+            if silent > GONE_SEC:
+                say = f"⏻ {d} выключился." if action == "shutdown" else f"🌙 {d} уснул."
+            elif now - w["t0"] > 240:
+                say = (f"⚠️ {d} всё ещё в сети — Windows не выключилась (возможно, мешает несохранённый документ)."
+                       if action == "shutdown" else f"⚠️ {d} не уснул и всё ещё в сети.")
+        else:                                            # перезагрузка: сначала пропал, потом вернулся
+            if not w["gone"] and silent > GONE_SEC:
+                w["gone"] = True
+            elif w["gone"] and silent < 10:
+                say = f"✅ {d} перезагрузился и снова в сети."
+            elif not w["gone"] and now - w["t0"] > 240:
+                say = f"⚠️ {d} всё ещё в сети — перезагрузка не началась (возможно, мешает несохранённый документ)."
+            elif w["gone"] and now - w["t0"] > 900:
+                say = (f"⚠️ {d} ушёл на перезагрузку, но за 15 минут Трой на нём не запустился. "
+                       "Включи в установщике «Запускать вместе с Windows» — тогда я увижу, когда он вернётся.")
+        if say:
+            POWER_WATCH.pop(cmd_id, None)
+            pc_notify(w["channel"], w["chat_id"], say)
+            add_history(w["chat_id"], "pc_result", say)
+
+
+def power_watch_loop() -> None:
+    while True:
+        try:
+            power_watch_once()
+        except Exception:
+            log.exception("Слежение за питанием")
+        time.sleep(5)
+
+
+class PcHooks:
+    poll = staticmethod(pc_poll)
+    result = staticmethod(pc_result)
+    choose = staticmethod(pc_choose)
+
+
+def start_desktop_api(assistant: "Assistant"):
+    cert, key = TLS_DIR / "cert.pem", TLS_DIR / "key.pem"
+    if not ALLOWED_USER_ID:
+        log.warning("Программа на компьютере не запущена: сначала впиши ALLOWED_USER_ID")
+        return None
+    if not (cert.exists() and key.exists()):
+        log.warning("Нет сертификата в %s — программа на компьютере не запущена (его создаёт install.sh)", TLS_DIR)
+        return None
+    return desktop_api.start(DESKTOP_PORT, AppAuth(), PcHooks, str(cert), str(key),
+                             lambda text, files: desktop_reply(assistant, text, files),
+                             desktop_history, events_after, BOT_NAME)
+
+
+# ───────────────────────── Проверка и запуск ─────────────────────────
+
+def self_check() -> bool:
+    ok = True
+    print("Telegram:", end=" ", flush=True)
+    try:
+        me = Telegram(TELEGRAM_TOKEN).call("getMe")
+        print(f"OK, бот @{me['username']}")
+    except Exception as e:
+        ok = False
+        print(f"ОШИБКА — {e}")
+
+    print("Groq:", end=" ", flush=True)
+    if not GROQ_API_KEY:
+        ok = False
+        print("ОШИБКА — не указан GROQ_API_KEY")
+    else:
+        g = Groq()
+        try:
+            available = set(g.models())
+            for m in GROQ_MODELS + [GROQ_SEARCH_MODEL, GROQ_STT_MODEL]:
+                print(f"{m} {'есть' if m in available else 'НЕТ'};", end=" ")
+            print()
+            if GROQ_MODELS[0] not in available:
+                ok = False
+            reply = clean_answer(g.chat(GROQ_MODELS[0], [{"role": "user", "content": "Ответь одним словом: работаю"}]
+                                        ).get("content"))
+            print(f"  тестовый ответ модели: {reply[:60]}")
+        except Exception as e:
+            ok = False
+            print(f"ОШИБКА — {e}")
+
+    print("Mistral (запасной):", end=" ", flush=True)
+    if not MISTRAL_API_KEY:
+        print("не подключён (MISTRAL_API_KEY пуст)")
+    else:
+        try:
+            reply = clean_answer(Mistral().chat(MISTRAL_MODEL, [{"role": "user", "content": "Ответь одним словом: работаю"}]
+                                                ).get("content"))
+            print(f"OK, {MISTRAL_MODEL}: {reply[:40]}")
+        except Exception as e:
+            print(f"ОШИБКА — {e}")
+
+    print("Идеи:", end=" ", flush=True)
+    if not (GITHUB_TOKEN and GITHUB_REPO):
+        print(f"GitHub не настроен — буду хранить в папке {LOCAL_IDEAS_DIR}")
+    else:
+        try:
+            ideas = Ideas()
+            r = ideas.s.get(f"https://api.github.com/repos/{GITHUB_REPO}", timeout=30)
+            r.raise_for_status()
+            perms = r.json().get("permissions") or {}
+            print(f"GitHub OK, репозиторий {GITHUB_REPO}" + ("" if perms.get("push", True) else
+                                                            " — но НЕТ прав на запись (Contents: Read and write)"))
+        except Exception as e:
+            ok = False
+            print(f"ОШИБКА — {e}. Проверь GITHUB_REPO (владелец/имя) и токен.")
+
+    print("Битрикс24:", end=" ", flush=True)
+    if not BITRIX_WEBHOOK:
+        print("не подключён (BITRIX_WEBHOOK пуст)")
+    else:
+        try:
+            bx = bitrix.Bitrix(BITRIX_WEBHOOK)
+            me = bx.me()
+            scopes = bx.call("scope").get("result") or []
+            need = {"task", "im", "crm", "user"}
+            missing = need - set(scopes) - ({"user"} if "user_brief" in scopes or "user_basic" in scopes else set())
+            print(f"OK, вхожу как {me.get('NAME', '')} {me.get('LAST_NAME', '')}"
+                  + (f"; НЕ ХВАТАЕТ прав: {', '.join(sorted(missing))}" if missing else ""))
+        except Exception as e:
+            ok = False
+            print(f"ОШИБКА — {e}. Проверь адрес вебхука.")
+
+    try:
+        init_db()
+        pw = "пароль задан" if AppAuth.has_password() else "пароль ещё не задан — напиши боту /password"
+    except Exception:
+        pw = "?"
+    print("Компьютер:", f"порт {DESKTOP_PORT}, {pw}",
+          "" if (TLS_DIR / "cert.pem").exists() else "— сертификат ещё не создан")
+    print("Владелец:", ALLOWED_USER_ID or "не указан — напиши боту, он пришлёт твой ID")
+    return ok
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Личный ассистент в Telegram")
+    ap.add_argument("--check", action="store_true", help="проверить настройки и доступ к сервисам")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.check:
+        raise SystemExit(0 if self_check() else 1)
+    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+        raise SystemExit("Укажите TELEGRAM_TOKEN и GROQ_API_KEY в settings.env")
+
+    init_db()
+    with closing(db()) as con, con:   # история от прежней версии на Gemini: роль model → assistant
+        con.execute("UPDATE history SET role='assistant' WHERE role='model'")
+    tg = Telegram(TELEGRAM_TOKEN)
+    me = tg.call("getMe")
+    tg.call("deleteWebhook")
+    tg.call("setMyCommands", data={"commands": json.dumps([
+        {"command": "reminders", "description": "Мои напоминания"},
+        {"command": "ideas", "description": "Проекты с идеями"},
+        {"command": "new", "description": "Начать разговор заново"},
+        {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
+        {"command": "help", "description": "Что я умею"},
+    ], ensure_ascii=False)})
+
+    stop = threading.Event()
+    threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
+    log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),
+             " + Mistral" if MISTRAL_API_KEY else "",
+             f"GitHub {GITHUB_REPO}" if GITHUB_TOKEN and GITHUB_REPO else "локально")
+    assistant = Assistant()
+    start_desktop_api(assistant)
+    threading.Thread(target=power_watch_loop, daemon=True).start()
+    Bot(tg, assistant).poll_forever()
+
+
+if __name__ == "__main__":
+    main()
