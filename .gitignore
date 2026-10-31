@@ -1,0 +1,8 @@
+settings.env
+.env
+*.pem
+__pycache__/
+build/
+dist/
+.venv/
+*.spec
