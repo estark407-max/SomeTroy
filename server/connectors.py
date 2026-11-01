@@ -542,14 +542,37 @@ def geocode(query: str, near: Optional[tuple] = None) -> Optional[dict]:
     if near:                                       # ищем сначала рядом с домом пользователя
         lat, lon = near
         params["viewbox"] = f"{lon - 0.6},{lat + 0.4},{lon + 0.6},{lat - 0.4}"
-    r = requests.get(NOMINATIM, params=params, timeout=15, headers=UA)
-    _geo_last[0] = time.time()
-    r.raise_for_status()
-    found = r.json()
-    if not found:
+    try:
+        r = requests.get(NOMINATIM, params=params, timeout=15, headers=UA)
+        _geo_last[0] = time.time()
+        r.raise_for_status()
+        found = r.json()
+        if found:
+            f = found[0]
+            return {"lat": float(f["lat"]), "lon": float(f["lon"]), "name": f.get("display_name", query)}
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Геокодер OpenStreetMap: %s — пробую запасной", _err(e))
+    return geocode_photon(query, near)          # запасной бесплатный геокодер (тоже на данных OpenStreetMap)
+
+
+PHOTON = "https://photon.komoot.io/api/"
+
+
+def geocode_photon(query: str, near: Optional[tuple] = None) -> Optional[dict]:
+    params = {"q": query, "limit": 1}
+    if near:
+        params.update(lat=near[0], lon=near[1])
+    try:
+        r = requests.get(PHOTON, params=params, timeout=15, headers=UA)
+        r.raise_for_status()
+        feats = r.json().get("features") or []
+    except (requests.RequestException, ValueError) as e:
+        raise RuntimeError("сервис адресов сейчас недоступен — попробуй через минуту") from e
+    if not feats:
         return None
-    f = found[0]
-    return {"lat": float(f["lat"]), "lon": float(f["lon"]), "name": f.get("display_name", query)}
+    pr, (lon, lat) = feats[0].get("properties", {}), feats[0]["geometry"]["coordinates"][:2]
+    name = ", ".join(x for x in (pr.get("name"), pr.get("street"), pr.get("housenumber"), pr.get("city")) if x)
+    return {"lat": float(lat), "lon": float(lon), "name": name or query}
 
 
 class Places:
@@ -597,6 +620,16 @@ class Places:
         return geocode(text, self._home(places))
 
 
+def _safe(fn):
+    def wrap(*a, **k):
+        try:
+            return fn(*a, **k)
+        except RuntimeError as e:
+            return f"Не получилось найти адрес: {e}."
+    return wrap
+
+
+@_safe
 def route_link(places: Places, args: dict) -> str:
     mode = str(args.get("mode") or "transit")
     rtt, title = ROUTE_MODES.get(mode, ROUTE_MODES["transit"])
@@ -620,6 +653,7 @@ TAXI_TARIFFS = {"econom": "Эконом", "business": "Комфорт", "comfort
                 "vip": "Бизнес", "child_tariff": "Детский"}
 
 
+@_safe
 def taxi_link(places: Places, args: dict, from_pc: bool = False) -> str:
     """Ссылка на заказ в Яндекс Go: откроет приложение с уже заполненным маршрутом — заказ человек подтверждает сам."""
     to_q, frm_q = str(args.get("to") or "").strip(), str(args.get("from") or "").strip()
@@ -813,8 +847,12 @@ YIOT_UNITS = {"unit.temperature.celsius": "°C", "unit.percent": "%", "unit.ppm"
 def _yiot(cfg: dict, method: str, path: str, body: Optional[dict] = None) -> dict:
     r = requests.request(method, YIOT_API + path, json=body, timeout=20,
                          headers={"Authorization": f"Bearer {cfg['token']}", **UA})
-    if r.status_code in (401, 403):
-        raise PermissionError("Яндекс не принял токен (он мог истечь — токен живёт около года)")
+    if r.status_code == 401:
+        raise PermissionError("Яндекс не принял токен: он неверный или истёк (обычно токен начинается с y0_). "
+                              "Получи новый по ссылке authorize из инструкции")
+    if r.status_code == 403:
+        raise PermissionError("у токена нет прав на умный дом. В своём приложении на oauth.yandex.ru проверь "
+                              "доступы «Умный дом Яндекса: просмотр и управление», сохрани и получи токен заново")
     r.raise_for_status()
     data = r.json()
     if data.get("status") == "error":
@@ -935,13 +973,30 @@ def yiot_info_cached(cfg: dict, ttl: int = 300) -> Optional[dict]:
     """Список устройств — не чаще раза в 5 минут (для быстрых команд и подсказок модели)."""
     if _YCACHE["info"] is not None and _YCACHE["token"] == cfg.get("token") and time.time() - _YCACHE["at"] < ttl:
         return _YCACHE["info"]
+    if _YCACHE.get("fail_at") and time.time() - _YCACHE["fail_at"] < 60 and _YCACHE.get("fail_token") == cfg.get("token"):
+        return _YCACHE["info"] if _YCACHE["token"] == cfg.get("token") else None     # не долбим Яндекс каждую секунду
     try:
         info = _yiot(cfg, "GET", "user/info")
     except Exception as e:
         log.warning("Умный дом Яндекса: %s", e)
+        _YCACHE.update(fail_at=time.time(), fail_token=cfg.get("token"), error=str(e))
         return _YCACHE["info"] if _YCACHE["token"] == cfg.get("token") else None
-    _YCACHE.update(at=time.time(), token=cfg.get("token"), info=info)
+    _YCACHE.update(at=time.time(), token=cfg.get("token"), info=info, fail_at=0, error="")
     return info
+
+
+_NOT_HOME = re.compile(r"^(?:комп\w*|пк|ноут\w*|звук|музык\w*|трек|песн\w*|экран|монитор\w*)\b", re.I)
+
+
+def yiot_unavailable(cfg: dict, text: str) -> Optional[str]:
+    """Токен есть, но умный дом недоступен, а команда похожа на «вкл/выкл устройство» — честно говорим, а не
+    отправляем её компьютеру как «закрыть программу»."""
+    m = _YFAST.match(re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I))
+    if not m or _NOT_HOME.match(m.group(2).strip()) or yiot_info_cached(cfg):
+        return None
+    why = _YCACHE.get("error") or "нет связи"
+    return (f"⚠️ Не могу проверить умный дом Яндекса: {why}.\n"
+            "Если это программа на компьютере — скажи «закрой …» / «открой …».")
 
 
 def _words(text: str) -> list:

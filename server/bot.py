@@ -1159,6 +1159,9 @@ class Assistant:
             home = connectors.yiot_fast(ycfg, self.user_text, TZ)
             if home:
                 return home
+            down = connectors.yiot_unavailable(ycfg, self.user_text)
+            if down:
+                return down
             if connectors.yiot_mentions(ycfg, self.user_text):
                 return None
         pending = getattr(self, "pending_power", {}).pop(chat_id, None)
