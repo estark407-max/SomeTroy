@@ -616,18 +616,55 @@ def route_link(places: Places, args: dict) -> str:
             "пересадками и временем в пути. Сам время и пересадки не придумывай.")
 
 
-ROUTE_HINT = r"как (?:добраться|доехать|дойти|проехать|попасть)|маршрут|доехать|добраться|дорог[ау] (?:до|от)|ехать (?:до|от|в)|сколько ехать|запомни.*(?:адрес|дом|работ)|мой (?:дом|адрес)|я живу"
+TAXI_TARIFFS = {"econom": "Эконом", "business": "Комфорт", "comfortplus": "Комфорт+", "minivan": "Минивэн",
+                "vip": "Бизнес", "child_tariff": "Детский"}
+
+
+def taxi_link(places: Places, args: dict) -> str:
+    """Ссылка на заказ в Яндекс Go: откроет приложение с уже заполненным маршрутом — заказ человек подтверждает сам."""
+    to_q, frm_q = str(args.get("to") or "").strip(), str(args.get("from") or "").strip()
+    params = []
+    frm = places.resolve(frm_q) if frm_q else None
+    if frm_q and not frm:
+        return f"Не нашёл на карте «{frm_q}». Попроси уточнить: город, улица, дом."
+    to = places.resolve(to_q) if to_q else None
+    if to_q and not to:
+        return f"Не нашёл на карте «{to_q}». Попроси уточнить: город, улица, дом."
+    if not to and not frm:
+        return "Ошибка: куда ехать? Спроси адрес."
+    if frm:
+        params += [f"start-lat={frm['lat']:.6f}", f"start-lon={frm['lon']:.6f}"]
+    if to:
+        params += [f"end-lat={to['lat']:.6f}", f"end-lon={to['lon']:.6f}"]
+    tariff = str(args.get("tariff") or "econom")
+    if tariff in TAXI_TARIFFS:
+        params.append(f"tariffClass={tariff}")
+    params += ["ref=sometroy", "appmetrica_tracking_id=1178268795219780156"]
+    url = "https://3.redirect.appmetrica.yandex.com/route?" + "&".join(params)
+    return (f"Ссылка на заказ такси в Яндекс Go ({TAXI_TARIFFS.get(tariff, 'Эконом')}): {url}\n"
+            f"Откуда: {frm['name'] if frm else 'текущее место (определит телефон)'}\nКуда: {to['name'] if to else 'не указано'}\n"
+            "Передай ссылку целиком, как есть. Скажи пользователю: на телефоне она откроет Яндекс Go с заполненным "
+            "маршрутом — тариф, оплату и сам заказ он подтверждает в приложении. Сам ты такси не заказываешь.")
+
+
+ROUTE_HINT = r"такси|яндекс ?go|как (?:добраться|доехать|дойти|проехать|попасть)|маршрут|доехать|добраться|дорог[ау] (?:до|от)|ехать (?:до|от|в)|сколько ехать|запомни.*(?:адрес|дом|работ)|мой (?:дом|адрес)|я живу"
 ROUTE_TOOLS = [
     fn("route_link", "Ссылка на маршрут в Яндекс Картах (общественный транспорт, машина, пешком…).", {
         "from": {"type": "string", "description": "откуда: адрес, место или «дом»/«работа»; пусто — от текущего места"},
         "to": {"type": "string", "description": "куда: адрес, место или «дом»/«работа»"},
         "mode": {"type": "string", "enum": list(ROUTE_MODES), "description": "по умолчанию transit — общественный транспорт"}},
         ["to"]),
+    fn("taxi_link", "Ссылка на заказ такси в Яндекс Go с заполненным маршрутом (заказ пользователь подтверждает сам).", {
+        "from": {"type": "string", "description": "откуда: адрес, место или «дом»/«работа»; пусто — от текущего места"},
+        "to": {"type": "string", "description": "куда: адрес, место или «дом»/«работа»"},
+        "tariff": {"type": "string", "enum": list(TAXI_TARIFFS), "description": "по умолчанию econom"}}, ["to"]),
     fn("save_place", "Запомнить место пользователя (дом, работа, дача…) для маршрутов.", {
         "name": {"type": "string", "description": "дом, работа, дача, офис…"},
         "address": {"type": "string", "description": "адрес с городом"}}, ["name", "address"]),
 ]
 ROUTE_RULES = """
+- Такси: taxi_link даёт ссылку на Яндекс Go с уже вбитым маршрутом. Ты такси не заказываешь — пользователь
+  нажимает ссылку и сам подтверждает заказ в приложении. Тариф «комфорт» — business, «комфорт плюс» — comfortplus.
 - Маршруты: route_link даёт ссылку на Яндекс Карты (по умолчанию общественный транспорт). Сам маршрут, пересадки
   и время не выдумывай — отправь ссылку как есть. Если в адресе нет города, а дом пользователя не сохранён,
   уточни город. «Мой дом — …», «работа — …» запоминай через save_place."""

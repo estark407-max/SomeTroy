@@ -1079,6 +1079,8 @@ class Assistant:
                 return self.pc_command(chat_id, args)
             if name == "route_link":
                 return connectors.route_link(self.places, args)
+            if name == "taxi_link":
+                return connectors.taxi_link(self.places, args)
             if name == "save_place":
                 return self.places.save(str(args.get("name") or ""), str(args.get("address") or ""))
             if self.conns.owner_of(name):
