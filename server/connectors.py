@@ -1013,7 +1013,7 @@ _NOT_HOME = re.compile(r"^(?:комп\w*|пк|ноут\w*|звук|музык\w*
 def yiot_unavailable(cfg: dict, text: str) -> Optional[str]:
     """Токен есть, но умный дом недоступен, а команда похожа на «вкл/выкл устройство» — честно говорим, а не
     отправляем её компьютеру как «закрыть программу»."""
-    m = _YFAST.match(re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I))
+    m = _YFAST.match(_yfast_text(text))
     if not m or _NOT_HOME.match(m.group(2).strip()) or yiot_info_cached(cfg):
         return None
     why = _YCACHE.get("error") or "нет связи"
@@ -1021,8 +1021,29 @@ def yiot_unavailable(cfg: dict, text: str) -> Optional[str]:
             "Если это программа на компьютере — скажи «закрой …» / «открой …».")
 
 
+_NUM_WORDS = {"один": "1", "одна": "1", "одну": "1", "первый": "1", "первая": "1", "первую": "1",
+              "два": "2", "две": "2", "второй": "2", "вторая": "2", "вторую": "2",
+              "три": "3", "третий": "3", "третья": "3", "третью": "3",
+              "четыре": "4", "четвертый": "4", "четвертая": "4", "четвертую": "4",
+              "пять": "5", "пятый": "5", "пятая": "5", "пятую": "5", "шесть": "6", "шестой": "6", "шестую": "6",
+              "семь": "7", "седьмой": "7", "седьмую": "7", "восемь": "8", "восьмой": "8", "восьмую": "8",
+              "девять": "9", "девятый": "9", "девятую": "9", "десять": "10", "десятый": "10", "десятую": "10"}
+
+
 def _words(text: str) -> list:
-    return re.sub(r"[^\w]+", " ", (text or "").lower().replace("ё", "е")).split()
+    """Слова для сравнения названий: голосом «ферму два» = текстом «ферма 2»."""
+    return [_NUM_WORDS.get(w, w) for w in re.sub(r"[^\w]+", " ", (text or "").lower().replace("ё", "е")).split()]
+
+
+_FILLER = re.compile(r"\b(?:пожалуйста|плиз|please|ка|мне|нам|там|быстро|срочно|сейчас)\b", re.I)
+
+
+def _yfast_text(text: str) -> str:
+    """Как команду обычно говорят голосом: «Эй, Трой, выключи-ка, пожалуйста, ферму два.» → «выключи ферму два»."""
+    t = re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I)
+    t = re.sub(r"^(?:(?:эй|ну|слушай|так|трой|troy)[\s,!.:—-]+)+", "", t, flags=re.I)
+    t = _FILLER.sub(" ", t.replace("-ка", " "))
+    return re.sub(r"\s*[,;]\s*", " ", re.sub(r"\s+", " ", t)).strip(" .!?…")
 
 
 def _word_hit(name_word: str, words: list) -> bool:
@@ -1052,13 +1073,12 @@ def yiot_mentions(cfg: dict, text: str) -> bool:
     return bool(info and _yiot_named(info, text))
 
 
-_YFAST = re.compile(r"^(?:(?:трой|эй)[\s,!.:—-]+)?(включи|выключи|вруби|выруби|отключи|погаси|зажги|включить|выключить)\s+(.+?)[.!]*$",
-                    re.I)
+_YFAST = re.compile(r"^(включи|выключи|вруби|выруби|отключи|погаси|зажги|включить|выключить)\s+(.+?)[.!?…]*$", re.I)
 
 
 def yiot_fast(cfg: dict, text: str, tz) -> Optional[str]:
     """«Выключи ферма 2» — если «ферма 2» есть в умном доме, выполняем сразу, без нейросети."""
-    m = _YFAST.match(re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I))
+    m = _YFAST.match(_yfast_text(text))
     if not m:
         return None
     info = yiot_info_cached(cfg)
