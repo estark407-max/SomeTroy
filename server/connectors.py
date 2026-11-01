@@ -620,7 +620,7 @@ TAXI_TARIFFS = {"econom": "Эконом", "business": "Комфорт", "comfort
                 "vip": "Бизнес", "child_tariff": "Детский"}
 
 
-def taxi_link(places: Places, args: dict) -> str:
+def taxi_link(places: Places, args: dict, from_pc: bool = False) -> str:
     """Ссылка на заказ в Яндекс Go: откроет приложение с уже заполненным маршрутом — заказ человек подтверждает сам."""
     to_q, frm_q = str(args.get("to") or "").strip(), str(args.get("from") or "").strip()
     params = []
@@ -639,12 +639,21 @@ def taxi_link(places: Places, args: dict) -> str:
     tariff = str(args.get("tariff") or "econom")
     if tariff in TAXI_TARIFFS:
         params.append(f"tariffClass={tariff}")
-    params += ["ref=sometroy", "appmetrica_tracking_id=1178268795219780156"]
-    url = "https://3.redirect.appmetrica.yandex.com/route?" + "&".join(params)
-    return (f"Ссылка на заказ такси в Яндекс Go ({TAXI_TARIFFS.get(tariff, 'Эконом')}): {url}\n"
-            f"Откуда: {frm['name'] if frm else 'текущее место (определит телефон)'}\nКуда: {to['name'] if to else 'не указано'}\n"
-            "Передай ссылку целиком, как есть. Скажи пользователю: на телефоне она откроет Яндекс Go с заполненным "
-            "маршрутом — тариф, оплату и сам заказ он подтверждает в приложении. Сам ты такси не заказываешь.")
+    params.append("ref=sometroy")
+    base = "https://3.redirect.appmetrica.yandex.com/route?" + "&".join(params)
+    app = base + "&appmetrica_tracking_id=1178268795219780156"     # телефон: приложение Яндекс Go
+    web = base + "&appmetrica_tracking_id=25395763362139037"       # компьютер: сайт Яндекс Go
+    links = ([("💻 На сайте Яндекс Go (с компьютера)", web), ("📱 В приложении (с телефона)", app)] if from_pc
+             else [("📱 В приложении Яндекс Go", app), ("💻 На сайте (с компьютера)", web)])
+    if not frm and from_pc:
+        note = " Точку подачи на сайте укажи сам — компьютер своё место не знает (или скажи «от дома»)."
+    else:
+        note = ""
+    return (f"Заказ такси в Яндекс Go ({TAXI_TARIFFS.get(tariff, 'Эконом')}):\n" +
+            "\n".join(f"{t}: {u}" for t, u in links) +
+            f"\nОткуда: {frm['name'] if frm else 'текущее место'}\nКуда: {to['name'] if to else 'не указано'}\n"
+            "Передай обе ссылки целиком, как есть. Скажи: маршрут уже вбит — тариф, оплату и сам заказ пользователь "
+            "подтверждает в Яндекс Go. Сам ты такси не заказываешь." + note)
 
 
 ROUTE_HINT = r"такси|яндекс ?go|как (?:добраться|доехать|дойти|проехать|попасть)|маршрут|доехать|добраться|дорог[ау] (?:до|от)|ехать (?:до|от|в)|сколько ехать|запомни.*(?:адрес|дом|работ)|мой (?:дом|адрес)|я живу"
