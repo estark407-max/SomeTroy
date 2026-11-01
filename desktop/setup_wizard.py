@@ -202,6 +202,23 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
 password_holder = {"pw": ""}     # пароль программы на время установки (в файл не пишется)
 
 
+def fetch_cert(ip: str, port: int, fingerprint: str):
+    """Скачать сертификат сервера и сверить с отпечатком из кода /connect. (pem, None) или (None, причина)."""
+    import base64
+    import hashlib
+    import ssl
+    try:
+        pem = ssl.get_server_certificate((ip, port), timeout=15)
+    except (OSError, ssl.SSLError):
+        return None, (f"Не достучался до {ip}:{port}. Проверь, что сервер включён и порт {port} открыт "
+                      "(в панели хостинга, если там есть файрвол).")
+    got = base64.urlsafe_b64encode(hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).digest()).decode().rstrip("=")
+    if got != fingerprint:
+        return None, ("⚠️ Сервер по этому адресу — не твой Трой: сертификат не совпал с кодом. "
+                      "Возьми свежий код командой /connect.")
+    return pem, None
+
+
 def server_reachable(ip: str, port: int, cert_path: Path) -> bool:
     try:
         r = requests.get(f"https://{ip}:{port}/api/ping", timeout=10, verify=str(cert_path))
@@ -216,8 +233,9 @@ class Wizard:
     """Шаги: режим → Groq → Telegram → хозяин → имя → пароль → доп. модули → часовой пояс → установка."""
 
     def __init__(self, finish_local: Callable[[str, str], None], finish_vps: Callable[[dict], None],
-                 template: str, src_dir: Path, data_dir: Path):
-        self.finish_local, self.finish_vps = finish_local, finish_vps
+                 template: str, src_dir: Path, data_dir: Path,
+                 finish_connect: Optional[Callable[[dict], Optional[str]]] = None):
+        self.finish_local, self.finish_vps, self.finish_connect = finish_local, finish_vps, finish_connect
         self.template, self.src_dir, self.data_dir = template, src_dir, data_dir
         self.v: dict = {}               # то, что пойдёт в settings.env
         self.state = "mode"
@@ -237,8 +255,9 @@ class Wizard:
                 msg("Где мне жить?\n\n"
                     "- **На этом компьютере** — проще всего, ничего не нужно. Но я работаю, только пока компьютер включён.\n"
                     "- **На твоём сервере (VPS)** — работаю круглосуточно, напоминания приходят всегда. "
-                    "Нужен свой сервер на Ubuntu и пароль root.",
-                    ["На этом компьютере", "На моём сервере (VPS)"])]
+                    "Нужен свой сервер на Ubuntu и пароль root.\n"
+                    "- **У меня уже есть Трой** — подключить этот компьютер к Трою, который уже живёт на твоём сервере.",
+                    ["На этом компьютере", "На моём сервере (VPS)", "У меня уже есть Трой"])]
 
     def handle(self, text: str) -> List[dict]:
         text = (text or "").strip()
@@ -251,12 +270,18 @@ class Wizard:
     # ── шаги ──
     def s_mode(self, t: str):
         low = t.lower()
+        if "уже есть" in low or "подключ" in low:
+            self.state = "connect"
+            return [msg("Подключим этот компьютер. Напиши своему Трою в Telegram команду /connect — он пришлёт код "
+                        "вида troy://… Скопируй его целиком сюда.\n\nВ коде нет паролей: это адрес сервера и его "
+                        "«отпечаток», чтобы я точно подключился к твоему Трою, а не к подделке.",
+                        ["Назад"], placeholder="troy://…")]
         if "компьютер" in low:
             self.mode = "local"
         elif "сервер" in low or "vps" in low:
             self.mode = "vps"
         else:
-            return [msg("Выбери кнопкой, где мне жить.", ["На этом компьютере", "На моём сервере (VPS)"])]
+            return [msg("Выбери кнопкой, где мне жить.", ["На этом компьютере", "На моём сервере (VPS)", "У меня уже есть Трой"])]
         self.state = "groq"
         return [msg("Отлично. Шаг 1 из 5 — мозги.\n\n"
                     "Я думаю с помощью бесплатных моделей Groq. Нужен ключ:\n"
@@ -468,6 +493,31 @@ class Wizard:
         return out + [msg(f"🎉 Готово! Я живу на сервере {self.vps['ip']}.{warn}\n\n"
                           "Сейчас перезапущусь и войду. Удалить меня с сервера можно одной командой: "
                           "`bash /opt/sometroy/uninstall.sh`", done=True)]
+
+    def s_connect(self, t: str):
+        if t.lower() == "назад":
+            return self.start()[1:]
+        m = re.fullmatch(r"troy://(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})#([\w-]{40,})", t.strip())
+        if not m:
+            return [msg("Код выглядит так: troy://203.0.113.10:8443#… — скопируй его из Telegram целиком "
+                        "(команда /connect).", ["Назад"], placeholder="troy://…")]
+        ip, port, fp = m.group(1), int(m.group(2)), m.group(3)
+        cert, err = fetch_cert(ip, port, fp)
+        if err:
+            return [msg(err, ["Назад"], placeholder="troy://…")]
+        self.vps = {"ip": ip, "port": port, "cert": cert}
+        self.state = "connect_pass"
+        return [msg(f"✅ Нашёл твоего Троя на {ip}, сертификат совпал. Введи пароль программы — тот же, "
+                    "что на первом компьютере (забыл — задай новый в Telegram: /password новый_пароль).",
+                    secret=True, placeholder="Пароль")]
+
+    def s_connect_pass(self, t: str):
+        err = self.finish_connect({**self.vps, "password": t}) if self.finish_connect else "нет подключения"
+        if err:
+            return [msg(err, secret=True, placeholder="Пароль")]
+        self.state = "done"
+        return [msg("🎉 Готово! Этот компьютер подключён к твоему Трою. Сейчас перезапущусь — переписка, "
+                    "напоминания и идеи те же, что и везде.", done=True)]
 
     def s_done(self, t: str):
         return [msg("Настройка уже закончена — перезапускаюсь.", done=True)]

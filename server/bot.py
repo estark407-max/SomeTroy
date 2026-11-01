@@ -1214,7 +1214,8 @@ HELP = """Я {name}, твой помощник. Пиши текстом, гол�
 /password новый_пароль — пароль для программы на компьютере
 /devices — где открыта программа; /devices выйти — выйти везде
 /status — какие модели сейчас работают, какие на перерыве
-/apps слово — какие программы с этим словом Трой видит на компьютере"""
+/apps слово — какие программы с этим словом Трой видит на компьютере
+/connect — код, чтобы подключить ещё один компьютер"""
 
 
 class Bot:
@@ -1232,6 +1233,8 @@ class Bot:
             self.tg.send(chat_id, "Начали с чистого листа. Напоминания и идеи на месте.")
         elif cmd == "/password":
             self.set_app_password(chat_id, arg.strip())
+        elif cmd == "/connect":
+            self.tg.send(chat_id, connect_text())
         elif cmd == "/devices":
             if arg.strip().lower() in ("выйти", "logout", "выход"):
                 n = AppAuth.logout_all()
@@ -1457,6 +1460,33 @@ class Bot:
 
 # ───────────────────────── Программа на компьютере ─────────────────────────
 
+def connect_code() -> Optional[str]:
+    """troy://IP:ПОРТ#отпечаток — адрес сервера и отпечаток его сертификата (без паролей).
+    Программа на новом компьютере скачает сертификат и сверит отпечаток: подменить сервер нельзя."""
+    import ssl
+    cert = TLS_DIR / "cert.pem"
+    if LOCAL_MODE or not cert.exists():
+        return None
+    pem = cert.read_text()
+    fp = base64.urlsafe_b64encode(hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).digest()).decode().rstrip("=")
+    try:
+        info = ssl._ssl._test_decode_cert(str(cert))              # IP сервера записан в сертификате
+        ip = next(v for k, v in info.get("subjectAltName", ()) if k == "IP Address")
+    except Exception:
+        return None
+    return f"troy://{ip}:{DESKTOP_PORT}#{fp}"
+
+
+def connect_text() -> str:
+    code = connect_code()
+    if not code:
+        return ("Я живу на компьютере (локальный режим) — к такому Трою другие компьютеры не подключаются. "
+                "Чтобы пользоваться мной с нескольких компьютеров, поставь меня на свой сервер (VPS).")
+    return ("Чтобы подключить ещё один компьютер: поставь на нём программу Трой, при первом запуске нажми "
+            "«У меня уже есть Трой» и вставь этот код:\n\n" + code +
+            "\n\nВ коде нет паролей — войти всё равно можно только с паролем программы.")
+
+
 def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
     """Команды в программе на компьютере — те же, что в Telegram (кроме пароля)."""
     cmd, _, arg = text.strip().partition(" ")
@@ -1485,6 +1515,8 @@ def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
             f"- {r['device']} ({r['ip']}), вход {datetime.fromtimestamp(r['created'], TZ):%d.%m %H:%M}" for r in rows)
     if cmd == "/password":
         return "Пароль меняется только в Telegram: /password новый_пароль"
+    if cmd == "/connect":
+        return connect_text()
     if cmd in ("/help", "/start"):
         return HELP.format(name=BOT_NAME)
     return None
@@ -1997,6 +2029,7 @@ def serve(stop: Optional[threading.Event] = None) -> None:
         {"command": "ideas", "description": "Проекты с идеями"},
         {"command": "new", "description": "Начать разговор заново"},
         {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
+        {"command": "connect", "description": "Подключить ещё один компьютер"},
         {"command": "help", "description": "Что я умею"},
     ], ensure_ascii=False)})
     log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),

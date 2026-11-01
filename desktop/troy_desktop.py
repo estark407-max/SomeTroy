@@ -559,6 +559,7 @@ def make_wizard():
     import setup_wizard
     import local_server
     device = os.environ.get("COMPUTERNAME") or "компьютер"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def finish_local(settings: str, password: str) -> None:
         home = local_server.server_home(DATA_DIR)
@@ -582,8 +583,27 @@ def make_wizard():
         except requests.RequestException:
             pass                                # сервер пока недоступен с компьютера — войдёт по паролю позже
 
+    def finish_connect(info: dict):
+        """Ещё один компьютер к Трою на сервере: вход по паролю. None — получилось, иначе причина."""
+        cert = DATA_DIR / "troy-cert.pem"
+        cert.write_text(info["cert"], encoding="utf-8")
+        server = f"https://{info['ip']}:{info['port']}"
+        try:
+            r = requests.post(server + "/api/login", json={"password": info["password"], "device": device},
+                              timeout=20, verify=str(cert))
+        except requests.RequestException:
+            return "Сервер не ответил. Попробуй ещё раз через минуту."
+        if r.status_code != 200:
+            try:
+                return r.json().get("error") or "Пароль не подошёл."
+            except ValueError:
+                return "Пароль не подошёл."
+        SESSION.write_text(json.dumps({"session": r.json().get("session", "")}), encoding="utf-8")
+        (DATA_DIR / "config.json").write_text(json.dumps({"mode": "vps", "server": server}), encoding="utf-8")
+        return None
+
     template = (SERVER_SRC / "settings.env.example").read_text(encoding="utf-8")
-    return setup_wizard.Wizard(finish_local, finish_vps, template, SERVER_SRC, DATA_DIR)
+    return setup_wizard.Wizard(finish_local, finish_vps, template, SERVER_SRC, DATA_DIR, finish_connect)
 
 
 def restart_program() -> None:
