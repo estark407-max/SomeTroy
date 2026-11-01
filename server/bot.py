@@ -1154,6 +1154,13 @@ class Assistant:
 
     def fast_pc(self, chat_id: str) -> Optional[str]:
         """Простые команды компьютеру — без модели."""
+        ycfg = self.conns.enabled().get("yhome")
+        if ycfg:                                 # «выключи ферма 2» — устройство умного дома, а не программа
+            home = connectors.yiot_fast(ycfg, self.user_text, TZ)
+            if home:
+                return home
+            if connectors.yiot_mentions(ycfg, self.user_text):
+                return None
         pending = getattr(self, "pending_power", {}).pop(chat_id, None)
         if pending and time.time() - pending[1] < 90 and YES_RE.match(self.user_text.strip()):
             text, choice = pc_create(pending[0], "", pending[2], self.channel, chat_id)

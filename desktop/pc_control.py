@@ -50,7 +50,9 @@ PROCESS = {"word": "winword", "powerpoint": "powerpnt", "google chrome": "chrome
 # Дополнительные имена процессов (у приложений из Store они часто английские)
 PROCESS_EXTRA = {"яндекс музыка": ["yandex.music", "yandexmusic", "yandex music"], "telegram": ["telegram desktop"],
                  "spotify": ["spotify"], "whatsapp": ["whatsapp", "whatsapp.root"]}
-NEVER_CLOSE = {"troy", "explorer", "csrss", "winlogon", "system", "svchost", "lsass", "dwm", "services", "smss"}
+NEVER_CLOSE = {"troy", "sometroy", "explorer", "csrss", "winlogon", "system", "svchost", "lsass", "dwm", "services",
+               "smss", "msedgewebview2", "runtimebroker", "searchhost", "startmenuexperiencehost", "shellexperiencehost",
+               "textinputhost", "ctfmon", "sihost", "fontdrvhost", "audiodg", "conhost"}
 
 
 def norm(s: str) -> str:
@@ -129,7 +131,8 @@ def _best(query: str, names: list) -> str:
     starts = [n for n in names if n.startswith(query)]
     if starts:
         return min(starts, key=len)
-    contains = [n for n in names if query in n]
+    # «содержит» — только для осмысленного слова: «2» или «pc» не должны совпасть с чем попало
+    contains = [n for n in names if query in n] if len(re.sub(r"[\d\s]", "", query)) >= 3 else []
     if contains:
         return min(contains, key=len)
     close = difflib.get_close_matches(query, names, n=1, cutoff=0.72)
@@ -215,7 +218,9 @@ def close_app(name: str):
         if hit:
             break
     if not hit and len(c.split()) > 1:
-        hit = best_match(c.split()[-1], procs)
+        last = c.split()[-1]
+        if len(last) >= 4 and not last.isdigit():     # «ферма 2» не должно закрыть «…2.exe»
+            hit = best_match(last, procs)
     if not hit:
         return False, f"«{name}» сейчас не запущена"
     if hit in NEVER_CLOSE:

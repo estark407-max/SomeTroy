@@ -928,6 +928,84 @@ def yiot_run(cfg: dict, name: str, args: dict, tz) -> str:
     return f"Готово: {obj.get('name')}{' (' + room + ')' if room else ''} — {action}{' ' + str(value) if value is not None else ''}."
 
 
+_YCACHE: dict = {"at": 0.0, "token": "", "info": None}
+
+
+def yiot_info_cached(cfg: dict, ttl: int = 300) -> Optional[dict]:
+    """Список устройств — не чаще раза в 5 минут (для быстрых команд и подсказок модели)."""
+    if _YCACHE["info"] is not None and _YCACHE["token"] == cfg.get("token") and time.time() - _YCACHE["at"] < ttl:
+        return _YCACHE["info"]
+    try:
+        info = _yiot(cfg, "GET", "user/info")
+    except Exception as e:
+        log.warning("Умный дом Яндекса: %s", e)
+        return _YCACHE["info"] if _YCACHE["token"] == cfg.get("token") else None
+    _YCACHE.update(at=time.time(), token=cfg.get("token"), info=info)
+    return info
+
+
+def _words(text: str) -> list:
+    return re.sub(r"[^\w]+", " ", (text or "").lower().replace("ё", "е")).split()
+
+
+def _word_hit(name_word: str, words: list) -> bool:
+    """Слово из названия есть в тексте с учётом падежа: «ферма» ~ «ферму», «люстра» ~ «люстру», «2» = «2»."""
+    if name_word.isdigit():
+        return name_word in words
+    if len(name_word) <= 3:                            # «зал» ~ «зале», «тв» = «тв»
+        return any(w == name_word or (w.startswith(name_word) and len(w) - len(name_word) <= 2) for w in words)
+    root = name_word[:max(3, len(name_word) - 2)]
+    return any(w.startswith(root) and abs(len(w) - len(name_word)) <= 3 for w in words)
+
+
+def _yiot_named(info: dict, text: str) -> list:
+    """Устройства и группы, чьё название есть в тексте (в любом падеже; самые длинные названия — первыми)."""
+    words = _words(text)
+    out = []
+    for kind, items in (("device", info.get("devices", [])), ("group", info.get("groups", []))):
+        for it in items:
+            nw = _words(it.get("name"))
+            if nw and all(_word_hit(w, words) for w in nw):
+                out.append((len(" ".join(nw)), kind, it))
+    return [x[1:] for x in sorted(out, key=lambda x: -x[0])]
+
+
+def yiot_mentions(cfg: dict, text: str) -> bool:
+    info = yiot_info_cached(cfg)
+    return bool(info and _yiot_named(info, text))
+
+
+_YFAST = re.compile(r"^(?:(?:трой|эй)[\s,!.:—-]+)?(включи|выключи|вруби|выруби|отключи|погаси|зажги|включить|выключить)\s+(.+?)[.!]*$",
+                    re.I)
+
+
+def yiot_fast(cfg: dict, text: str, tz) -> Optional[str]:
+    """«Выключи ферма 2» — если «ферма 2» есть в умном доме, выполняем сразу, без нейросети."""
+    m = _YFAST.match(re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I))
+    if not m:
+        return None
+    info = yiot_info_cached(cfg)
+    if not info:
+        return None
+    found = _yiot_named(info, m.group(2))
+    if not found:
+        return None
+    top = [f for f in found if len(_words(f[1].get("name"))) == len(_words(found[0][1].get("name")))
+           and _words(f[1].get("name")) == _words(found[0][1].get("name"))]
+    if len(top) > 1:                                   # одинаковые названия в разных комнатах — смотрим на комнату
+        rooms = {r["id"]: r["name"] for r in info.get("rooms", [])}
+        words = _words(m.group(2))
+        top = [f for f in top if all(_word_hit(w, words) for w in _words(rooms.get(f[1].get("room"), "")) or ["-"])]
+        if len(top) != 1:
+            return None                                # неясно, какое — пусть модель переспросит
+    kind, obj = top[0]
+    on = m.group(1).lower() in ("включи", "вруби", "зажги", "включить")
+    try:
+        return yiot_run(cfg, "yhome_control", {"target": obj["id"], "action": "on" if on else "off"}, tz)
+    except Exception as e:
+        return f"Умный дом Яндекса: не получилось — {_err(e) if isinstance(e, requests.RequestException) else e}"
+
+
 YIOT_CONNECTOR = {
     "title": "Умный дом Яндекса (Алиса)",
     "about": "Свет, розетки, кондиционеры, шторы, сценарии Алисы: «выключи свет в спальне».",
@@ -1040,7 +1118,8 @@ class Connections:
         tools, rules = [], []
         for cid, cfg in self.enabled().items():
             c = CONNECTORS[cid]
-            if any(re.search(c["hint"], t or "", re.I) for t in texts):
+            named = cid == "yhome" and texts and yiot_mentions(cfg, texts[0] or "")
+            if named or any(re.search(c["hint"], t or "", re.I) for t in texts):
                 tools += c["tools"]
                 rules.append(c["title"])
         return tools, rules
