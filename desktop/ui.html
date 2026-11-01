@@ -117,6 +117,7 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
        background: color-mix(in srgb, var(--user-text) 8%, transparent); font-size: 12.5px; }
 .thumbs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-bottom: 6px; }
 .thumbs img { height: 110px; max-width: 220px; object-fit: cover; border-radius: 12px; border: 1px solid var(--line); }
+.msg .box { white-space: pre-line; }
 .msg.alert .box {
   background: var(--alert-bg); color: var(--alert-text); border: 1px solid var(--alert-line);
   border-radius: 12px; padding: 10px 14px; display: flex; gap: 10px; align-items: flex-start;
@@ -126,6 +127,18 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
 textarea.secret { -webkit-text-security: disc; }
 .wz .pc-btn { padding: 8px 16px; }
 .msg.wz { margin-top: -12px; }
+.help-link { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; background: none; border: 0; padding: 0;
+  color: var(--accent); font: inherit; font-size: 13.5px; cursor: pointer; }
+.help-link:hover { text-decoration: underline; }
+.help-modal { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.45); display: none; place-items: center; padding: 16px; }
+.help-modal.show { display: grid; }
+.help-card { width: min(560px, 100%); max-height: min(80vh, 720px); overflow: auto; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 18px; padding: 20px 22px; box-shadow: 0 20px 60px rgba(0,0,0,.35); }
+.help-card h3 { margin: 0 0 10px; font-size: 17px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.help-card h3 button { background: none; border: 0; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; }
+.help-card .body p, .help-card .body li { line-height: 1.55; }
+.help-card a { color: var(--accent); text-decoration: underline; }
+.help-card .body p { margin: 0 0 10px; }
 .wz .avatar { visibility: hidden; }
 .pcs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .pc-btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--surface);
@@ -589,7 +602,11 @@ function drawFiles() {
   $("files").querySelectorAll(".x").forEach((b) => (b.onclick = () => { pending.splice(+b.dataset.i, 1); drawFiles(); }));
   updateSend(); input.focus();
 }
-function flash(text) { addBox("error", String(text)); }
+function flash(text) {
+  text = String(text);
+  if (!wizard && /связ|не отвечает|HTTP 5|ошибка в программе/i.test(text)) text += "\nЧтобы узнать причину, напиши /diag";
+  addBox("error", text);
+}
 
 // ── ввод ──
 function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 240) + "px"; updateSend(); }
@@ -867,6 +884,22 @@ setInterval(() => fetch(BASE + "/alive").then(() => { aliveFails = 0; }).catch((
   }
 }), 5000);
 
+// ── подробная инструкция к шагу настройки — в отдельном окне ──
+function showHelp(h) {
+  let m = $("help-modal");
+  if (!m) {
+    m = document.createElement("div"); m.id = "help-modal"; m.className = "help-modal";
+    m.innerHTML = `<div class="help-card" role="dialog"><h3><span></span><button title="Закрыть">×</button></h3><div class="body"></div></div>`;
+    m.onclick = (e) => { if (e.target === m || e.target.closest("h3 button")) m.classList.remove("show"); };
+    document.body.appendChild(m);
+  }
+  m.querySelector("h3 span").textContent = h.title;
+  // шаги «1. …» — строками с жирным номером (не маркированным списком)
+  m.querySelector(".body").innerHTML = render(h.text.replace(/^(\d+)\. /gm, "\u200b**$1.** "));
+  m.classList.add("show"); m.querySelector(".help-card").scrollTop = 0;
+}
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("help-modal")?.classList.remove("show"); });
+
 // ── мастер первой настройки: шаги ведёт программа, не нейросеть ──
 let wizard = false, wizardSecret = false;
 function addChoices(buttons) {
@@ -884,6 +917,12 @@ function showWizard(msgs) {
   let last = null;
   for (const m of msgs) {
     addTroy(m.text, Date.now() / 1000);
+    if (m.help) {
+      const btn = document.createElement("button"); btn.className = "help-link";
+      btn.textContent = "📖 Подробная инструкция"; btn.onclick = () => showHelp(m.help);
+      const meta = feed.lastElementChild.querySelector(".content .meta");
+      meta.parentNode.insertBefore(btn, meta);
+    }
     if (m.buttons && m.buttons.length) addChoices(m.buttons);
     last = m;
   }
@@ -949,6 +988,10 @@ $("logout").onclick = async () => {
   if (s.setup) { startWizard(); return; }
   if (s.logged_in) {
     await boot();
+    if (new URLSearchParams(location.search).get("diag") === "1") {        // «Диагностика» из трея
+      history.replaceState(null, "", location.pathname);
+      input.value = "/diag"; autosize(); send();
+    }
     if (new URLSearchParams(location.search).get("voice") === "1") {      // окно открыли клавишей
       history.replaceState(null, "", location.pathname);
       const st = await fetch(BASE + "/hk").then((r) => r.json()).catch(() => ({ down: false }));

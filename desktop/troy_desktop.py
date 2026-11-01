@@ -145,6 +145,54 @@ class Remote:
 WIZARD = {"w": None, "restart": None}      # мастер первой настройки, пока он идёт
 
 
+def app_diagnostics(remote: "Remote") -> str:
+    """/diag в программе: сначала проверки этого компьютера, потом — отчёт самого Троя."""
+    cfg = load_config()
+    mode = cfg.get("mode") or ("сервер" if cfg.get("server") else "не настроена")
+    lines = [f"🖥 Программа Трой {APP_VERSION} на {os.environ.get('COMPUTERNAME') or 'этом компьютере'}",
+             f"✅ Режим: {'на этом компьютере' if mode == 'local' else 'сервер ' + remote.base}"]
+    if mode == "local":
+        try:
+            import local_server
+            err = local_server._state.get("error")
+            lines.append(f"❌ Трой на этом компьютере остановился: {err}" if err else "✅ Трой на этом компьютере запущен")
+        except Exception as e:
+            lines.append(f"❌ Локальный Трой: {e}")
+    elif mode != "не настроена":
+        lines.append(("✅" if CERT.exists() else "❌") + f" Сертификат сервера: {'есть' if CERT.exists() else 'нет — ' + str(CERT)}")
+    code, body = remote._send("GET", "/api/ping")
+    if code == 200:
+        lines.append("✅ Связь с Троем: есть, вход выполнен")
+    elif code == 401:
+        lines.append("⚠️ Связь есть, но вход не выполнен — введи пароль (или задай новый в Telegram: /password)")
+    else:
+        try:
+            why = json.loads(body).get("error", "")
+        except ValueError:
+            why = ""
+        lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}. Проверь интернет; если Трой на сервере — "
+                     "что сервер включён и порт открыт.")
+    lines.append(("✅" if find_browser() else "⚠️") + " Окно: " + ("Edge/Chrome найден" if find_browser()
+                 else "Edge и Chrome не найдены — окно откроется в браузере по умолчанию"))
+    hk = load_settings().get("hotkey")
+    lines.append(f"⚪ Голос по клавише: {hk.get('label') if hk else 'не назначен'}")
+    try:                                        # последние ошибки программы из troy.log
+        errs = [l for l in LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+                if " ERROR " in l or " WARNING " in l][-5:]
+    except OSError:
+        errs = []
+    lines.append("Последние проблемы программы:\n" + "\n".join("- " + e[:200] for e in errs) if errs
+                 else "Проблем в журнале программы нет.")
+    if code == 200:
+        c2, b2 = remote.forward("POST", "/api/message", jbytes({"text": "/diag"}))
+        try:
+            lines.append("\n" + (json.loads(b2).get("reply") or "") if c2 == 200 else f"\n❌ Трой не ответил на /diag (код {c2})")
+        except ValueError:
+            pass
+    lines.append(f"\nЖурнал программы: {LOG}")
+    return "\n".join(lines)
+
+
 def make_handler(remote: Remote, key: str):
     prefix = f"/{key}"
     files = {"/": ("ui.html", "text/html; charset=utf-8"), "/favicon.png": ("favicon.png", "image/png")}
@@ -255,6 +303,13 @@ def make_handler(remote: Remote, key: str):
                 return
             if path != "/api/message":
                 self.send(404, b"{}")
+                return
+            try:
+                text = (json.loads(body or b"{}").get("text") or "").strip().lower()
+            except ValueError:
+                text = ""
+            if text in ("/diag", "/диагностика", "диагностика"):
+                self.send(200, jbytes({"reply": app_diagnostics(remote)}))
                 return
             code, resp = remote.forward("POST", path, body)
             self.send(code, resp)
@@ -606,6 +661,15 @@ def make_wizard():
     return setup_wizard.Wizard(finish_local, finish_vps, template, SERVER_SRC, DATA_DIR, finish_connect)
 
 
+def show_diag() -> None:
+    """Из трея: открыть окно и сразу показать диагностику."""
+    hwnd = find_window() if window_open() else None
+    if hwnd:
+        close_window()
+        time.sleep(0.8)
+    open_window(APP_URL + "?diag=1")
+
+
 def restart_program() -> None:
     """После мастера: запустить программу заново уже с настройками."""
     args = [sys.executable] + ([] if getattr(sys, "frozen", False) else [str(Path(__file__).resolve())])
@@ -673,6 +737,7 @@ def main():
     icon = pystray.Icon("troy", Image.open(RES_DIR / "favicon.png"), WINDOW_TITLE, menu=pystray.Menu(
         pystray.MenuItem("Открыть Троя", lambda icon, item: show_window(), default=True),
         pystray.MenuItem("О программе", on_about),
+        pystray.MenuItem("Диагностика", lambda icon, item: show_diag()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Выйти из аккаунта", on_logout, enabled=lambda item: remote.logged_in),
         pystray.MenuItem("Закрыть Троя", on_close),

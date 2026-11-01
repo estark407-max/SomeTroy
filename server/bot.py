@@ -87,6 +87,62 @@ LOCAL_IDEAS_DIR = BASE / "ideas"           # если GitHub не настрое
 MAX_FILE_MB = 19                           # Telegram отдаёт ботам файлы до 20 МБ
 
 log = logging.getLogger("assistant")
+STARTED = time.time()
+
+
+_SECRET_RE = re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}")
+
+
+def redact(text: str) -> str:
+    """Убрать из текста ошибки токены и ключи (Telegram вставляет токен прямо в адрес запроса)."""
+    return _SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or m.group(3)) + "•••", str(text))
+
+
+def human_error(e: BaseException) -> str:
+    """Понятная причина вместо простыни из requests."""
+    if isinstance(e, requests.exceptions.ProxyError):
+        return "не удалось соединиться через прокси"
+    if isinstance(e, requests.exceptions.SSLError):
+        return "ошибка защищённого соединения (возможно, мешает антивирус или прокси)"
+    if isinstance(e, requests.exceptions.Timeout):
+        return "сервис долго не отвечает"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "нет соединения — проверь интернет; возможно, сайт заблокирован (нужен VPN или прокси)"
+    return redact(str(e))[:200]
+
+
+class _RedactFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg_ = record.getMessage()
+        except Exception:
+            return True
+        clean = redact(msg_)
+        if clean != msg_:
+            record.msg, record.args = clean, ()
+        return True
+
+
+class _RecentProblems(logging.Handler):
+    """Последние предупреждения и ошибки — для /diag: видно, что именно пошло не так."""
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.items: list = []
+
+    def emit(self, record):
+        try:
+            text = record.getMessage().splitlines()[0][:220]
+        except Exception:
+            return
+        self.items = (self.items + [(record.created, record.levelname, text)])[-30:]
+
+
+RECENT = _RecentProblems()
+logging.getLogger().addHandler(RECENT)
+for _h in logging.getLogger().handlers:          # и в журнал файлов/консоли токены не попадают
+    _h.addFilter(_RedactFilter())
+log.addFilter(_RedactFilter())
+TG_STATE = {"ok": None, "error": "", "at": 0.0}     # связь с Telegram — для /diag
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 REPEATS = ["none", "daily", "weekdays", "weekly", "monthly", "yearly"]
@@ -1215,7 +1271,8 @@ HELP = """Я {name}, твой помощник. Пиши текстом, гол�
 /devices — где открыта программа; /devices выйти — выйти везде
 /status — какие модели сейчас работают, какие на перерыве
 /apps слово — какие программы с этим словом Трой видит на компьютере
-/connect — код, чтобы подключить ещё один компьютер"""
+/connect — код, чтобы подключить ещё один компьютер
+/diag — диагностика: что работает, что нет и почему"""
 
 
 class Bot:
@@ -1235,6 +1292,9 @@ class Bot:
             self.set_app_password(chat_id, arg.strip())
         elif cmd == "/connect":
             self.tg.send(chat_id, connect_text())
+        elif cmd == "/diag":
+            self.tg.typing(chat_id)
+            self.tg.send(chat_id, diagnostics(self.assistant))
         elif cmd == "/devices":
             if arg.strip().lower() in ("выйти", "logout", "выход"):
                 n = AppAuth.logout_all()
@@ -1434,9 +1494,11 @@ class Bot:
                 updates = self.tg.call("getUpdates", timeout=40, data={
                     "timeout": 30, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])})
             except (requests.RequestException, TelegramError) as e:
-                log.warning("getUpdates: %s", e)
+                log.warning("Telegram: %s", human_error(e))
+                TG_STATE.update(ok=False, error=human_error(e), at=time.time())
                 time.sleep(5)
                 continue
+            TG_STATE.update(ok=True, error="", at=time.time())
             for u in updates:
                 offset = u["update_id"] + 1
                 if u.get("callback_query"):
@@ -1460,6 +1522,87 @@ class Bot:
 
 # ───────────────────────── Программа на компьютере ─────────────────────────
 
+def _ok(flag) -> str:
+    return "✅" if flag is True else ("⚪" if flag is None else "❌")
+
+
+def diagnostics(assistant: Optional["Assistant"] = None) -> str:
+    """/diag — что работает, что нет и почему. Без ключей и паролей в ответе."""
+    up = int(time.time() - STARTED)
+    lines = [f"🩺 Диагностика Троя — {'на этом компьютере' if LOCAL_MODE else 'на сервере'}, "
+             f"работает {up // 3600} ч {up % 3600 // 60} мин"]
+    # Telegram
+    if TG_STATE["ok"] is None:
+        lines.append("⚪ Telegram: ещё не подключался")
+    elif TG_STATE["ok"]:
+        lines.append("✅ Telegram: на связи")
+    else:
+        lines.append(f"❌ Telegram: {TG_STATE['error']}. Если Telegram заблокирован — нужен прокси "
+                     "(TELEGRAM_PROXY в настройках) или VPN.")
+    # Groq
+    try:
+        have = set(Groq().models())
+        missing = [m for m in GROQ_MODELS if m not in have]
+        lines.append("✅ Groq: ключ работает" + (f"; нет моделей: {', '.join(missing)}" if missing else ""))
+    except LLMError as e:
+        lines.append(f"❌ Groq: {'ключ не принят — проверь GROQ_API_KEY' if e.status == 401 else e}")
+    except requests.RequestException as e:
+        lines.append(f"❌ Groq: {human_error(e)}")
+    if assistant is not None:
+        lines.append("   " + assistant.router.status().split("\n\n")[0].replace("\n", "\n   "))
+    # Mistral
+    if MISTRAL_API_KEY:
+        try:
+            r = requests.get("https://api.mistral.ai/v1/models", headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+                             timeout=15)
+            lines.append(f"{_ok(r.status_code == 200)} Mistral: " +
+                         ("ключ работает" if r.status_code == 200 else f"ошибка {r.status_code} — проверь MISTRAL_API_KEY"))
+        except requests.RequestException as e:
+            lines.append(f"❌ Mistral: {human_error(e)}")
+    else:
+        lines.append("⚪ Mistral: не подключён (необязательно)")
+    # Битрикс
+    if BITRIX_WEBHOOK:
+        try:
+            r = requests.get(BITRIX_WEBHOOK.rstrip("/") + "/profile.json", timeout=15)
+            okb = r.status_code == 200 and "result" in r.json()
+            lines.append(f"{_ok(okb)} Битрикс24: " + ("вебхук работает" if okb else
+                         f"ошибка {r.status_code} — проверь вебхук и его права"))
+        except (requests.RequestException, ValueError) as e:
+            lines.append(f"❌ Битрикс24: {human_error(e)}")
+    # идеи
+    if GITHUB_TOKEN and GITHUB_REPO:
+        try:
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}",
+                             headers={"Authorization": f"Bearer {GITHUB_TOKEN}"}, timeout=15)
+            lines.append(f"{_ok(r.status_code == 200)} Идеи в GitHub: " + (GITHUB_REPO if r.status_code == 200 else
+                         f"ошибка {r.status_code} — проверь GITHUB_TOKEN и GITHUB_REPO"))
+        except requests.RequestException as e:
+            lines.append(f"❌ Идеи в GitHub: {human_error(e)}")
+    else:
+        lines.append("✅ Идеи: хранятся " + ("на этом компьютере" if LOCAL_MODE else "на сервере"))
+    # база и напоминания
+    try:
+        with closing(db()) as con:
+            n = con.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
+        size = DB_FILE.stat().st_size // 1024
+        lines.append(f"✅ База: в порядке ({size} КБ), напоминаний: {n}, часовой пояс {TZ_NAME}")
+    except Exception as e:
+        lines.append(f"❌ База: {e}")
+    if not ALLOWED_USER_ID:
+        lines.append("❌ Хозяин не указан (ALLOWED_USER_ID) — Трой никому не отвечает")
+    # компьютеры
+    lines.append(pcs_status())
+    # последние проблемы
+    recent = [x for x in RECENT.items if time.time() - x[0] < 24 * 3600][-6:]
+    if recent:
+        lines.append("Последние проблемы:")
+        lines += [f"- {datetime.fromtimestamp(t, TZ):%d.%m %H:%M} {msg_}" for t, _lvl, msg_ in recent]
+    else:
+        lines.append("Проблем за последние сутки не было.")
+    return "\n".join(lines)
+
+
 def connect_code() -> Optional[str]:
     """troy://IP:ПОРТ#отпечаток — адрес сервера и отпечаток его сертификата (без паролей).
     Программа на новом компьютере скачает сертификат и сверит отпечаток: подменить сервер нельзя."""
@@ -1480,8 +1623,7 @@ def connect_code() -> Optional[str]:
 def connect_text() -> str:
     code = connect_code()
     if not code:
-        return ("Я живу на компьютере (локальный режим) — к такому Трою другие компьютеры не подключаются. "
-                "Чтобы пользоваться мной с нескольких компьютеров, поставь меня на свой сервер (VPS).")
+        return ("Я живу на компьютере (локальный режим) — к такому Трою другие компьютеры не подключаются.")
     return ("Чтобы подключить ещё один компьютер: поставь на нём программу Трой, при первом запуске нажми "
             "«У меня уже есть Трой» и вставь этот код:\n\n" + code +
             "\n\nВ коде нет паролей — войти всё равно можно только с паролем программы.")
@@ -1517,6 +1659,8 @@ def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
         return "Пароль меняется только в Telegram: /password новый_пароль"
     if cmd == "/connect":
         return connect_text()
+    if cmd == "/diag":
+        return diagnostics(assistant)
     if cmd in ("/help", "/start"):
         return HELP.format(name=BOT_NAME)
     return None
@@ -1784,20 +1928,34 @@ def pc_poll(device: str, version: str = "") -> list:
     PRESENCE[device] = time.time()
     if version:
         PC_VERSION[device] = version
-    now = int(time.time())
+    expire_stale()
     with closing(db()) as con, con:
-        stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent') AND created < ?",
-                            (now - 120,)).fetchall()
-        for r in stale:
-            con.execute("UPDATE pc_commands SET status='expired' WHERE id=?", (r["id"],))
         rows = con.execute("SELECT * FROM pc_commands WHERE status='pending' AND device=? ORDER BY id",
                            (device,)).fetchall()
         for r in rows:
             con.execute("UPDATE pc_commands SET status='sent' WHERE id=?", (r["id"],))
-    for r in stale:
-        pc_notify(r["channel"], r["chat_id"], f"⚠️ {r['device']} не ответил на «{pc_label(r['action'], r['arg'])}» "
-                                              f"— похоже, Трой там закрыт или нет интернета.")
     return [{"id": r["id"], "action": r["action"], "arg": r["arg"]} for r in rows]
+
+
+def expire_stale() -> None:
+    """Команда компьютеру висит 2 минуты — говорим владельцу, что именно не так, а не молчим."""
+    now = int(time.time())
+    with closing(db()) as con, con:
+        stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent','choose') AND created < ?",
+                            (now - 120,)).fetchall()
+        for r in stale:
+            con.execute("UPDATE pc_commands SET status='expired' WHERE id=?", (r["id"],))
+    for r in stale:
+        label = pc_label(r["action"], r["arg"])
+        if r["status"] == "choose":
+            continue                                   # кнопку выбора просто не нажали — это не ошибка
+        if r["status"] == "pending":
+            why = (f"⚠️ «{label}» не выполнено: {r['device']} не забрал команду за 2 минуты — "
+                   "программа Трой там закрыта, компьютер выключен или нет интернета.")
+        else:
+            why = (f"⚠️ «{label}»: {r['device']} взял команду, но не сообщил результат — возможно, программа "
+                   "там зависла или пропал интернет. Подробности — в журнале программы (troy.log).")
+        pc_notify(r["channel"], r["chat_id"], why)
 
 
 def pc_result(device: str, cmd_id: int, ok: bool, text: str, late: bool = False) -> None:
@@ -1863,6 +2021,7 @@ def power_watch_loop() -> None:
     while True:
         try:
             power_watch_once()
+            expire_stale()
         except Exception:
             log.exception("Слежение за питанием")
         time.sleep(5)
@@ -1985,6 +2144,8 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    for h in logging.getLogger().handlers:      # токены и ключи в журнал не пишем
+        h.addFilter(_RedactFilter())
 
     if args.check:
         raise SystemExit(0 if self_check() else 1)
@@ -2022,7 +2183,8 @@ def serve(stop: Optional[threading.Event] = None) -> None:
             tg.call("deleteWebhook")
             break
         except (requests.RequestException, TelegramError) as e:
-            log.warning("Telegram недоступен (%s) — пробую снова через 30 с", e)
+            log.warning("Telegram недоступен (%s) — пробую снова через 30 с", human_error(e))
+            TG_STATE.update(ok=False, error=human_error(e), at=time.time())
             time.sleep(30)
     tg.call("setMyCommands", data={"commands": json.dumps([
         {"command": "reminders", "description": "Мои напоминания"},
@@ -2030,6 +2192,7 @@ def serve(stop: Optional[threading.Event] = None) -> None:
         {"command": "new", "description": "Начать разговор заново"},
         {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
         {"command": "connect", "description": "Подключить ещё один компьютер"},
+        {"command": "diag", "description": "Диагностика: что работает и что нет"},
         {"command": "help", "description": "Что я умею"},
     ], ensure_ascii=False)})
     log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),
