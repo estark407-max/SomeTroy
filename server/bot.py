@@ -1021,7 +1021,6 @@ class Assistant:
         self.router = Router(self.llm)
         self.ideas = Ideas()
         self.bx = bitrix.Bitrix(BITRIX_WEBHOOK) if BITRIX_WEBHOOK else None
-        self.conns = connectors.Connections(db, TZ)      # календари, почта, умный дом, расписания
         self.lock = threading.Lock()     # Telegram и программа на компьютере — по очереди
         self.pc_used = False
         self.user_text = ""
@@ -1090,6 +1089,13 @@ class Assistant:
         except Exception as e:
             log.exception("Функция %s упала", name)
             return f"Ошибка: {e}"
+
+    @property
+    def conns(self) -> "connectors.Connections":
+        """Подключения: календари, почта, умный дом, расписания (доступы — в базе Троя)."""
+        if getattr(self, "_conns", None) is None:
+            self._conns = connectors.Connections(db, TZ)
+        return self._conns
 
     @staticmethod
     def strip_images(messages: list) -> list:
