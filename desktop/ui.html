@@ -157,6 +157,10 @@ textarea.secret { -webkit-text-security: disc; }
   padding: 9px 11px; font: inherit; font-size: 14px; }
 .conn-form .err { color: var(--danger); font-size: 13px; white-space: pre-line; }
 .conn-form .ok { color: var(--accent); font-size: 13px; }
+.conn-note { font-size: 13px; line-height: 1.45; background: var(--accent-soft); border-radius: 10px; padding: 8px 10px; }
+.conn-note a { color: var(--accent); }
+.conn-hint { color: var(--muted); font-size: 13px; margin: 4px 0 0; }
+.conn-group { margin: 14px 0 2px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .help-card .body p { margin: 0 0 10px; }
 .wz .avatar { visibility: hidden; }
 .pcs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
@@ -368,7 +372,7 @@ textarea::placeholder { color: var(--muted); }
     <button data-mode="off">Без звука</button>
   </div>
   </div>
-  <button class="icon-btn" id="conn-btn" title="Подключения: календарь, почта, умный дом, расписания">
+  <button class="icon-btn" id="conn-btn" title="Подключения: Telegram, календарь, почта, умный дом и другое">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0V8zM12 18v4"/></svg>
   </button>
   <div class="snd-wrap">
@@ -922,7 +926,7 @@ function showHelp(h) {
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("help-modal")?.classList.remove("show"); });
 
-// ── Подключения: календарь, почта, умный дом, расписания ──
+// ── Подключения: модули Троя (Telegram, Mistral, Битрикс24) и сервисы (календарь, почта, умный дом) ──
 let conns = [];
 function connModal() {
   let m = $("conn-modal");
@@ -942,14 +946,20 @@ async function openConnections() {
 }
 function drawConnList() {
   const body = connModal().querySelector(".body");
-  body.innerHTML = `<p>Подключи свои сервисы — и спрашивай Троя: «что у меня завтра», «есть новые письма?»,
-    «выключи свет в зале», «когда электричка до Москвы». Доступы хранятся только у твоего Троя и в нейросеть не попадают.</p>
-    <div class="conn-list">${conns.map((c) => `<div class="conn-item" data-id="${c.id}">
+  const item = (c) => `<div class="conn-item" data-id="${c.id}">
       <div class="row"><b>${esc(c.title)}</b><span class="conn-badge ${c.enabled ? "" : "off"}">${c.enabled ? "подключено" : "выключено"}</span></div>
       <div class="about">${esc(c.about)}${c.enabled && c.summary ? "<br>" + esc(c.summary) : ""}</div>
+      ${c.note ? `<div class="conn-note">${render(c.note)}</div>` : ""}
       <div class="conn-actions">${c.enabled
         ? `<button data-a="edit">Изменить</button><button data-a="off">Отключить</button>`
-        : `<button class="primary" data-a="edit">Подключить</button>`}<button data-a="help">📖 Инструкция</button></div></div>`).join("")}</div>`;
+        : `<button class="primary" data-a="edit">Подключить</button>`}<button data-a="help">📖 Инструкция</button></div></div>`;
+  const mods = conns.filter((c) => c.group === "module"), svcs = conns.filter((c) => c.group !== "module");
+  body.innerHTML = `<p>Всё здесь — по желанию, подключай когда удобно. Доступы проверяются у самих сервисов,
+    хранятся только у твоего Троя и в нейросеть не попадают.</p>
+    ${mods.length ? `<h4 class="conn-group">Трой</h4><div class="conn-list">${mods.map(item).join("")}</div>` : ""}
+    ${mods.length ? `<h4 class="conn-group">Сервисы</h4>` : ""}
+    <p class="conn-hint">Спрашивай: «что у меня завтра», «есть новые письма?», «выключи свет в зале».</p>
+    <div class="conn-list">${svcs.map(item).join("")}</div>`;
   body.querySelectorAll(".conn-item").forEach((el) => el.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
     const c = conns.find((x) => x.id === el.dataset.id);
     if (b.dataset.a === "help") return showHelp({ title: c.title, text: c.help });
@@ -992,7 +1002,7 @@ function drawConnForm(c) {
       if (r.status === 401) { connModal().classList.remove("show"); return showLogin(); }
       if (!r.ok) { form.querySelector(".err").textContent = "⚠️ " + (data.error || "не получилось"); return; }
       conns = data.connections; drawConnList();
-      addBox("info", `✅ Подключено: ${c.title}. Можно спрашивать Троя.`);
+      addBox("info", `✅ Подключено: ${c.title}.` + (data.note ? "\n\n" + data.note : " Можно спрашивать Троя."));
     } catch (err) { form.querySelector(".err").textContent = "⚠️ " + err.message; }
     finally { btn.disabled = false; btn.textContent = "Проверить и подключить"; }
   };

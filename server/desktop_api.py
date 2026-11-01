@@ -120,7 +120,8 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                     self.reply(200, {"ok": True, "connections": conns.listing()})
                     return
                 err = conns.connect(cid, data.get("values") or {})
-                self.reply(200 if not err else 400, {"ok": not err, "error": err or "", "connections": conns.listing()})
+                self.reply(200 if not err else 400, {"ok": not err, "error": err or "", "note": getattr(conns, "note", ""),
+                                                     "connections": conns.listing()})
                 return
             if path == "/api/pc/choose":
                 data = self.body()

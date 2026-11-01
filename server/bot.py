@@ -27,7 +27,7 @@ import time
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
 import requests
@@ -50,6 +50,8 @@ def env(name: str, default: str = "") -> str:
 
 TELEGRAM_TOKEN = env("TELEGRAM_TOKEN")
 TELEGRAM_PROXY = env("TELEGRAM_PROXY")
+TELEGRAM_BOT = env("TELEGRAM_BOT")               # адрес бота — для ссылок (не секрет)
+TELEGRAM_LINK_CODE = env("TELEGRAM_LINK_CODE")   # одноразовый код: Telegram подключили позже, ждём хозяина
 ALLOWED_USER_ID = env("ALLOWED_USER_ID")
 USER_NAME = env("USER_NAME")
 BOT_NAME = env("BOT_NAME", "Трой")
@@ -429,10 +431,12 @@ def events_after(after: int) -> list:
 
 
 def reminder_loop(stop: threading.Event) -> None:
-    tg = Telegram(TELEGRAM_TOKEN)   # своя сессия: requests.Session не любит несколько потоков
+    tg = None                       # своя сессия: requests.Session не любит несколько потоков
     pushed: set = set()
     while not stop.is_set():
         try:
+            if tg_linked() and (tg is None or tg.token != TELEGRAM_TOKEN):
+                tg = Telegram(TELEGRAM_TOKEN)
             now = int(time.time())
             with closing(db()) as con:
                 rows = con.execute("SELECT * FROM reminders WHERE active=1 AND due<=?", (now,)).fetchall()
@@ -441,7 +445,8 @@ def reminder_loop(stop: threading.Event) -> None:
                     pushed.add((r["id"], r["due"]))   # на компьютер — один раз, даже если Telegram недоступен
                     push_event(f"⏰ {r['text']}")
                 try:
-                    tg.send(r["chat_id"], f"⏰ {r['text']}")
+                    if tg_linked():         # без Telegram напоминание приходит только в программу
+                        tg.send(r["chat_id"], f"⏰ {r['text']}")
                 except requests.RequestException as e:
                     log.warning("Нет связи с Telegram, напоминание №%s отправлю позже: %s", r["id"], e)
                     continue
@@ -1469,6 +1474,16 @@ class Bot:
             self.tg.send(chat_id, f"Твой Telegram ID: {uid}\nВпиши в settings.env строку ALLOWED_USER_ID={uid} "
                                   f"и перезапусти бота. До этого я никому не отвечаю.")
             return
+        if not tg_linked():                  # Telegram подключили позже: хозяин приходит по ссылке с кодом
+            code = (msg.get("text") or "").strip()
+            if TELEGRAM_LINK_CODE and code in (f"/start {TELEGRAM_LINK_CODE}", TELEGRAM_LINK_CODE):
+                link_owner(uid)
+                self.tg.send(chat_id, f"Привет{', ' + USER_NAME if USER_NAME else ''}! Это {BOT_NAME}. Теперь я на "
+                                      "связи и здесь: та же переписка, напоминания и идеи, что в программе.")
+            else:
+                self.tg.send(chat_id, "Я пока ни к кому не привязан. Хозяин подключает меня в программе: "
+                                      "🔌 «Подключения» → Telegram.")
+            return
         if uid != ALLOWED_USER_ID:
             log.warning("Сообщение от чужого пользователя %s — игнорирую", uid)
             return
@@ -1539,9 +1554,9 @@ class Bot:
         except Exception:
             pass
 
-    def poll_forever(self) -> None:
+    def poll_forever(self, stop_when: Callable[[], bool] = lambda: False) -> None:
         offset = None
-        while True:
+        while not stop_when():
             try:
                 updates = self.tg.call("getUpdates", timeout=40, data={
                     "timeout": 30, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])})
@@ -1584,7 +1599,11 @@ def diagnostics(assistant: Optional["Assistant"] = None) -> str:
     lines = [f"🩺 Диагностика Троя — {'на этом компьютере' if LOCAL_MODE else 'на сервере'}, "
              f"работает {up // 3600} ч {up % 3600 // 60} мин"]
     # Telegram
-    if TG_STATE["ok"] is None:
+    if not TELEGRAM_TOKEN:
+        lines.append("⚪ Telegram: не подключён (необязательно — кнопка 🔌 «Подключения» в программе)")
+    elif not tg_linked():
+        lines.append("⚪ Telegram: бот подключён, но хозяин ещё не нажал «Запустить» по ссылке из «Подключений»")
+    elif TG_STATE["ok"] is None:
         lines.append("⚪ Telegram: ещё не подключался")
     elif TG_STATE["ok"]:
         lines.append("✅ Telegram: на связи")
@@ -1711,7 +1730,13 @@ def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
         return "Программа открыта:\n" + "\n".join(
             f"- {r['device']} ({r['ip']}), вход {datetime.fromtimestamp(r['created'], TZ):%d.%m %H:%M}" for r in rows)
     if cmd == "/password":
-        return "Пароль меняется только в Telegram: /password новый_пароль"
+        if tg_linked():
+            return "Пароль меняется только в Telegram: /password новый_пароль"
+        pw = arg.strip()                      # Telegram не подключён — меняем здесь (вход уже по паролю)
+        if len(pw) < 6 or " " in pw:
+            return "Напиши так: /password новый_пароль — не короче 6 символов, без пробелов."
+        AppAuth.set_password(pw)
+        return "🔑 Пароль сменён. Программа попросит войти с новым паролем."
     if cmd == "/connect":
         return connect_text()
     if cmd == "/diag":
@@ -1801,10 +1826,204 @@ def desktop_reply(assistant: "Assistant", text: str, files: Optional[list]) -> d
 
 
 def notify_owner(text: str) -> None:
+    if not tg_linked():
+        push_event(text)
+        return
     try:
         Telegram(TELEGRAM_TOKEN).send(ALLOWED_USER_ID, text)
     except Exception as e:
         log.warning("Не отправил уведомление: %s", e)
+
+
+# ───────────────────────── Модули, которые можно подключить позже ─────────────────────────
+# Telegram, Mistral и Битрикс24 включаются из программы (🔌 «Подключения») без перезапуска:
+# значение проверяется у сервиса, пишется в settings.env и сразу начинает работать.
+
+def tg_linked() -> bool:
+    """Telegram подключён и хозяин известен (ALLOWED_USER_ID — числовой id, а не «local»)."""
+    return bool(TELEGRAM_TOKEN) and bool(re.fullmatch(r"\d+", ALLOWED_USER_ID or ""))
+
+
+SETTINGS_LOCK = threading.Lock()
+
+
+def save_setting(key: str, value: str) -> None:
+    """Меняет одну строку settings.env (пустое значение — убирает её) и значение в работающем Трое."""
+    path = BASE / "settings.env"
+    with SETTINGS_LOCK:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        out, done = [], False
+        for line in lines:
+            if re.match(rf"\s*{re.escape(key)}\s*=", line):
+                if value and not done:
+                    out.append(f"{key}={value}")
+                done = True
+                continue
+            out.append(line)
+        if value and not done:
+            out.append(f"{key}={value}")
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    os.environ[key] = value
+    globals()[key] = value
+
+
+def link_owner(uid: str) -> None:
+    """Хозяин нажал «Запустить» по ссылке с кодом: переписка и напоминания программы переезжают на его id."""
+    old = ALLOWED_USER_ID
+    if old and old != uid:
+        with closing(db()) as con, con:
+            for table in ("history", "reminders", "pc_commands"):
+                con.execute(f"UPDATE {table} SET chat_id=? WHERE chat_id=?", (uid, old))
+    save_setting("ALLOWED_USER_ID", uid)
+    save_setting("TELEGRAM_LINK_CODE", "")
+    log.info("Telegram: хозяин привязан")
+
+
+def _tg_link_note() -> str:
+    if not (TELEGRAM_TOKEN and TELEGRAM_LINK_CODE and not tg_linked()):
+        return ""
+    return (f"Последний шаг: открой https://t.me/{TELEGRAM_BOT}?start={TELEGRAM_LINK_CODE} и нажми «Запустить» — "
+            "так я узнаю, что это ты, и буду отвечать только тебе.")
+
+
+def _tg_connect(v: dict) -> tuple:
+    token, proxy = v.get("token", ""), v.get("proxy", "")
+    if not re.fullmatch(r"\d{5,}:[\w-]{30,}", token):
+        return "Токен бота выглядит так: 123456789:AAH… — скопируй его из сообщения @BotFather целиком.", ""
+    if proxy and not re.match(r"(socks5h?|https?)://\S+$", proxy):
+        return "Адрес прокси выглядит так: socks5://адрес:порт или http://адрес:порт", ""
+    try:
+        r = make_session(proxy).get(f"https://api.telegram.org/bot{token}/getMe", timeout=20)
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        return (f"Не достучался до Telegram: {human_error(e)}. Если Telegram открывается только через VPN — "
+                "включи VPN или впиши прокси."), ""
+    if not data.get("ok"):
+        return "Telegram не принял токен. Проверь, что скопировал его целиком (/mybots → бот → API Token).", ""
+    save_setting("TELEGRAM_PROXY", proxy)
+    save_setting("TELEGRAM_BOT", data["result"]["username"])
+    if not re.fullmatch(r"\d+", ALLOWED_USER_ID or ""):
+        save_setting("TELEGRAM_LINK_CODE", secrets.token_hex(8))
+    save_setting("TELEGRAM_TOKEN", token)         # последним: на него смотрит цикл Telegram
+    return None, _tg_link_note() or (f"Готово: теперь я @{TELEGRAM_BOT}. Открой https://t.me/{TELEGRAM_BOT} "
+                                     "и нажми «Запустить», чтобы я мог тебе писать.")
+
+
+def _tg_disconnect() -> None:
+    save_setting("TELEGRAM_TOKEN", "")
+    save_setting("TELEGRAM_LINK_CODE", "")
+
+
+def _mistral_connect(assistant: "Assistant", v: dict) -> tuple:
+    key = v.get("key", "")
+    try:
+        r = requests.get("https://api.mistral.ai/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=20)
+    except requests.RequestException as e:
+        return f"Не достучался до Mistral: {human_error(e)}", ""
+    if r.status_code in (401, 403):
+        return "Mistral не принял ключ. Скопируй его заново на https://console.mistral.ai/api-keys", ""
+    if r.status_code != 200:
+        return f"Mistral ответил ошибкой {r.status_code}. Попробуй через минуту.", ""
+    save_setting("MISTRAL_API_KEY", key)
+    assistant.router.mistral = Mistral()
+    return None, ""
+
+
+def _mistral_disconnect(assistant: "Assistant") -> None:
+    save_setting("MISTRAL_API_KEY", "")
+    assistant.router.mistral = None
+
+
+def _bitrix_connect(assistant: "Assistant", v: dict) -> tuple:
+    url = v.get("url", "").strip()
+    if not re.match(r"https://\S+/rest/\d+/\S+", url):
+        return "Адрес вебхука выглядит так: https://портал.bitrix24.ru/rest/1/abc123…/ — скопируй его целиком.", ""
+    url = url.rstrip("/") + "/"
+    try:
+        r = requests.get(url + "profile.json", timeout=20)
+        ok = r.status_code == 200 and "result" in r.json()
+    except (requests.RequestException, ValueError) as e:
+        return f"Не достучался до портала: {human_error(e)}", ""
+    if not ok:
+        return "Битрикс24 не принял вебхук. Проверь адрес и права (task, im, crm, user).", ""
+    save_setting("BITRIX_WEBHOOK", url)
+    assistant.bx = bitrix.Bitrix(url)
+    return None, ""
+
+
+def _bitrix_disconnect(assistant: "Assistant") -> None:
+    save_setting("BITRIX_WEBHOOK", "")
+    assistant.bx = None
+
+
+def _host(url: str) -> str:
+    m = re.match(r"https?://([^/]+)", url or "")
+    return m.group(1) if m else ""
+
+
+def register_modules(assistant: "Assistant") -> None:
+    """Модули в окне «Подключения» — вверху списка, с той же формой и инструкцией."""
+    assistant.conns.modules = {
+        "telegram": {
+            "title": "Telegram", "about": "Пиши Трою с телефона, получай напоминания где угодно.",
+            "fields": [{"name": "token", "label": "Токен бота от @BotFather", "secret": True,
+                        "placeholder": "123456789:AAH…"},
+                       {"name": "proxy", "label": "Прокси (только если Telegram у тебя не открывается без него)",
+                        "placeholder": "socks5://адрес:порт", "optional": True}],
+            "state": lambda: (bool(TELEGRAM_TOKEN), f"@{TELEGRAM_BOT}" if TELEGRAM_BOT and TELEGRAM_TOKEN else "",
+                              _tg_link_note()),
+            "connect": _tg_connect, "disconnect": _tg_disconnect,
+            "help": """
+Трой будет отвечать и в Telegram — та же переписка, напоминания и идеи, что в программе.
+
+1. Открой @BotFather: https://t.me/BotFather (официальный бот Telegram, с синей галочкой).
+2. Нажми **Запустить** и отправь **/newbot**.
+3. Придумай имя (например «Мой Трой») и адрес латиницей на **bot** в конце, например my_troy_2026_bot.
+4. BotFather пришлёт токен вида **123456789:AAH…** — скопируй его целиком и вставь сюда.
+5. Трой покажет ссылку — открой её и нажми **Запустить**. Так он узнает, что ты хозяин, и будет отвечать только тебе.
+
+Потерял токен — /mybots → выбери бота → **API Token**.
+"""},
+        "mistral": {
+            "title": "Запасная модель Mistral",
+            "about": "Когда у бесплатного Groq кончится дневной лимит, Трой ответит через Mistral, а не замолчит.",
+            "fields": [{"name": "key", "label": "Ключ Mistral", "secret": True}],
+            "state": lambda: (bool(MISTRAL_API_KEY), "", ""),
+            "connect": lambda v: _mistral_connect(assistant, v),
+            "disconnect": lambda: _mistral_disconnect(assistant),
+            "help": """
+1. Открой https://console.mistral.ai/api-keys и войди (Google или почта).
+2. Если спросят про план — выбери бесплатный **Experiment** (может понадобиться подтвердить телефон).
+3. Нажми **Create new key**, имя любое, срок — без ограничения.
+4. Скопируй ключ и вставь сюда.
+
+Бесплатный Mistral может использовать переписку для улучшения своих моделей. Если это важно —
+отключи в настройках Mistral (Admin → Privacy).
+"""},
+        "bitrix": {
+            "title": "Битрикс24",
+            "about": "Задачи, чаты, CRM и аналитика. Всё, что меняет, — только после твоего «да».",
+            "fields": [{"name": "url", "label": "Адрес входящего вебхука", "secret": True,
+                        "placeholder": "https://портал.bitrix24.ru/rest/1/…/"}],
+            "state": lambda: (bool(BITRIX_WEBHOOK), _host(BITRIX_WEBHOOK), ""),
+            "connect": lambda v: _bitrix_connect(assistant, v),
+            "disconnect": lambda: _bitrix_disconnect(assistant),
+            "help": """
+Вебхук — это ключ, по которому Трой работает в Битриксе от твоего имени и с твоими правами.
+
+1. В своём портале Битрикс24 открой **Приложения → Разработчикам**.
+2. Вкладка **Другое → Входящий вебхук**.
+3. Отметь права: **Задачи (task)**, **Чаты и уведомления (im)**, **CRM (crm)**, **Пользователи (user)**.
+4. Нажми **Сохранить** и скопируй адрес вебхука целиком — вида https://портал.bitrix24.ru/rest/1/abc123…/
+5. Вставь его сюда.
+
+Если раздела «Разработчикам» нет — нужны права администратора портала, попроси администратора.
+"""},
+    }
 
 
 class AppAuth:
@@ -1926,7 +2145,7 @@ def pc_label(action: str, arg: str) -> str:
 
 def pc_notify(channel: str, chat_id: str, text: str) -> None:
     """Результат — туда, откуда пришла команда."""
-    if channel == "telegram":
+    if channel == "telegram" and tg_linked():
         try:
             Telegram(TELEGRAM_TOKEN).send(chat_id, text)
         except Exception as e:
@@ -2110,12 +2329,15 @@ def start_desktop_api(assistant: "Assistant"):
 def self_check() -> bool:
     ok = True
     print("Telegram:", end=" ", flush=True)
-    try:
-        me = Telegram(TELEGRAM_TOKEN).call("getMe")
-        print(f"OK, бот @{me['username']}")
-    except Exception as e:
-        ok = False
-        print(f"ОШИБКА — {e}")
+    if not TELEGRAM_TOKEN:
+        print("не подключён (необязательно)")
+    else:
+        try:
+            me = Telegram(TELEGRAM_TOKEN).call("getMe")
+            print(f"OK, бот @{me['username']}" + ("" if tg_linked() else " — хозяин ещё не привязан"))
+        except Exception as e:
+            ok = False
+            print(f"ОШИБКА — {e}")
 
     print("Groq:", end=" ", flush=True)
     if not GROQ_API_KEY:
@@ -2218,21 +2440,37 @@ def main() -> None:
 
 def serve(stop: Optional[threading.Event] = None) -> None:
     """Запуск Троя: на сервере — из main(), в локальном режиме — из программы на компьютере (в потоке)."""
-    if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-        raise SystemExit("Укажите TELEGRAM_TOKEN и GROQ_API_KEY в settings.env")
+    if not GROQ_API_KEY:
+        raise SystemExit("Укажите GROQ_API_KEY в settings.env")
 
     init_db()
     with closing(db()) as con, con:   # история от прежней версии на Gemini: роль model → assistant
         con.execute("UPDATE history SET role='assistant' WHERE role='model'")
     stop = stop or threading.Event()
     assistant = Assistant()
-    # программа на компьютере работает, даже если Telegram пока недоступен
+    register_modules(assistant)
+    # программа на компьютере работает, даже если Telegram пока недоступен или не подключён
     start_desktop_api(assistant)
     threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=power_watch_loop, daemon=True).start()
+    while not stop.is_set():                 # Telegram можно подключить, сменить или отключить на ходу
+        if not TELEGRAM_TOKEN:
+            stop.wait(3)
+            continue
+        try:
+            telegram_session(assistant)
+        except Exception:
+            log.exception("Telegram")
+            stop.wait(10)
 
-    tg = Telegram(TELEGRAM_TOKEN)
+
+def telegram_session(assistant: "Assistant") -> None:
+    """Работаем с текущим ботом, пока токен не сменили в «Подключениях»."""
+    token = TELEGRAM_TOKEN
+    tg = Telegram(token)
     while True:
+        if TELEGRAM_TOKEN != token:
+            return
         try:
             me = tg.call("getMe")
             tg.call("deleteWebhook")
@@ -2241,6 +2479,7 @@ def serve(stop: Optional[threading.Event] = None) -> None:
             log.warning("Telegram недоступен (%s) — пробую снова через 30 с", human_error(e))
             TG_STATE.update(ok=False, error=human_error(e), at=time.time())
             time.sleep(30)
+    TG_STATE.update(ok=True, error="", at=time.time())
     tg.call("setMyCommands", data={"commands": json.dumps([
         {"command": "reminders", "description": "Мои напоминания"},
         {"command": "ideas", "description": "Проекты с идеями"},
@@ -2253,7 +2492,7 @@ def serve(stop: Optional[threading.Event] = None) -> None:
     log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),
              " + Mistral" if MISTRAL_API_KEY else "",
              f"GitHub {GITHUB_REPO}" if GITHUB_TOKEN and GITHUB_REPO else "локально")
-    Bot(tg, assistant).poll_forever()
+    Bot(tg, assistant).poll_forever(lambda: TELEGRAM_TOKEN != token)
 
 
 if __name__ == "__main__":

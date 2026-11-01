@@ -229,8 +229,17 @@ def server_reachable(ip: str, port: int, cert_path: Path) -> bool:
 
 # ───────────────────────── сценарий ─────────────────────────
 
+SKIP_TG = "Пропустить — пока только в программе"
+SKIP_LATER = "Пропустить — подключу потом"
+DONE_LATER = "Готово, остальное потом"
+BACK = "Назад"
+EXTRA_KEYS = {"mistral": "MISTRAL_API_KEY", "bitrix": "BITRIX_WEBHOOK"}
+EXTRA_BTN = {"mistral": "Подключить Mistral", "bitrix": "Подключить Битрикс24"}
+
+
 class Wizard:
-    """Шаги: режим → Groq → Telegram → хозяин → имя → пароль → доп. модули → часовой пояс → установка."""
+    """Шаги: режим → Groq → Telegram (можно пропустить) → хозяин → имя → пароль → часовой пояс →
+    дополнительно (по желанию, можно потом в «Подключениях») → установка."""
 
     def __init__(self, finish_local: Callable[[str, str], None], finish_vps: Callable[[dict], None],
                  template: str, src_dir: Path, data_dir: Path,
@@ -249,8 +258,8 @@ class Wizard:
         a, b = random.sample(FILMS, 2)
         self.state = "mode"
         return [msg(f"Привет, я Трой! Возможно, вы помните меня по таким фильмам, как {a} и {b}.\n\n"
-                    "Сейчас я помогу себя настроить — это минут пять. Всё бесплатно: понадобятся только "
-                    "Telegram и бесплатный ключ Groq. Ключи и пароли, которые ты введёшь, проверяю у самих "
+                    "Сейчас я помогу себя настроить — это минут пять. Всё бесплатно: обязательно нужен только "
+                    "бесплатный ключ Groq, остальное — по желанию, и всё можно подключить потом. Ключи и пароли, которые ты введёшь, проверяю у самих "
                     "сервисов и храню только в настройках — нейросеть их не видит."),
                 msg("Где мне жить?\n\n"
                     "- **На этом компьютере** — проще всего, ничего не нужно. Но я работаю, только пока компьютер включён.\n"
@@ -283,7 +292,7 @@ class Wizard:
         else:
             return [msg("Выбери кнопкой, где мне жить.", ["На этом компьютере", "На моём сервере (VPS)", "У меня уже есть Трой"])]
         self.state = "groq"
-        return [msg("Отлично. Шаг 1 из 5 — мозги.\n\n"
+        return [msg("Отлично. Шаг 1 из 4 — мозги.\n\n"
                     "Я думаю с помощью бесплатных моделей Groq. Нужен ключ:\n"
                     "1. Открой https://console.groq.com/keys и войди (Google или почта, карта не нужна).\n"
                     "2. Нажми **Create API Key**, назови как угодно, скопируй ключ (начинается с gsk_).\n"
@@ -295,29 +304,45 @@ class Wizard:
             return [msg(err, secret=True, placeholder="gsk_…")]
         self.v["GROQ_API_KEY"] = t
         self.state = "telegram"
-        return [msg("✅ Ключ Groq работает.\n\nШаг 2 из 5 — Telegram. Мне нужен свой бот:\n"
-                    "1. В Telegram открой @BotFather и отправь ему /newbot.\n"
-                    "2. Придумай имя и адрес бота (адрес заканчивается на bot).\n"
-                    "3. BotFather пришлёт токен вида 123456789:ABC… — скопируй его сюда.",
-                    secret=True, placeholder="123456789:ABC…")]
+        return [self._ask_telegram("✅ Ключ Groq работает.\n\n")]
+
+    def _ask_telegram(self, prefix: str = ""):
+        return msg(prefix + "Шаг 2 из 4 — Telegram (по желанию). С ним можно писать мне с телефона и получать "
+                   "напоминания где угодно. Нужен свой бот:\n"
+                   "1. В Telegram открой @BotFather и отправь ему /newbot.\n"
+                   "2. Придумай имя и адрес бота (адрес заканчивается на bot).\n"
+                   "3. BotFather пришлёт токен вида 123456789:ABC… — скопируй его сюда.\n\n"
+                   "Не сейчас — нажми «Пропустить»: буду жить в этой программе, а Telegram подключишь потом "
+                   "кнопкой 🔌 «Подключения».", [SKIP_TG], secret=True, placeholder="123456789:ABC…")
+
+    def _skip_telegram(self, prefix: str = ""):
+        for k in ("TELEGRAM_TOKEN", "TELEGRAM_PROXY", "TELEGRAM_BOT"):
+            self.v.pop(k, None)
+        self.v["ALLOWED_USER_ID"] = "local"     # хозяин — тот, кто вошёл в программу; Telegram привяжется потом
+        self.skipped_tg = True
+        return self._ask_name(prefix)
 
     def s_telegram(self, t: str):
+        if t.lower().startswith("пропуст"):
+            return self._skip_telegram("Хорошо, Telegram подключим потом.\n\n")
         name, err, need_proxy = check_telegram(t, self.v.get("TELEGRAM_PROXY", ""))
         if err and need_proxy:
             self.v["TELEGRAM_TOKEN"] = t
             self.state = "proxy"
             return [msg(err + " Похоже, Telegram у тебя открывается только через прокси или VPN.\n\n"
                         "Если есть прокси — вставь адрес (socks5://… или http://…). Если включил VPN — нажми «Проверить ещё раз».",
-                        ["Проверить ещё раз"], placeholder="socks5://…")]
+                        ["Проверить ещё раз", SKIP_TG], placeholder="socks5://…")]
         if err:
-            return [msg(err, secret=True, placeholder="123456789:ABC…")]
-        self.v["TELEGRAM_TOKEN"], self.bot = t, name
+            return [msg(err, [SKIP_TG], secret=True, placeholder="123456789:ABC…")]
+        self.v["TELEGRAM_TOKEN"], self.v["TELEGRAM_BOT"], self.bot = t, name, name
         self.state = "owner"
-        return [msg(f"✅ Нашёл твоего бота @{name}.\n\nШаг 3 из 5 — познакомимся. Открой https://t.me/{name}, "
+        return [msg(f"✅ Нашёл твоего бота @{name}.\n\nЕщё чуть-чуть — познакомимся. Открой https://t.me/{name}, "
                     "нажми **Запустить** (или напиши что угодно) и потом нажми кнопку ниже. "
-                    "Так я узнаю, что ты — мой хозяин, и буду отвечать только тебе.", ["Написал"])]
+                    "Так я узнаю, что ты — мой хозяин, и буду отвечать только тебе.", ["Написал", SKIP_LATER])]
 
     def s_proxy(self, t: str):
+        if t.lower().startswith("пропуст"):
+            return self._skip_telegram("Хорошо, Telegram подключим потом.\n\n")
         if t.lower() != "проверить ещё раз":
             if not re.match(r"(socks5h?|https?)://\S+$", t):
                 return [msg("Адрес прокси выглядит так: socks5://адрес:порт или http://адрес:порт", ["Проверить ещё раз"])]
@@ -327,38 +352,41 @@ class Wizard:
 
     def s_owner(self, t: str):
         low = t.lower()
+        if low.startswith("пропуст"):
+            return self._skip_telegram("Хорошо, Telegram подключим потом: 🔌 «Подключения» → Telegram.\n\n")
         if self.v.get("ALLOWED_USER_ID") and low == "да":
             return self._ask_name()
         if low.startswith("нет"):               # написал кто-то другой — забываем и ждём хозяина
             self.v.pop("ALLOWED_USER_ID", None)
             self.skip_updates = getattr(self, "last_update", 0) + 1
             return [msg(f"Понял. Напиши боту https://t.me/{self.bot} со **своего** аккаунта Telegram и нажми кнопку.",
-                        ["Написал"])]
+                        ["Написал", SKIP_LATER])]
         owner = find_owner(self.v["TELEGRAM_TOKEN"], self.v.get("TELEGRAM_PROXY", ""),
                            getattr(self, "skip_updates", 0))
         if not owner:
             return [msg(f"Пока не вижу сообщений. Открой https://t.me/{self.bot}, нажми «Запустить» "
-                        "или напиши что угодно — и снова нажми кнопку.", ["Написал"])]
+                        "или напиши что угодно — и снова нажми кнопку.", ["Написал", SKIP_LATER])]
         self.v["ALLOWED_USER_ID"] = owner["id"]
         self.owner_name, self.last_update = owner["name"], owner["update"]
         return [msg(f"Вижу сообщение от **{owner['name'] or 'без имени'}**. Это ты?", ["Да", "Нет, это не я"])]
 
-    def _ask_name(self):
-        try:
-            tg_call(self.v["TELEGRAM_TOKEN"], "sendMessage", self.v.get("TELEGRAM_PROXY", ""),
-                    chat_id=self.v["ALLOWED_USER_ID"], text="Привет! Это Трой. Настройка почти закончена — вернись в программу 🙂")
-        except Exception:
-            pass
+    def _ask_name(self, prefix: str = ""):
+        if self.v.get("TELEGRAM_TOKEN"):
+            try:
+                tg_call(self.v["TELEGRAM_TOKEN"], "sendMessage", self.v.get("TELEGRAM_PROXY", ""),
+                        chat_id=self.v["ALLOWED_USER_ID"], text="Привет! Это Трой. Настройка почти закончена — вернись в программу 🙂")
+            except Exception:
+                pass
+            prefix = "✅ Запомнил: отвечаю только тебе. Я написал тебе в Telegram — проверь.\n\n"
         self.state = "name"
         name = getattr(self, "owner_name", "")
-        return [msg("✅ Запомнил: отвечаю только тебе. Я написал тебе в Telegram — проверь.\n\nКак к тебе обращаться?",
-                    ([name] if name else []) + ["Не важно"], placeholder="Имя")]
+        return [msg(prefix + "Как к тебе обращаться?", ([name] if name else []) + ["Не важно"], placeholder="Имя")]
 
     def s_name(self, t: str):
         if t and t.lower() != "не важно":
             self.v["USER_NAME"] = t[:40]
         self.state = "password"
-        return [msg("Шаг 4 из 5 — пароль для этой программы. Его спрошу при входе и на других компьютерах, "
+        return [msg("Шаг 3 из 4 — пароль для этой программы. Его спрошу при входе и на других компьютерах, "
                     "где поставишь Троя. Минимум 6 символов.", secret=True, placeholder="Пароль")]
 
     def s_password(self, t: str):
@@ -372,61 +400,73 @@ class Wizard:
         if t != self.password:
             self.state = "password"
             return [msg("Пароли не совпали. Давай ещё раз — придумай пароль.", secret=True, placeholder="Пароль")]
-        return self._extras("✅ Пароль запомнил.\n\n")
-
-    def _extras(self, prefix: str = ""):
-        """Шаг 5: запасная модель Mistral — по желанию."""
-        self.state = "extras"
-        return [msg(prefix + "Шаг 5 из 5 — запас на всякий случай (по желанию).\n\n"
-                    "У бесплатного Groq есть дневные лимиты. Если подключить ещё и бесплатный **Mistral**, "
-                    "я не замолчу, когда лимит Groq закончится. Подключим?",
-                    ["Подключить Mistral", "Пропустить"])]
-
-    def s_extras(self, t: str):
-        if "mistral" in t.lower() or t.lower().startswith("подключ"):
-            self.state = "mistral"
-            return [msg("Ключ Mistral: открой https://console.mistral.ai/api-keys, войди, выбери бесплатный план "
-                        "(Experiment), нажми **Create new key** и вставь ключ сюда.", ["Пропустить"], secret=True)]
-        return self._ask_bitrix()
-
-    def s_mistral(self, t: str):
-        if t.lower() in ("пропустить", "назад"):
-            return self._ask_bitrix()
-        err = check_mistral(t)
-        if err:
-            return [msg(err, ["Пропустить"], secret=True)]
-        self.v["MISTRAL_API_KEY"] = t
-        return self._ask_bitrix("✅ Mistral подключён.\n\n")
-
-    def _ask_bitrix(self, prefix: str = ""):
-        self.state = "bitrix_q"
-        return [msg(prefix + "Пользуешься **Битрикс24** на работе? Могу смотреть задачи и чаты, искать в CRM "
-                    "и считать аналитику — а всё, что меняет, делать только после твоего «да».",
-                    ["Да, подключить", "Нет"])]
-
-    def s_bitrix_q(self, t: str):
-        if t.lower().startswith("да"):
-            self.state = "bitrix"
-            return [msg("Вебхук Битрикс24: в портале **Приложения → Разработчикам → Другое → Входящий вебхук**, "
-                        "права: task, im, crm, user. Скопируй адрес вебхука целиком и вставь сюда.", ["Пропустить"],
-                        secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
-        return self._ask_zone()
-
-    def s_bitrix(self, t: str):
-        if t.lower() in ("пропустить", "назад"):
-            return self._ask_zone()
-        err = check_bitrix(t)
-        if err:
-            return [msg(err, ["Пропустить"], secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
-        self.v["BITRIX_WEBHOOK"] = t.rstrip("/") + "/"
-        return self._ask_zone("✅ Битрикс24 подключён.\n\n")
+        return self._ask_zone("✅ Пароль запомнил.\n\n")
 
     def _ask_zone(self, prefix: str = ""):
         city, zone = local_zone()
         self.zone_guess = zone
         self.state = "zone"
-        return [msg(prefix + f"Последнее: часовой пояс для напоминаний. По часам компьютера это **{city}**. Верно?",
+        return [msg(prefix + f"Шаг 4 из 4 — часовой пояс для напоминаний. По часам компьютера это **{city}**. Верно?",
                     [f"Да, {city}", "Другой"])]
+
+    # ── дополнительно: по желанию, сейчас или потом в «Подключениях» ──
+    def _extras(self, prefix: str = ""):
+        self.state = "extras"
+        left = [k for k in ("mistral", "bitrix") if not self.v.get(EXTRA_KEYS[k])]
+        if not left:
+            return self._after_extras(prefix)
+        lines = {"mistral": "- **Mistral** — запасная бесплатная модель: не замолчу, когда у Groq кончится дневной лимит.",
+                 "bitrix": "- **Битрикс24** — задачи, чаты, CRM и аналитика с работы (всё, что меняет, — только после твоего «да»)."}
+        first = not prefix
+        head = ("Основное готово! 🎉 " if self.mode == "local" else "Почти всё. ") if first else ""
+        return [msg(prefix + head +
+                    "Дальше — по желанию. Подключить можно сейчас или в любой момент потом: "
+                    "кнопка 🔌 «Подключения» в шапке программы.\n\n" + "\n".join(lines[k] for k in left),
+                    [DONE_LATER] + [EXTRA_BTN[k] for k in left])]
+
+    def s_extras(self, t: str):
+        low = t.lower()
+        if "mistral" in low:
+            self.state = "mistral"
+            return [msg("Ключ Mistral: открой https://console.mistral.ai/api-keys, войди, выбери бесплатный план "
+                        "(Experiment), нажми **Create new key** и вставь ключ сюда.", [BACK], secret=True)]
+        if "битрикс" in low or "bitrix" in low:
+            self.state = "bitrix"
+            return [msg("Вебхук Битрикс24: в портале **Приложения → Разработчикам → Другое → Входящий вебхук**, "
+                        "права: task, im, crm, user. Скопируй адрес вебхука целиком и вставь сюда.", [BACK],
+                        secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
+        return self._after_extras()
+
+    def s_mistral(self, t: str):
+        if t.lower() in ("пропустить", "назад", BACK.lower()):
+            return self._extras("Хорошо.\n\n")
+        err = check_mistral(t)
+        if err:
+            return [msg(err, [BACK], secret=True)]
+        self.v["MISTRAL_API_KEY"] = t
+        return self._extras("✅ Mistral подключён.\n\n")
+
+    def s_bitrix(self, t: str):
+        if t.lower() in ("пропустить", "назад", BACK.lower()):
+            return self._extras("Хорошо.\n\n")
+        err = check_bitrix(t)
+        if err:
+            return [msg(err, [BACK], secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
+        self.v["BITRIX_WEBHOOK"] = t.rstrip("/") + "/"
+        return self._extras("✅ Битрикс24 подключён.\n\n")
+
+    def _after_extras(self, prefix: str = ""):
+        if self.mode == "local":
+            return self._finish_local(prefix)
+        self.state = "vps_ip"
+        return [msg(prefix + "Теперь данные сервера. IP-адрес (например 203.0.113.10):", placeholder="IP-адрес")]
+
+    def _later_text(self) -> str:
+        """Что можно подключить потом — чтобы человек знал, где это искать."""
+        left = (["Telegram"] if not self.v.get("TELEGRAM_TOKEN") else []) + \
+               [n for k, n in (("MISTRAL_API_KEY", "Mistral"), ("BITRIX_WEBHOOK", "Битрикс24")) if not self.v.get(k)]
+        return ("\n\nПотом в любой момент — кнопка 🔌 «Подключения» в шапке: " +
+                ", ".join(left + ["календарь", "почта", "умный дом"]) + ".")
 
     def s_zone(self, t: str):
         from zoneinfo import ZoneInfo
@@ -442,20 +482,17 @@ class Wizard:
             except Exception:
                 return [msg("Не знаю такой зоны. Напиши город из списка или зону вида Europe/Moscow.")]
             self.v["TIMEZONE"] = zone
-        if self.mode == "local":
-            return self._finish_local()
-        self.state = "vps_ip"
-        return [msg("Теперь данные сервера. IP-адрес (например 203.0.113.10):",
-                    placeholder="IP-адрес")]
+        return self._extras()
 
     def _settings(self) -> str:
         return settings_text(self.template, self.v)
 
-    def _finish_local(self):
+    def _finish_local(self, prefix: str = ""):
         self.finish_local(self._settings(), self.password)
         self.state = "done"
-        return [msg("🎉 Готово! Я живу на этом компьютере. Сейчас перезапущусь и войду — дальше просто пиши мне "
-                    "здесь или в Telegram.\n\nПодсказка: в установщике можно включить «Запускать вместе с Windows» — "
+        where = "здесь или в Telegram" if self.v.get("TELEGRAM_TOKEN") else "здесь"
+        return [msg(prefix + f"🎉 Готово! Я живу на этом компьютере. Сейчас перезапущусь и войду — дальше просто пиши мне "
+                    f"{where}.{self._later_text()}\n\nПодсказка: в установщике можно включить «Запускать вместе с Windows» — "
                     "тогда я всегда на связи, пока компьютер включён.", done=True)]
 
     def s_vps_ip(self, t: str):
@@ -493,8 +530,8 @@ class Wizard:
             f"файрвол в панели управления — открой там порт {res['port']} (TCP). Telegram работает и без этого.")
         self.state = "done"
         return out + [msg(f"🎉 Готово! Я живу на сервере {self.vps['ip']}.{warn}\n\n"
-                          "Сейчас перезапущусь и войду. Удалить меня с сервера можно одной командой: "
-                          "`bash /opt/sometroy/uninstall.sh`", done=True)]
+                          "Сейчас перезапущусь и войду." + self._later_text() + "\n\nУдалить меня с сервера "
+                          "можно одной командой: `bash /opt/sometroy/uninstall.sh`", done=True)]
 
     def s_connect(self, t: str):
         if t.lower() == "назад":
@@ -558,12 +595,15 @@ Groq — сервис, где бесплатно работают нейросе
 - Сайт не открывается — попробуй включить VPN.
 - Закрыл окно, не скопировав ключ, — не страшно: создай новый (Create API Key ещё раз).
 - У бесплатного Groq есть лимиты в минуту и в сутки. Трой сам переключается между несколькими моделями,
-  а если хочешь запас — на шаге 5 можно подключить бесплатный Mistral.
+  а если хочешь запас — в конце настройки (или потом в «Подключениях») можно добавить бесплатный Mistral.
 
 Ключ — как пароль: никому его не показывай.
 """),
     "telegram": ("Свой бот в Telegram", """
-Трой разговаривает с тобой через своего Telegram-бота. Создать его — минута, бесплатно.
+С Telegram Трою можно писать с телефона, и напоминания придут где угодно. Это **по желанию**: без него Трой
+работает в программе. Можно нажать «Пропустить» и подключить потом — кнопка 🔌 «Подключения» → Telegram.
+
+Создать бота — минута, бесплатно.
 
 1. Открой @BotFather: https://t.me/BotFather (официальный бот Telegram для создания ботов, с синей галочкой).
 2. Нажми **Запустить** (Start) и отправь команду **/newbot**.
@@ -618,21 +658,19 @@ Groq — сервис, где бесплатно работают нейросе
 Повтори тот же пароль ещё раз — так Трой убедится, что опечатки нет.
 Если не совпадёт, он попросит придумать пароль заново.
 """),
-    "extras": ("Запасная модель Mistral", """
-Mistral — ещё один бесплатный сервис с нейросетями. Он нужен как запас: когда у Groq закончился
-дневной лимит, Трой ответит через Mistral, а не замолчит.
+    "extras": ("Дополнительно — по желанию", """
+Всё здесь необязательно. Нажми «Готово, остальное потом» — и подключишь в любой момент кнопкой
+🔌 «Подключения» в шапке программы. Там же — календари, почта и умный дом.
 
-Можно пропустить и подключить потом. Ключ берётся здесь: https://console.mistral.ai/api-keys
-(при входе выбери бесплатный план **Experiment**; может попросить подтвердить номер телефона).
-"""),
-    "bitrix_q": ("Битрикс24", """
-Если ты пользуешься Битрикс24 (обычно — на работе), Трой может:
+**Mistral** — ещё один бесплатный сервис с нейросетями. Нужен как запас: когда у Groq закончился
+дневной лимит, Трой ответит через Mistral, а не замолчит. Ключ: https://console.mistral.ai/api-keys
+(бесплатный план **Experiment**; может попросить подтвердить номер телефона).
+
+**Битрикс24** — если пользуешься им на работе, Трой может:
 - показывать твои задачи и непрочитанные сообщения;
 - искать сделки, контакты и компании в CRM;
 - считать аналитику: например, сколько сделок закрыли за месяц по менеджерам;
 - ставить задачи, писать в чаты и менять CRM — но только после твоего «да».
-
-Трой работает от твоего имени и с твоими правами. Не пользуешься Битриксом — нажми «Нет», этот шаг пропустится.
 """),
     "mistral": ("Ключ Mistral", """
 1. Открой https://console.mistral.ai/api-keys и войди (Google или почта).

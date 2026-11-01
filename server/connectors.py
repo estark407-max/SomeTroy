@@ -844,9 +844,31 @@ YIOT_TYPES = {"light": "свет", "socket": "розетка", "switch": "вык
 YIOT_UNITS = {"unit.temperature.celsius": "°C", "unit.percent": "%", "unit.ppm": " ppm", "unit.illumination.lux": " лк"}
 
 
+def yiot_clean_token(raw: str) -> str:
+    """Токен, как его обычно копируют: целиком адрес страницы (#access_token=…), с «OAuth »/«Bearer » или пробелами."""
+    t = (raw or "").strip().strip("'\"")
+    m = re.search(r"access_token=([^&\s]+)", t)
+    if m:
+        t = m.group(1)
+    return re.sub(r"^(?:oauth|bearer)\s+", "", t, flags=re.I).strip()
+
+
+def yiot_clientid_hint(token: str) -> Optional[str]:
+    """Частая ошибка: вместо токена вставлен ClientID приложения (32 символа 0-9 a-f)."""
+    if re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return ("это ClientID приложения, а не токен. Открой ссылку "
+                f"https://oauth.yandex.ru/authorize?response_type=token&client_id={token} , нажми «Разрешить» "
+                "и скопируй длинный токен со страницы (обычно начинается с y0_)")
+    return None
+
+
 def _yiot(cfg: dict, method: str, path: str, body: Optional[dict] = None) -> dict:
+    token = yiot_clean_token(cfg.get("token", ""))
+    hint = yiot_clientid_hint(token)
+    if hint:
+        raise PermissionError(hint)
     r = requests.request(method, YIOT_API + path, json=body, timeout=20,
-                         headers={"Authorization": f"Bearer {cfg['token']}", **UA})
+                         headers={"Authorization": f"Bearer {token}", **UA})
     if r.status_code == 401:
         raise PermissionError("Яндекс не принял токен: он неверный или истёк (обычно токен начинается с y0_). "
                               "Получи новый по ссылке authorize из инструкции")
@@ -864,7 +886,7 @@ def yiot_test(cfg: dict) -> Optional[str]:
     try:
         _yiot(cfg, "GET", "user/info")
     except PermissionError as e:
-        return str(e) + ". Получи новый токен по инструкции."
+        return str(e)[0].upper() + str(e)[1:] + "."
     except (requests.RequestException, RuntimeError) as e:
         return _err(e) if isinstance(e, requests.RequestException) else str(e)
     return None
@@ -1077,6 +1099,7 @@ YIOT_CONNECTOR = {
                  ["target", "action"]),
               fn("yhome_scenario", "Запустить сценарий Алисы по названию.", {"scenario": {"type": "string"}}, ["scenario"])],
     "test": yiot_test, "run": yiot_run,
+    "clean": lambda name, v: yiot_clean_token(v) if name == "token" else v,
     "help": """
 Трой управляет устройствами из приложения **Дом с Алисой** через официальный API Яндекса. Нужен токен — это бесплатно,
 займёт минуты три. Замки и охранные устройства Трой не трогает.
@@ -1089,13 +1112,13 @@ YIOT_CONNECTOR = {
 3. Платформа — **Веб-сервисы**, в поле Redirect URI вставь: https://oauth.yandex.ru/verification_code
 4. В доступах найди **Умный дом Яндекса** и отметь оба: **просмотр списка устройств** (iot:view)
    и **управление устройствами** (iot:control).
-5. Нажми **Создать приложение** и скопируй **ClientID** (строка из букв и цифр).
+5. Нажми **Создать приложение** и скопируй **ClientID** (строка из 32 букв и цифр). Это ещё не токен!
 
 **2. Получи токен**
 1. Открой ссылку, подставив свой ClientID вместо ВАШ_CLIENT_ID:
    https://oauth.yandex.ru/authorize?response_type=token&client_id=ВАШ_CLIENT_ID
-2. Нажми **Разрешить**. На странице появится токен (длинная строка) — скопируй его.
-3. Вставь токен сюда.
+2. Нажми **Разрешить**. На странице появится токен — длинная строка, обычно начинается с **y0_**. Скопируй его.
+3. Вставь токен сюда. Если по ошибке вставишь ClientID — Трой подскажет и даст готовую ссылку.
 
 Токен действует около года. Когда истечёт, Трой скажет — получишь новый по пункту 2.
 Отозвать доступ можно в любой момент: https://id.yandex.ru/security → «Доступы».
@@ -1112,6 +1135,11 @@ class Connections:
 
     def __init__(self, db: Callable, tz):
         self.db, self.tz = db, tz
+        # Модули Троя, которые можно включить позже (Telegram, Mistral, Битрикс24…). Их подключает сам бот:
+        # id → {title, about, help, fields, state() → (вкл, сводка, подсказка), connect(values) → (ошибка, подсказка),
+        #       disconnect()}
+        self.modules: dict = {}
+        self.note = ""          # подсказка после подключения модуля (например, ссылка «нажми Запустить»)
 
     def _all(self) -> dict:
         from contextlib import closing
@@ -1135,6 +1163,11 @@ class Connections:
         """Для окна «Подключения»: что есть и что включено. Секреты не отдаём."""
         have = self.enabled()
         out = []
+        for mid, m in self.modules.items():
+            on, summary, note = m["state"]()
+            out.append({"id": mid, "group": "module", "title": m["title"], "about": m["about"],
+                        "help": m["help"].strip(), "enabled": bool(on), "summary": summary, "note": note,
+                        "fields": m["fields"]})
         for cid, c in CONNECTORS.items():
             cfg = have.get(cid) or {}
             out.append({"id": cid, "title": c["title"], "about": c["about"], "help": c["help"].strip(),
@@ -1146,6 +1179,14 @@ class Connections:
         return out
 
     def connect(self, cid: str, values: dict) -> Optional[str]:
+        self.note = ""
+        if cid in self.modules:
+            m = self.modules[cid]
+            for f in m["fields"]:
+                if not str(values.get(f["name"]) or "").strip() and not f.get("optional"):
+                    return f"заполни поле «{f['label']}»"
+            err, self.note = m["connect"]({k: str(v or "").strip() for k, v in values.items()})
+            return err
         c = CONNECTORS.get(cid)
         if not c:
             return "нет такого подключения"
@@ -1154,7 +1195,7 @@ class Connections:
             v = str(values.get(f["name"]) or "").strip()
             if not v and not f.get("optional"):
                 return f"заполни поле «{f['label']}»"
-            cfg[f["name"]] = v
+            cfg[f["name"]] = c["clean"](f["name"], v) if c.get("clean") else v
         err = c["test"](cfg)
         if err:
             return err
@@ -1164,6 +1205,9 @@ class Connections:
         return None
 
     def disconnect(self, cid: str) -> None:
+        if cid in self.modules:
+            self.modules[cid]["disconnect"]()
+            return
         data = self._all()
         data.pop(cid, None)
         self._save(data)
