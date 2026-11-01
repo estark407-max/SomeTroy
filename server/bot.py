@@ -1077,6 +1077,10 @@ class Assistant:
                                    str(args.get("date_to") or ""))
             if name == "pc_command":
                 return self.pc_command(chat_id, args)
+            if name == "route_link":
+                return connectors.route_link(self.places, args)
+            if name == "save_place":
+                return self.places.save(str(args.get("name") or ""), str(args.get("address") or ""))
             if self.conns.owner_of(name):
                 if self.conns.is_write(name) and not YES_RE.match(self.user_text.strip()):
                     return ("НЕ ВЫПОЛНЕНО: сначала покажи пользователю, что именно добавишь (название, дата, время), "
@@ -1094,6 +1098,13 @@ class Assistant:
         except Exception as e:
             log.exception("Функция %s упала", name)
             return f"Ошибка: {e}"
+
+    @property
+    def places(self) -> "connectors.Places":
+        """Места пользователя для маршрутов: дом, работа…"""
+        if getattr(self, "_places", None) is None:
+            self._places = connectors.Places(db)
+        return self._places
 
     @property
     def conns(self) -> "connectors.Connections":
@@ -1209,9 +1220,14 @@ class Assistant:
         use_pc = any(PC_HINT_RE.search(t or "") for t in recent)
         use_boiler = BOILER_ON and any(BOILER_HINT_RE.search(t or "") for t in recent)
         conn_tools, conn_names = self.conns.tools_for(recent)
+        use_route = any(re.search(connectors.ROUTE_HINT, t or "", re.I) for t in recent)
+        if use_route:
+            conn_tools = conn_tools + connectors.ROUTE_TOOLS
         tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
                  + ([BOILER_TOOL] if use_boiler else []) + conn_tools)
         prompt = system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)
+        if use_route:
+            prompt += connectors.ROUTE_RULES
         if conn_names:
             prompt += ("\n- Подключено: " + ", ".join(conn_names) + ". Для событий, писем, умного дома и расписаний "
                        "вызывай соответствующие функции, не выдумывай. Даты считай от сегодняшней.")

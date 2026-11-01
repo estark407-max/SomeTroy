@@ -522,127 +522,115 @@ def ha_run(cfg: dict, name: str, args: dict, tz) -> str:
     return f"Готово: {service} → {entity}"
 
 
-# ═════════════════════════ 5. Яндекс Расписания ═════════════════════════
+# ═════════════════════════ 5. Маршруты: ссылка на Яндекс Карты ═════════════════════════
+# Посчитать маршрут на общественном транспорте бесплатно нельзя (API маршрутов у Яндекса и Google платные),
+# поэтому Трой даёт готовую ссылку: на телефоне откроется Яндекс Карты с построенным маршрутом,
+# пересадками и временем в пути. Адреса переводим в точки бесплатным геокодером OpenStreetMap.
 
-RASP_API = "https://api.rasp.yandex.net/v3.0/"
-RASP_SUGGEST = "https://suggests.rasp.yandex.net/all_suggests"
-RASP_TYPES = {"train": "поезд", "suburban": "электричка", "bus": "автобус", "plane": "самолёт", "water": "водный транспорт"}
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+ROUTE_MODES = {"transit": ("mt", "на общественном транспорте"), "car": ("auto", "на машине"),
+               "walk": ("pd", "пешком"), "bike": ("bc", "на велосипеде"), "taxi": ("taxi", "на такси")}
+_geo_last = [0.0]
 
 
-def rasp_suggest(query: str) -> List[dict]:
-    """Код станции или города по названию (подсказки Яндекс Расписаний)."""
-    r = requests.get(RASP_SUGGEST,
-                     params={"part": query, "format": "old", "lang": "ru"}, timeout=15, headers=UA)
+def geocode(query: str, near: Optional[tuple] = None) -> Optional[dict]:
+    """Адрес или место → {"lat", "lon", "name"} (OpenStreetMap; не чаще раза в секунду — правило сервиса)."""
+    wait = 1.1 - (time.time() - _geo_last[0])
+    if wait > 0:
+        time.sleep(wait)
+    params = {"q": query, "format": "jsonv2", "limit": 1, "accept-language": "ru", "addressdetails": 0}
+    if near:                                       # ищем сначала рядом с домом пользователя
+        lat, lon = near
+        params["viewbox"] = f"{lon - 0.6},{lat + 0.4},{lon + 0.6},{lat - 0.4}"
+    r = requests.get(NOMINATIM, params=params, timeout=15, headers=UA)
+    _geo_last[0] = time.time()
     r.raise_for_status()
-    data = r.json()
-    items = data[1] if isinstance(data, list) and len(data) > 1 else data.get("suggests", [])
-    out = []
-    for it in items:
-        if isinstance(it, list) and len(it) >= 2:
-            out.append({"code": it[0], "title": it[1], "region": it[2] if len(it) > 2 else ""})
-        elif isinstance(it, dict) and it.get("point_key"):
-            out.append({"code": it["point_key"], "title": it.get("title", ""), "region": it.get("region_title", "")})
-    return out
-
-
-def _rasp_code(q: str, station_only: bool = False) -> tuple:
-    q = q.strip()
-    if not q:
-        raise ValueError("не указана станция")
-    if re.fullmatch(r"[sc]\d+", q):
-        return q, q
-    found = rasp_suggest(q)
-    if station_only:                                   # для табло нужна станция, а не город
-        found = [f for f in found if str(f["code"]).startswith("s")] or found
+    found = r.json()
     if not found:
-        raise ValueError(f"не нашёл станцию или город «{q}»")
-    return found[0]["code"], found[0]["title"]
+        return None
+    f = found[0]
+    return {"lat": float(f["lat"]), "lon": float(f["lon"]), "name": f.get("display_name", query)}
 
 
-def rasp_test(cfg: dict) -> Optional[str]:
-    try:
-        r = requests.get(RASP_API + "nearest_settlement/", timeout=15, headers=UA,
-                         params={"apikey": cfg["apikey"], "lat": 55.75, "lng": 37.62, "format": "json"})
-    except requests.RequestException as e:
-        return _err(e)
-    if r.status_code in (401, 403):
-        return "Яндекс не принял ключ. Проверь, что это ключ именно для «API Яндекс Расписаний»."
-    return None if r.status_code == 200 else f"Яндекс ответил ошибкой {r.status_code}"
+class Places:
+    """«Дом», «работа» и другие места пользователя — чтобы говорить «от дома до работы»."""
 
+    def __init__(self, db: Callable):
+        self.db = db
 
-def rasp_station(cfg: dict, args: dict, tz) -> str:
-    """Табло станции: ближайшие отправления всего транспорта, который там останавливается."""
-    try:
-        code, title = _rasp_code(str(args.get("station") or cfg.get("home") or ""), station_only=True)
-    except ValueError as e:
-        return f"Ошибка: {e}. Уточни название станции."
-    if code.startswith("c"):
-        return (f"«{title}» — это город, а нужна конкретная станция или остановка "
-                "(например «Подольск» → станция Подольск, «Курский вокзал»).")
-    now = datetime.now(tz)
-    params = {"apikey": cfg["apikey"], "station": code, "date": now.strftime("%Y-%m-%d"), "format": "json",
-              "lang": "ru_RU", "event": "departure", "limit": 300}
-    if args.get("transport") in RASP_TYPES:
-        params["transport_types"] = args["transport"]
-    r = requests.get(RASP_API + "schedule/", params=params, timeout=20, headers=UA)
-    if r.status_code != 200:
-        return f"Яндекс Расписания ответили ошибкой {r.status_code}."
-    rows, limit = [], int(args.get("limit") or 8)
-    for it in r.json().get("schedule", []):
+    def all(self) -> dict:
+        from contextlib import closing
+        with closing(self.db()) as con:
+            row = con.execute("SELECT value FROM kv WHERE key='places'").fetchone()
         try:
-            dep = datetime.fromisoformat(it.get("departure") or "").astimezone(tz)
+            return json.loads(row[0]) if row else {}
         except ValueError:
-            continue
-        if dep < now - timedelta(minutes=1):
-            continue
-        th = it.get("thread", {})
-        kind = RASP_TYPES.get(th.get("transport_type", ""), th.get("transport_type", ""))
-        extra = " (экспресс)" if th.get("express_type") else ""
-        plat = f", {it['platform']}" if it.get("platform") else ""
-        rows.append(f"- {dep:%H:%M} {kind}{extra} {th.get('title', '')}{plat}".rstrip())
-        if len(rows) >= limit:
-            break
-    return (f"Ближайшие отправления со станции {title}:\n" + ("\n".join(rows) if rows else "сегодня больше нет")
-            + "\n(Данные: Яндекс Расписания, rasp.yandex.ru)")
+            return {}
+
+    def save(self, name: str, address: str) -> str:
+        from contextlib import closing
+        name = name.strip().lower()
+        if not name or not address.strip():
+            return "Ошибка: нужно название места и адрес."
+        places = self.all()
+        g = geocode(address, self._home(places))
+        if not g:
+            return f"Не нашёл на карте «{address}». Попроси адрес точнее: город, улица, дом."
+        places[name] = {"address": address.strip(), "lat": g["lat"], "lon": g["lon"]}
+        with closing(self.db()) as con, con:
+            con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES ('places', ?)",
+                        (json.dumps(places, ensure_ascii=False),))
+        return f"Запомнил «{name}»: {g['name']}"
+
+    @staticmethod
+    def _home(places: dict) -> Optional[tuple]:
+        p = places.get("дом") or next(iter(places.values()), None)
+        return (p["lat"], p["lon"]) if p else None
+
+    def resolve(self, text: str) -> Optional[dict]:
+        places = self.all()
+        key = re.sub(r"^(?:от|до|из|в|на|с)\s+", "", text.strip().lower())
+        key = {"дома": "дом", "работы": "работа", "работу": "работа", "офиса": "офис"}.get(key, key)
+        if key in places:
+            p = places[key]
+            return {"lat": p["lat"], "lon": p["lon"], "name": f"{key} ({p['address']})"}
+        return geocode(text, self._home(places))
 
 
-def rasp_run(cfg: dict, name: str, args: dict, tz) -> str:
-    if name == "rasp_station":
-        return rasp_station(cfg, args, tz)
-    if not (args.get("from") or cfg.get("home")):
-        return "Ошибка: откуда ехать? Спроси у пользователя станцию отправления."
-    try:
-        frm, frm_t = _rasp_code(str(args.get("from") or cfg.get("home") or ""))
-        to, to_t = _rasp_code(str(args.get("to") or ""))
-    except ValueError as e:
-        return f"Ошибка: {e}."
-    day = str(args.get("date") or datetime.now(tz).strftime("%Y-%m-%d"))
-    params = {"apikey": cfg["apikey"], "from": frm, "to": to, "date": day, "format": "json", "lang": "ru_RU",
-              "transfers": "false", "limit": 200}
-    if args.get("transport") in RASP_TYPES:
-        params["transport_types"] = args["transport"]
-    r = requests.get(RASP_API + "search/", params=params, timeout=20, headers=UA)
-    if r.status_code != 200:
-        return f"Яндекс Расписания ответили ошибкой {r.status_code}."
-    now = datetime.now(tz)
-    rows = []
-    for s in r.json().get("segments", []):
-        try:
-            dep = datetime.fromisoformat(s["departure"]).astimezone(tz)
-            arr = datetime.fromisoformat(s["arrival"]).astimezone(tz)
-        except (KeyError, ValueError):
-            continue
-        if day == now.strftime("%Y-%m-%d") and dep < now - timedelta(minutes=1):
-            continue
-        th = s.get("thread", {})
-        kind = RASP_TYPES.get(th.get("transport_type", ""), th.get("transport_type", ""))
-        extra = th.get("express_type") and " (экспресс)" or ""
-        rows.append(f"- {dep:%H:%M} → {arr:%H:%M}: {kind}{extra} {th.get('title', '')}".rstrip())
-        if len(rows) >= int(args.get("limit") or 6):
-            break
-    head = f"{frm_t} → {to_t}, {datetime.strptime(day, '%Y-%m-%d'):%d.%m}"
-    return head + ":\n" + ("\n".join(rows) if rows else "рейсов больше нет") + \
-        "\n(Данные: Яндекс Расписания, rasp.yandex.ru)"
+def route_link(places: Places, args: dict) -> str:
+    mode = str(args.get("mode") or "transit")
+    rtt, title = ROUTE_MODES.get(mode, ROUTE_MODES["transit"])
+    to = places.resolve(str(args.get("to") or ""))
+    if not to:
+        return f"Не нашёл на карте «{args.get('to')}». Попроси уточнить: город, улица, название места."
+    frm_q = str(args.get("from") or "").strip()
+    frm = places.resolve(frm_q) if frm_q else None
+    if frm_q and not frm:
+        return f"Не нашёл на карте «{frm_q}». Попроси уточнить: город, улица, название места."
+    pt = lambda p: f"{p['lat']:.6f},{p['lon']:.6f}"
+    url = f"https://yandex.ru/maps/?rtext={pt(frm) if frm else ''}~{pt(to)}&rtt={rtt}"
+    where_from = frm["name"] if frm else "текущего места (определит телефон)"
+    return (f"Ссылка на маршрут {title}: {url}\n"
+            f"Откуда: {where_from}\nКуда: {to['name']}\n"
+            "Передай пользователю ссылку целиком, как есть: она откроет Яндекс Карты с готовым маршрутом, "
+            "пересадками и временем в пути. Сам время и пересадки не придумывай.")
+
+
+ROUTE_HINT = r"как (?:добраться|доехать|дойти|проехать|попасть)|маршрут|доехать|добраться|дорог[ау] (?:до|от)|ехать (?:до|от|в)|сколько ехать|запомни.*(?:адрес|дом|работ)|мой (?:дом|адрес)|я живу"
+ROUTE_TOOLS = [
+    fn("route_link", "Ссылка на маршрут в Яндекс Картах (общественный транспорт, машина, пешком…).", {
+        "from": {"type": "string", "description": "откуда: адрес, место или «дом»/«работа»; пусто — от текущего места"},
+        "to": {"type": "string", "description": "куда: адрес, место или «дом»/«работа»"},
+        "mode": {"type": "string", "enum": list(ROUTE_MODES), "description": "по умолчанию transit — общественный транспорт"}},
+        ["to"]),
+    fn("save_place", "Запомнить место пользователя (дом, работа, дача…) для маршрутов.", {
+        "name": {"type": "string", "description": "дом, работа, дача, офис…"},
+        "address": {"type": "string", "description": "адрес с городом"}}, ["name", "address"]),
+]
+ROUTE_RULES = """
+- Маршруты: route_link даёт ссылку на Яндекс Карты (по умолчанию общественный транспорт). Сам маршрут, пересадки
+  и время не выдумывай — отправь ссылку как есть. Если в адресе нет города, а дом пользователя не сохранён,
+  уточни город. «Мой дом — …», «работа — …» запоминай через save_place."""
 
 
 # ═════════════════════════ Список подключений ═════════════════════════
@@ -761,42 +749,6 @@ CONNECTORS: Dict[str, dict] = {
 Если Трой живёт на сервере, а Home Assistant — дома, серверу нужен доступ к нему из интернета
 (например, через Home Assistant Cloud — Nabu Casa — или свой внешний адрес). Если Трой живёт на
 домашнем компьютере — подойдёт обычный домашний адрес.
-"""},
-    "rasp": {
-        "title": "Электрички и автобусы (Яндекс Расписания)",
-        "about": "«Что ближайшее идёт со станции Подольск?», «когда электричка до Москвы?» — поезда, электрички, автобусы.",
-        "fields": [{"name": "apikey", "label": "Ключ API Яндекс Расписаний", "secret": True},
-                   {"name": "home", "label": "Твоя станция по умолчанию (необязательно — можно всегда называть станцию)",
-                    "placeholder": "например «Подольск»", "optional": True}],
-        "hint": r"электричк|поезд|автобус|расписани|рейс|станци|вокзал|ласточк|когда (?:ближайш|следующ)|что (?:идёт|идет|ближайш)|остановк|табло|платформ|ближайш\w* (?:транспорт|отправлен)",
-        "tools": [fn("rasp_search", "Расписание транспорта между станциями/городами на дату (ближайшие рейсы).", {
-            "from": {"type": "string", "description": "откуда — станция или город; пусто — станция пользователя"},
-            "to": {"type": "string", "description": "куда — станция или город"},
-            "date": {"type": "string", "description": "YYYY-MM-DD, по умолчанию сегодня"},
-            "transport": {"type": "string", "enum": list(RASP_TYPES)},
-            "limit": {"type": "integer"}}, ["to"]),
-                  fn("rasp_station", "Табло станции: ближайший транспорт, который отправляется с неё (все направления).", {
-                      "station": {"type": "string", "description": "станция или остановка; пусто — станция пользователя"},
-                      "transport": {"type": "string", "enum": list(RASP_TYPES)},
-                      "limit": {"type": "integer"}})],
-        "test": rasp_test, "run": rasp_run,
-        "help": """
-Ключ бесплатный — для личного некоммерческого использования.
-
-1. Открой https://developer.tech.yandex.ru и войди с Яндекс ID.
-2. Нажми **Подключить API**. В окне «Выберите продукт» прокрути **в самый низ** и нажми **Ещё**.
-3. Выбери **API Яндекс.Расписаний** → **Подключить API**.
-4. Выбери страну → **Продолжить** → прими условия использования → **Подключить**.
-5. Ключ появится сразу (он же — на вкладке **Ключи**). Скопируй его и вставь сюда.
-
-Спрашивать можно двумя способами:
-- **табло станции** — «что ближайшее идёт со станции Царицыно?»: Трой покажет ближайшие отправления во все стороны;
-- **маршрут** — «когда электричка из Подольска до Москвы?».
-
-Станцию по умолчанию указывать не обязательно — тогда просто называй станцию в вопросе.
-
-Что есть в Яндекс Расписаниях: электрички, поезда, пригородные и междугородние автобусы, самолёты.
-Городских автобусов, трамваев и метро там нет — это данные Яндекс Карт, у них нет открытого API.
 """},
 }
 
