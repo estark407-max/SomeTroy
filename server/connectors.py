@@ -745,7 +745,177 @@ CONNECTORS: Dict[str, dict] = {
 }
 
 
+# ═════════════════════════ 6. Умный дом Яндекса (Алиса) ═════════════════════════
+
+YIOT_API = "https://api.iot.yandex.net/v1.0/"
+YIOT_TYPES = {"light": "свет", "socket": "розетка", "switch": "выключатель", "thermostat": "климат",
+              "thermostat.ac": "кондиционер", "media_device": "медиа", "media_device.tv": "телевизор",
+              "openable": "шторы/двери", "openable.curtain": "шторы", "humidifier": "увлажнитель",
+              "purifier": "очиститель", "vacuum_cleaner": "пылесос", "cooking": "кухня", "cooking.kettle": "чайник",
+              "washing_machine": "стиральная машина", "sensor": "датчик", "other": "устройство"}
+YIOT_UNITS = {"unit.temperature.celsius": "°C", "unit.percent": "%", "unit.ppm": " ppm", "unit.illumination.lux": " лк"}
+
+
+def _yiot(cfg: dict, method: str, path: str, body: Optional[dict] = None) -> dict:
+    r = requests.request(method, YIOT_API + path, json=body, timeout=20,
+                         headers={"Authorization": f"Bearer {cfg['token']}", **UA})
+    if r.status_code in (401, 403):
+        raise PermissionError("Яндекс не принял токен (он мог истечь — токен живёт около года)")
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") == "error":
+        raise RuntimeError(data.get("message") or "Яндекс ответил ошибкой")
+    return data
+
+
+def yiot_test(cfg: dict) -> Optional[str]:
+    try:
+        _yiot(cfg, "GET", "user/info")
+    except PermissionError as e:
+        return str(e) + ". Получи новый токен по инструкции."
+    except (requests.RequestException, RuntimeError) as e:
+        return _err(e) if isinstance(e, requests.RequestException) else str(e)
+    return None
+
+
+def _yiot_kind(t: str) -> str:
+    t = t.replace("devices.types.", "")
+    return YIOT_TYPES.get(t) or YIOT_TYPES.get(t.split(".")[0], t)
+
+
+def _yiot_state(d: dict) -> str:
+    parts = []
+    for c in d.get("capabilities", []):
+        st = c.get("state") or {}
+        if st.get("instance") == "on":
+            parts.append("включено" if st.get("value") else "выключено")
+        elif st.get("instance") in ("brightness", "temperature", "volume", "humidity", "open") and st.get("value") is not None:
+            parts.append(f"{st['instance']} {st['value']}")
+    for p in d.get("properties", []):
+        st = p.get("state") or {}
+        if st.get("value") is not None:
+            unit = YIOT_UNITS.get((p.get("parameters") or {}).get("unit", ""), "")
+            parts.append(f"{st.get('instance')} {st['value']}{unit}")
+    return ", ".join(parts) or "состояние неизвестно"
+
+
+def _yiot_find(info: dict, query: str) -> tuple:
+    """(kind, obj) — устройство, группа или сценарий по id или названию (с комнатой)."""
+    q = query.lower().strip()
+    rooms = {r["id"]: r["name"] for r in info.get("rooms", [])}
+    for kind, items in (("device", info.get("devices", [])), ("group", info.get("groups", [])),
+                        ("scenario", info.get("scenarios", []))):
+        for it in items:
+            if it.get("id") == query:
+                return kind, it
+    best, best_score = None, 0
+    words = [w for w in re.split(r"\W+", q) if len(w) > 2]
+    for kind, items in (("device", info.get("devices", [])), ("group", info.get("groups", []))):
+        for it in items:
+            name = f"{it.get('name', '')} {rooms.get(it.get('room'), '')}".lower()
+            score = sum(1 for w in words if w[:5] in name) + (3 if it.get("name", "").lower() in q else 0)
+            if score > best_score:
+                best, best_score = (kind, it), score
+    return best if best else (None, None)
+
+
+def yiot_run(cfg: dict, name: str, args: dict, tz) -> str:
+    info = _yiot(cfg, "GET", "user/info")
+    rooms = {r["id"]: r["name"] for r in info.get("rooms", [])}
+    if name == "yhome_devices":
+        q = str(args.get("filter") or "").lower()
+        rows = []
+        for d in info.get("devices", []):
+            title = f"{d.get('name')} ({rooms.get(d.get('room'), 'без комнаты')})"
+            if q and q not in title.lower() and q not in _yiot_kind(d.get("type", "")):
+                continue
+            rows.append(f"- {title}, {_yiot_kind(d.get('type', ''))}: {_yiot_state(d)} [id {d['id']}]")
+        groups = [f"- группа «{g['name']}» [id {g['id']}]" for g in info.get("groups", []) if not q or q in g["name"].lower()]
+        scen = [f"- сценарий «{sc['name']}»" for sc in info.get("scenarios", []) if sc.get("is_active", True)]
+        out = ("Устройства:\n" + "\n".join(rows[:80])) if rows else "Подходящих устройств нет."
+        if groups:
+            out += "\nГруппы:\n" + "\n".join(groups[:30])
+        if scen and not q:
+            out += "\nСценарии:\n" + "\n".join(scen[:30])
+        return out
+    if name == "yhome_scenario":
+        q = str(args.get("scenario") or "").lower()
+        sc = next((x for x in info.get("scenarios", []) if x["id"] == q or x["name"].lower() == q), None) or \
+            next((x for x in info.get("scenarios", []) if q and q in x["name"].lower()), None)
+        if not sc:
+            return "Такого сценария нет. Сценарии: " + ", ".join(x["name"] for x in info.get("scenarios", []))
+        _yiot(cfg, "POST", f"scenarios/{sc['id']}/actions")
+        return f"Готово: запустил сценарий «{sc['name']}»."
+    # yhome_control
+    kind, obj = _yiot_find(info, str(args.get("target") or ""))
+    if not obj:
+        return "Не нашёл такое устройство или группу. Посмотри список (yhome_devices)."
+    if "lock" in str(obj.get("type", "")) or "security" in str(obj.get("type", "")):
+        return "Замки и охранные устройства я не трогаю — только в приложении «Дом с Алисой»."
+    action, value = str(args.get("action") or ""), args.get("value")
+    if action in ("on", "off"):
+        act = {"type": "devices.capabilities.on_off", "state": {"instance": "on", "value": action == "on"}}
+    elif action in ("brightness", "temperature", "volume", "humidity") and value is not None:
+        act = {"type": "devices.capabilities.range", "state": {"instance": action, "value": float(value)}}
+    elif action in ("open", "close"):
+        act = {"type": "devices.capabilities.range", "state": {"instance": "open", "value": 100 if action == "open" else 0}}
+    else:
+        return "Ошибка: action — on, off, brightness, temperature, volume, humidity, open или close (с value, где нужно)."
+    if kind == "group":
+        _yiot(cfg, "POST", f"groups/{obj['id']}/actions", {"actions": [act]})
+    else:
+        res = _yiot(cfg, "POST", "devices/actions", {"devices": [{"id": obj["id"], "actions": [act]}]})
+        for d in res.get("devices", []):
+            for c in d.get("capabilities", []):
+                ar = (c.get("state") or {}).get("action_result") or {}
+                if ar.get("status") == "ERROR":
+                    return f"Устройство «{obj.get('name')}» не выполнило команду: {ar.get('error_message') or ar.get('error_code')}"
+    room = rooms.get(obj.get("room"), "")
+    return f"Готово: {obj.get('name')}{' (' + room + ')' if room else ''} — {action}{' ' + str(value) if value is not None else ''}."
+
+
+YIOT_CONNECTOR = {
+    "title": "Умный дом Яндекса (Алиса)",
+    "about": "Свет, розетки, кондиционеры, шторы, сценарии Алисы: «выключи свет в спальне».",
+    "fields": [{"name": "token", "label": "Токен умного дома Яндекса", "secret": True}],
+    "hint": r"свет|ламп|розетк|умн|дом[еау]? |алис|сценари|кондиционер|обогрев|штор|пылесос|чайник|увлажнит|температур|влажн",
+    "tools": [fn("yhome_devices", "Устройства умного дома Яндекса, их комнаты и состояние; группы и сценарии.",
+                 {"filter": {"type": "string", "description": "слово для поиска: комната или тип, например «спальня», «свет»"}}),
+              fn("yhome_control", "Управлять устройством или группой умного дома Яндекса.", {
+                  "target": {"type": "string", "description": "название устройства с комнатой или id из yhome_devices"},
+                  "action": {"type": "string", "enum": ["on", "off", "brightness", "temperature", "volume", "humidity",
+                                                        "open", "close"]},
+                  "value": {"type": "number", "description": "для brightness/volume/humidity — %, temperature — °C"}},
+                 ["target", "action"]),
+              fn("yhome_scenario", "Запустить сценарий Алисы по названию.", {"scenario": {"type": "string"}}, ["scenario"])],
+    "test": yiot_test, "run": yiot_run,
+    "help": """
+Трой управляет устройствами из приложения **Дом с Алисой** через официальный API Яндекса. Нужен токен — это бесплатно,
+займёт минуты три. Замки и охранные устройства Трой не трогает.
+
+**1. Зарегистрируй «приложение» (один раз)**
+1. Открой https://oauth.yandex.ru/client/new и войди тем же Яндекс ID, что и в «Доме с Алисой».
+2. Название — любое, например «Трой».
+3. Платформа — **Веб-сервисы**, в поле Redirect URI вставь: https://oauth.yandex.ru/verification_code
+4. В доступах найди **Умный дом Яндекса** и отметь оба: **просмотр списка устройств** (iot:view)
+   и **управление устройствами** (iot:control).
+5. Нажми **Создать приложение** и скопируй **ClientID** (строка из букв и цифр).
+
+**2. Получи токен**
+1. Открой ссылку, подставив свой ClientID вместо ВАШ_CLIENT_ID:
+   https://oauth.yandex.ru/authorize?response_type=token&client_id=ВАШ_CLIENT_ID
+2. Нажми **Разрешить**. На странице появится токен (длинная строка) — скопируй его.
+3. Вставь токен сюда.
+
+Токен действует около года. Когда истечёт, Трой скажет — получишь новый по пункту 2.
+Отозвать доступ можно в любой момент: https://id.yandex.ru/security → «Доступы».
+"""}
+
+
 # ═════════════════════════ Хранение и использование ═════════════════════════
+
+CONNECTORS["yhome"] = YIOT_CONNECTOR
+
 
 class Connections:
     """Доступы подключений — в базе Троя (таблица kv), отдельно от настроек."""

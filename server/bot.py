@@ -842,6 +842,11 @@ def boiler_info(what: str, frm: str = "", to: str = "") -> str:
     return "\n".join(lines)
 
 
+# умный дом: «включи свет», «выключи кондиционер» — это не команды компьютеру
+HOME_RE = re.compile(r"\b(?:свет\w*|ламп\w*|люстр\w*|ночник\w*|розетк\w*|кондиционер\w*|обогревател\w*|"
+                     r"штор\w*|жалюзи|чайник\w*|увлажнител\w*|пылесос\w*|сценари\w*|гирлянд\w*|умн\w* дом\w*)\b", re.I)
+
+
 # прямое поручение компьютеру — модель обязана вызвать pc_command, а не просто ответить
 PC_ORDER_RE = re.compile(r"\b(?:открой|запусти|включи|закрой|выключи|перезагрузи|усыпи|заблокируй|переключи|"
                          r"поставь на паузу|пауза|громче|тише|следующ\w*|предыдущ\w*)\b", re.I)
@@ -937,7 +942,7 @@ def pc_fast_match(text: str):
     t = re.sub(rf"^(?:{re.escape(BOT_NAME.lower())}|трой|эй|слушай)[\s,!.:—-]+", "", t)
     t = re.sub(r"\b(?:пожалуйста|плиз|please|быстро|мне)\b", " ", t)
     t = re.sub(r"[.!?,]+$", "", re.sub(r"\s+", " ", t)).strip(" ,")
-    if BOILER_HINT_RE.search(t):
+    if BOILER_HINT_RE.search(t) or HOME_RE.search(t):      # котёл и умный дом — не программы на компьютере
         return None
     device, m = device_span(t)              # «выключи office pc», «открой телеграм на офисном»
     if device:
@@ -1213,7 +1218,7 @@ class Assistant:
         messages = ([{"role": "system", "content": prompt}]
                     + history + [{"role": "user", "content": content}])
         has_image = isinstance(content, list)
-        must_pc = use_pc and bool(PC_ORDER_RE.search(self.user_text or ""))
+        must_pc = use_pc and bool(PC_ORDER_RE.search(self.user_text or "")) and not HOME_RE.search(self.user_text or "")
         nudged = False
         skip: set = set()
         provider, model = None, None
