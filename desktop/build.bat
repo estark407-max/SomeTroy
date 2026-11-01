@@ -21,16 +21,7 @@ if not defined PY (
     exit /b 1
 )
 
-if not exist "config.json" (
-    echo Нет config.json в папке desktop.
-    pause
-    exit /b 1
-)
-if not exist "troy-cert.pem" (
-    echo Нет troy-cert.pem - сначала запустите server\deploy.bat, он его скачает.
-    pause
-    exit /b 1
-)
+rem config.json и troy-cert.pem не обязательны: без них при первом запуске Трой откроет мастер настройки
 
 rem Защитник Windows иногда удаляет свежесобранный SomeTroy.exe — предлагаем исключение для папки сборки
 set "DEF="
@@ -48,7 +39,7 @@ if /i "%DEF%"=="Y" (
 echo [1/4] Готовлю окружение...
 if not exist ".venv\Scripts\python.exe" %PY% -m venv .venv
 ".venv\Scripts\python.exe" -m pip install -q --upgrade pip
-".venv\Scripts\python.exe" -m pip install -q requests pystray pillow pyinstaller
+".venv\Scripts\python.exe" -m pip install -q requests[socks] pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf
 if errorlevel 1 (
     echo Не удалось установить библиотеки. Проверьте интернет.
     pause
@@ -59,7 +50,13 @@ echo [2/4] Собираю SomeTroy.exe...
 rem --onedir (папка, а не один самораспаковывающийся exe): антивирус почти не путает с вредоносной программой
 if exist "dist\SomeTroy" rmdir /s /q "dist\SomeTroy" >nul 2>&1
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --windowed --name SomeTroy ^
-    --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." troy_desktop.py >build.log 2>&1
+    --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." ^
+    --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import desktop_api ^
+    --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata ^
+    --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" ^
+    --add-data "..\server\desktop_api.py;server_src" --add-data "..\server\requirements.txt;server_src" ^
+    --add-data "..\server\install.sh;server_src" --add-data "..\server\uninstall.sh;server_src" ^
+    --add-data "..\server\settings.env.example;server_src" troy_desktop.py >build.log 2>&1
 if errorlevel 1 (
     echo Сборка не удалась. Пришлите файл build.log из папки desktop.
     pause
@@ -115,8 +112,8 @@ if errorlevel 1 (
 
 echo.
 echo Готово: %~dp0SomeTroySetup.exe
-echo Его можно ставить и на другие компьютеры. Паролей внутри нет: при первом запуске
-echo Трой спросит пароль, который ты задаёшь в Telegram командой /password.
+echo Его можно ставить и на другие компьютеры. Паролей и ключей внутри нет: при первом запуске
+echo Трой сам проведёт настройку в своём окне.
 echo.
 set /p RUN=Установить Троя на этот компьютер сейчас? [Y/n]:
 if /i not "%RUN%"=="n" start "" "%~dp0SomeTroySetup.exe"

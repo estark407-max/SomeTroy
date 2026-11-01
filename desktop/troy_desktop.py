@@ -31,9 +31,12 @@ import requests
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
-CONFIG = APP_DIR / "config.json"
-CERT = APP_DIR / "troy-cert.pem"
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SomeTroy"
+# настройки, которые сделал мастер, — в папке данных; ручная установка — рядом с программой
+CONFIG = DATA_DIR / "config.json" if (DATA_DIR / "config.json").exists() else APP_DIR / "config.json"
+CERT = DATA_DIR / "troy-cert.pem" if (DATA_DIR / "troy-cert.pem").exists() else APP_DIR / "troy-cert.pem"
+# код сервера: для локального режима и для установки на VPS из мастера
+SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DIR.parent / "server"
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
@@ -139,6 +142,9 @@ class Remote:
             return 504, json.dumps({"error": "сервер долго не отвечает"}, ensure_ascii=False).encode()
 
 
+WIZARD = {"w": None, "restart": None}      # мастер первой настройки, пока он идёт
+
+
 def make_handler(remote: Remote, key: str):
     prefix = f"/{key}"
     files = {"/": ("ui.html", "text/html; charset=utf-8"), "/favicon.png": ("favicon.png", "image/png")}
@@ -190,7 +196,7 @@ def make_handler(remote: Remote, key: str):
             elif path == "/version":
                 self.send(200, jbytes({"version": APP_VERSION}))
             elif path == "/session":
-                self.send(200, jbytes({"logged_in": remote.logged_in}))
+                self.send(200, jbytes({"logged_in": remote.logged_in, "setup": WIZARD["w"] is not None}))
             elif path == "/alive":
                 last_alive = time.time()
                 self.send(200, b"{}")
@@ -210,6 +216,19 @@ def make_handler(remote: Remote, key: str):
             if path is None:
                 return
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if path == "/setup" and WIZARD["w"]:            # шаг мастера настройки
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                w = WIZARD["w"]
+                if data.get("action") == "restart":
+                    self.send(200, b"{}")
+                    threading.Thread(target=WIZARD["restart"], daemon=True).start()
+                    return
+                msgs = w.start() if data.get("action") == "start" else w.handle(str(data.get("text") or ""))
+                self.send(200, jbytes({"messages": msgs}))
+                return
             if path == "/login":
                 try:
                     password = json.loads(body or b"{}").get("password", "")
@@ -527,19 +546,72 @@ def tray_hint_once(icon) -> None:
             flag.write_text("1")
 
 
-def main():
-    global APP_URL
+def load_config() -> dict:
     try:
         cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-        assert cfg.get("server")
+        return cfg if cfg.get("mode") == "local" or cfg.get("server") else {}
     except Exception:
-        message_box(f"Нет настроек: положи config.json рядом с программой\n{CONFIG}")
-        return
-    if not CERT.exists():
-        message_box(f"Нет сертификата сервера: положи troy-cert.pem рядом с программой\n{CERT}")
-        return
+        return {}
+
+
+def make_wizard():
+    """Мастер первой настройки: что делать, когда человек всё ввёл."""
+    import setup_wizard
+    import local_server
+    device = os.environ.get("COMPUTERNAME") or "компьютер"
+
+    def finish_local(settings: str, password: str) -> None:
+        home = local_server.server_home(DATA_DIR)
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "settings.env").write_text(settings, encoding="utf-8")
+        session = local_server.set_password_and_login(DATA_DIR, password, device)
+        if session:
+            SESSION.write_text(json.dumps({"session": session}), encoding="utf-8")
+        (DATA_DIR / "config.json").write_text(json.dumps({"mode": "local"}), encoding="utf-8")
+
+    def finish_vps(info: dict) -> None:
+        cert = DATA_DIR / "troy-cert.pem"
+        cert.write_text(info["cert"], encoding="utf-8")
+        server = f"https://{info['ip']}:{info['port']}"
+        (DATA_DIR / "config.json").write_text(json.dumps({"mode": "vps", "server": server}), encoding="utf-8")
+        try:                                    # сразу войти, чтобы не спрашивать только что придуманный пароль
+            r = requests.post(server + "/api/login", json={"password": info["password"], "device": device},
+                              timeout=15, verify=str(cert))
+            if r.status_code == 200:
+                SESSION.write_text(json.dumps({"session": r.json().get("session", "")}), encoding="utf-8")
+        except requests.RequestException:
+            pass                                # сервер пока недоступен с компьютера — войдёт по паролю позже
+
+    template = (SERVER_SRC / "settings.env.example").read_text(encoding="utf-8")
+    return setup_wizard.Wizard(finish_local, finish_vps, template, SERVER_SRC, DATA_DIR)
+
+
+def restart_program() -> None:
+    """После мастера: запустить программу заново уже с настройками."""
+    args = [sys.executable] + ([] if getattr(sys, "frozen", False) else [str(Path(__file__).resolve())])
+    subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def main():
+    global APP_URL
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if already_running():
+        return
+    cfg = load_config()
+    if not cfg:                                 # первый запуск — мастер настройки в окне
+        WIZARD["w"] = make_wizard()
+        cfg = {"server": "http://127.0.0.1:9"}
+    elif cfg.get("mode") == "local":            # Трой живёт прямо здесь
+        import local_server
+        try:
+            port = local_server.start(DATA_DIR)
+        except Exception as e:
+            log.error("Локальный сервер: %s", e)
+            message_box(f"Трой не смог запуститься на этом компьютере: {e}\nПодробности — в {LOG}")
+            return
+        cfg = {**cfg, "server": f"http://127.0.0.1:{port}"}
+    elif not CERT.exists():
+        message_box(f"Нет сертификата сервера: положи troy-cert.pem рядом с программой\n{CERT}")
         return
 
     import pystray
@@ -585,6 +657,20 @@ def main():
         pystray.MenuItem("Выйти из аккаунта", on_logout, enabled=lambda item: remote.logged_in),
         pystray.MenuItem("Закрыть Троя", on_close),
     ))
+
+    def after_wizard():
+        time.sleep(0.5)
+        close_window()
+        try:
+            INSTANCE.unlink()
+        except OSError:
+            pass
+        server.shutdown()
+        server.server_close()                   # освободить порт для нового запуска
+        restart_program()
+        icon.stop()
+
+    WIZARD["restart"] = after_wizard
 
     def setup(icon):
         icon.visible = True

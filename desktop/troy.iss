@@ -99,8 +99,8 @@ end;
 
 [Files]
 Source: "dist\SomeTroy\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "troy-cert.pem"; DestDir: "{app}"; Flags: ignoreversion
+Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "troy-cert.pem"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"

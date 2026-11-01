@@ -138,13 +138,17 @@ class _Server(ThreadingHTTPServer):
         log.debug("Соединение с %s прервано", client_address[0])
 
 
-def start(port: int, auth, pc, cert: str, key: str, on_message, get_history, get_events, bot_name: str):
-    server = _Server(("0.0.0.0", port), make_handler(auth, pc, on_message, get_history, get_events, bot_name))
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(cert, key)
-    # рукопожатие TLS — уже в потоке запроса, чтобы зависший клиент не блокировал приём остальных
-    server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+def start(port: int, auth, pc, cert, key, on_message, get_history, get_events, bot_name: str, host: str = "0.0.0.0"):
+    """cert=None — без шифрования; так можно только на 127.0.0.1 (локальный режим: связь не выходит наружу)."""
+    server = _Server((host, port), make_handler(auth, pc, on_message, get_history, get_events, bot_name))
+    if cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        # рукопожатие TLS — уже в потоке запроса, чтобы зависший клиент не блокировал приём остальных
+        server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    elif host != "127.0.0.1":
+        raise ValueError("без сертификата — только 127.0.0.1")
     threading.Thread(target=server.serve_forever, daemon=True).start()
     log.info("Доступ для программы на компьютере: порт %d", port)
     return server

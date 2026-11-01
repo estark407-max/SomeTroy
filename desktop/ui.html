@@ -123,6 +123,10 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
 }
 .msg.info .box { background: var(--accent-soft); color: var(--text); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
   border-radius: 12px; padding: 9px 14px; }
+textarea.secret { -webkit-text-security: disc; }
+.wz .pc-btn { padding: 8px 16px; }
+.msg.wz { margin-top: -12px; }
+.wz .avatar { visibility: hidden; }
 .pcs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .pc-btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--surface);
   border-radius: 12px; padding: 8px 14px; cursor: pointer; font-size: 14px; color: var(--text); transition: border-color .15s, background .15s; }
@@ -619,6 +623,7 @@ async function api(path, body) {
 
 async function send(voice) {
   if (busy) return;
+  if (wizard) { if (!voice) wizardSend(input.value.trim()); return; }
   const text = voice ? "" : input.value.trim();
   const files = voice ? [voice] : pending;
   if (!text && !files.length) return;
@@ -862,6 +867,58 @@ setInterval(() => fetch(BASE + "/alive").then(() => { aliveFails = 0; }).catch((
   }
 }), 5000);
 
+// ── мастер первой настройки: шаги ведёт программа, не нейросеть ──
+let wizard = false, wizardSecret = false;
+function addChoices(buttons) {
+  const el = document.createElement("div"); el.className = "msg troy wz";
+  el.innerHTML = `<div class="avatar"></div><div class="content"><div class="pcs">${buttons.map((b) =>
+    `<button class="pc-btn">${esc(b)}</button>`).join("")}</div></div>`;
+  el.querySelectorAll(".pc-btn").forEach((btn) => (btn.onclick = () => {
+    if (busy) return;
+    el.querySelectorAll(".pc-btn").forEach((x) => (x.disabled = true)); btn.classList.add("chosen");
+    wizardSend(btn.textContent, true);
+  }));
+  feed.appendChild(el); toBottom();
+}
+function showWizard(msgs) {
+  let last = null;
+  for (const m of msgs) {
+    addTroy(m.text, Date.now() / 1000);
+    if (m.buttons && m.buttons.length) addChoices(m.buttons);
+    last = m;
+  }
+  if (!last) return;
+  wizardSecret = !!last.secret;
+  input.classList.toggle("secret", wizardSecret);
+  input.placeholder = last.placeholder || "Напиши Трою…";
+  if (msgs.some((m) => m.done)) {
+    addBox("info", "Перезапускаюсь…");
+    fetch(BASE + "/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restart" }) }).catch(() => {});
+  }
+}
+async function wizardCall(body) {
+  const r = await fetch(BASE + "/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return (await r.json()).messages || [];
+}
+async function wizardSend(text, fromButton) {
+  if (!text || busy) return;
+  addUser(wizardSecret && !fromButton ? "••••••••" : text, Date.now() / 1000);
+  input.value = ""; autosize(); play("sent");
+  busy = true; updateSend(); showTyping(true);
+  try { const msgs = await wizardCall({ text }); showTyping(false); showWizard(msgs); play("received"); }
+  catch (e) { showTyping(false); flash("Не получилось: " + e.message); }
+  finally { busy = false; updateSend(); input.focus(); }
+}
+async function startWizard() {
+  wizard = true; feed.innerHTML = ""; lastDay = "";
+  $("login").classList.remove("show");
+  ["attach", "mic", "logout"].forEach((id) => { const b = $(id); if (b) b.style.display = "none"; });
+  setStatus(true, "первая настройка");
+  try { showWizard(await wizardCall({ action: "start" })); }
+  catch (e) { flash("Мастер настройки не отвечает: " + e.message); }
+}
+
 // ── вход и выход ──
 let pollTimer = null, loginShown = false;
 function showLogin(msg) {
@@ -889,6 +946,7 @@ $("logout").onclick = async () => {
 
 (async () => {
   const s = await fetch(BASE + "/session").then((r) => r.json()).catch(() => ({ logged_in: false }));
+  if (s.setup) { startWizard(); return; }
   if (s.logged_in) {
     await boot();
     if (new URLSearchParams(location.search).get("voice") === "1") {      // окно открыли клавишей

@@ -36,8 +36,11 @@ from dotenv import load_dotenv
 import bitrix
 import desktop_api
 
-BASE = Path(__file__).resolve().parent
-load_dotenv(BASE / "settings.env")
+# TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
+# указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
+BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
+load_dotenv(BASE / "settings.env", override=True)
+LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
 
 
 def env(name: str, default: str = "") -> str:
@@ -71,7 +74,7 @@ GITHUB_BRANCH = env("GITHUB_BRANCH", "main")
 
 BITRIX_WEBHOOK = env("BITRIX_WEBHOOK")    # https://портал.bitrix24.ru/rest/1/xxxxxxxx/
 
-DESKTOP_PORT = int(env("DESKTOP_PORT", "8443"))
+DESKTOP_PORT = int(os.environ.get("TROY_LOCAL_PORT") or env("DESKTOP_PORT", "8443"))   # локальный режим — свободный порт
 
 TZ_NAME = env("TIMEZONE", "Europe/Moscow")
 TZ = ZoneInfo(TZ_NAME)
@@ -1844,6 +1847,10 @@ def start_desktop_api(assistant: "Assistant"):
     if not ALLOWED_USER_ID:
         log.warning("Программа на компьютере не запущена: сначала впиши ALLOWED_USER_ID")
         return None
+    if LOCAL_MODE:                      # программа и сервер на одном компьютере — связь не выходит наружу
+        return desktop_api.start(DESKTOP_PORT, AppAuth(), PcHooks, None, None,
+                                 lambda text, files: desktop_reply(assistant, text, files),
+                                 desktop_history, events_after, BOT_NAME, host="127.0.0.1")
     if not (cert.exists() and key.exists()):
         log.warning("Нет сертификата в %s — программа на компьютере не запущена (его создаёт install.sh)", TLS_DIR)
         return None
@@ -1940,6 +1947,8 @@ def self_check() -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Личный ассистент в Telegram")
     ap.add_argument("--check", action="store_true", help="проверить настройки и доступ к сервисам")
+    ap.add_argument("--set-password", action="store_true",
+                    help="задать пароль программы на компьютере (пароль читается из stdin)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1947,15 +1956,42 @@ def main() -> None:
 
     if args.check:
         raise SystemExit(0 if self_check() else 1)
+    if args.set_password:               # мастер настройки задаёт пароль по SSH — в командной строке его не видно
+        import sys
+        password = sys.stdin.readline().rstrip("\r\n")
+        if len(password) < 4:
+            raise SystemExit("Пароль слишком короткий")
+        init_db()
+        AppAuth.set_password(password)
+        print("Пароль программы задан")
+        return
+    serve()
+
+
+def serve(stop: Optional[threading.Event] = None) -> None:
+    """Запуск Троя: на сервере — из main(), в локальном режиме — из программы на компьютере (в потоке)."""
     if not TELEGRAM_TOKEN or not GROQ_API_KEY:
         raise SystemExit("Укажите TELEGRAM_TOKEN и GROQ_API_KEY в settings.env")
 
     init_db()
     with closing(db()) as con, con:   # история от прежней версии на Gemini: роль model → assistant
         con.execute("UPDATE history SET role='assistant' WHERE role='model'")
+    stop = stop or threading.Event()
+    assistant = Assistant()
+    # программа на компьютере работает, даже если Telegram пока недоступен
+    start_desktop_api(assistant)
+    threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
+    threading.Thread(target=power_watch_loop, daemon=True).start()
+
     tg = Telegram(TELEGRAM_TOKEN)
-    me = tg.call("getMe")
-    tg.call("deleteWebhook")
+    while True:
+        try:
+            me = tg.call("getMe")
+            tg.call("deleteWebhook")
+            break
+        except (requests.RequestException, TelegramError) as e:
+            log.warning("Telegram недоступен (%s) — пробую снова через 30 с", e)
+            time.sleep(30)
     tg.call("setMyCommands", data={"commands": json.dumps([
         {"command": "reminders", "description": "Мои напоминания"},
         {"command": "ideas", "description": "Проекты с идеями"},
@@ -1963,15 +1999,9 @@ def main() -> None:
         {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
         {"command": "help", "description": "Что я умею"},
     ], ensure_ascii=False)})
-
-    stop = threading.Event()
-    threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
     log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),
              " + Mistral" if MISTRAL_API_KEY else "",
              f"GitHub {GITHUB_REPO}" if GITHUB_TOKEN and GITHUB_REPO else "локально")
-    assistant = Assistant()
-    start_desktop_api(assistant)
-    threading.Thread(target=power_watch_loop, daemon=True).start()
     Bot(tg, assistant).poll_forever()
 
 

@@ -32,7 +32,7 @@
 
 ## Статус
 
-🚧 В разработке. Уже можно поставить вручную — [docs/INSTALL.md](docs/INSTALL.md). План — в [docs/PLAN.md](docs/PLAN.md).
+🚧 В разработке. Установка — [docs/INSTALL.md](docs/INSTALL.md): мастер настройки в окне программы (на компьютере или на своём VPS) или вручную. План — в [docs/PLAN.md](docs/PLAN.md).
 
 ## Авторы
 
