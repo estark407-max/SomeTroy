@@ -132,12 +132,31 @@ textarea.secret { -webkit-text-security: disc; }
 .help-link:hover { text-decoration: underline; }
 .help-modal { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.45); display: none; place-items: center; padding: 16px; }
 .help-modal.show { display: grid; }
+#help-modal { z-index: 40; }
 .help-card { width: min(560px, 100%); max-height: min(80vh, 720px); overflow: auto; background: var(--surface);
   border: 1px solid var(--line); border-radius: 18px; padding: 20px 22px; box-shadow: 0 20px 60px rgba(0,0,0,.35); }
 .help-card h3 { margin: 0 0 10px; font-size: 17px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .help-card h3 button { background: none; border: 0; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; }
 .help-card .body p, .help-card .body li { line-height: 1.55; }
 .help-card a { color: var(--accent); text-decoration: underline; }
+.conn-list { display: grid; gap: 10px; margin-top: 6px; }
+.conn-item { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; display: grid; gap: 4px; }
+.conn-item .row { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.conn-item b { font-size: 14.5px; }
+.conn-item .about { color: var(--muted); font-size: 13px; line-height: 1.45; }
+.conn-badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.conn-badge.off { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+.conn-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.conn-actions button, .conn-form button { border: 1px solid var(--line); background: var(--surface); color: var(--text);
+  border-radius: 10px; padding: 7px 14px; font: inherit; font-size: 13.5px; cursor: pointer; }
+.conn-actions button.primary, .conn-form button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.conn-actions button:disabled, .conn-form button:disabled { opacity: .5; cursor: default; }
+.conn-form { display: grid; gap: 10px; margin-top: 4px; }
+.conn-form label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); }
+.conn-form input, .conn-form select { border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 10px;
+  padding: 9px 11px; font: inherit; font-size: 14px; }
+.conn-form .err { color: var(--danger); font-size: 13px; white-space: pre-line; }
+.conn-form .ok { color: var(--accent); font-size: 13px; }
 .help-card .body p { margin: 0 0 10px; }
 .wz .avatar { visibility: hidden; }
 .pcs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
@@ -349,6 +368,9 @@ textarea::placeholder { color: var(--muted); }
     <button data-mode="off">Без звука</button>
   </div>
   </div>
+  <button class="icon-btn" id="conn-btn" title="Подключения: календарь, почта, умный дом, расписания">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0V8zM12 18v4"/></svg>
+  </button>
   <div class="snd-wrap">
   <button class="icon-btn" id="about-btn" title="О программе">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
@@ -900,6 +922,85 @@ function showHelp(h) {
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("help-modal")?.classList.remove("show"); });
 
+// ── Подключения: календарь, почта, умный дом, расписания ──
+let conns = [];
+function connModal() {
+  let m = $("conn-modal");
+  if (!m) {
+    m = document.createElement("div"); m.id = "conn-modal"; m.className = "help-modal";
+    m.innerHTML = `<div class="help-card" role="dialog"><h3><span>Подключения</span><button title="Закрыть">×</button></h3><div class="body"></div></div>`;
+    m.onclick = (e) => { if (e.target === m || e.target.closest("h3 button")) m.classList.remove("show"); };
+    document.body.appendChild(m);
+  }
+  return m;
+}
+async function openConnections() {
+  const m = connModal(); m.classList.add("show");
+  const body = m.querySelector(".body"); body.innerHTML = "<p>Загружаю…</p>";
+  try { conns = (await api("/connections")).connections || []; drawConnList(); }
+  catch (e) { body.innerHTML = `<p class="err">Не получилось загрузить: ${esc(e.message)}</p>`; }
+}
+function drawConnList() {
+  const body = connModal().querySelector(".body");
+  body.innerHTML = `<p>Подключи свои сервисы — и спрашивай Троя: «что у меня завтра», «есть новые письма?»,
+    «выключи свет в зале», «когда электричка до Москвы». Доступы хранятся только у твоего Троя и в нейросеть не попадают.</p>
+    <div class="conn-list">${conns.map((c) => `<div class="conn-item" data-id="${c.id}">
+      <div class="row"><b>${esc(c.title)}</b><span class="conn-badge ${c.enabled ? "" : "off"}">${c.enabled ? "подключено" : "выключено"}</span></div>
+      <div class="about">${esc(c.about)}${c.enabled && c.summary ? "<br>" + esc(c.summary) : ""}</div>
+      <div class="conn-actions">${c.enabled
+        ? `<button data-a="edit">Изменить</button><button data-a="off">Отключить</button>`
+        : `<button class="primary" data-a="edit">Подключить</button>`}<button data-a="help">📖 Инструкция</button></div></div>`).join("")}</div>`;
+  body.querySelectorAll(".conn-item").forEach((el) => el.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
+    const c = conns.find((x) => x.id === el.dataset.id);
+    if (b.dataset.a === "help") return showHelp({ title: c.title, text: c.help });
+    if (b.dataset.a === "edit") return drawConnForm(c);
+    b.disabled = true;
+    try { conns = (await api("/connections/remove", { id: c.id })).connections; drawConnList(); }
+    catch (e) { b.disabled = false; flash("Не получилось отключить: " + e.message); }
+  })));
+}
+function drawConnForm(c) {
+  const body = connModal().querySelector(".body");
+  const field = (f) => {
+    const input = `<input name="${f.name}" type="${f.secret ? "password" : "text"}" placeholder="${esc(f.placeholder || "")}" autocomplete="off">`;
+    if (f.choices) return `<label>${esc(f.label)}<select data-for="${f.name}">${f.choices.map(([v, t]) =>
+      `<option value="${esc(v)}">${esc(t)}</option>`).join("")}<option value="">Другой адрес…</option></select>
+      <input name="${f.name}" type="text" value="${esc(f.choices[0][0])}" style="display:none" placeholder="${esc(f.placeholder || "")}"></label>`;
+    return `<label>${esc(f.label)}${input}</label>`;
+  };
+  body.innerHTML = `<p><b>${esc(c.title)}</b><br>${esc(c.about)}</p>
+    <button class="help-link" data-a="help">📖 Подробная инструкция: где взять доступ</button>
+    <form class="conn-form">${c.fields.map(field).join("")}<div class="err"></div>
+      <div class="conn-actions"><button type="submit" class="primary">Проверить и подключить</button>
+      <button type="button" data-a="back">Назад</button></div></form>`;
+  body.querySelector('[data-a="help"]').onclick = () => showHelp({ title: c.title, text: c.help });
+  body.querySelector('[data-a="back"]').onclick = drawConnList;
+  body.querySelectorAll("select[data-for]").forEach((sel) => (sel.onchange = () => {
+    const inp = sel.parentNode.querySelector("input");
+    inp.style.display = sel.value ? "none" : ""; inp.value = sel.value; if (!sel.value) inp.focus();
+  }));
+  const form = body.querySelector("form");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const values = {}; form.querySelectorAll("input").forEach((i) => (values[i.name] = i.value.trim()));
+    const btn = form.querySelector('button[type="submit"]'); btn.disabled = true; btn.textContent = "Проверяю…";
+    form.querySelector(".err").textContent = "";
+    try {
+      const r = await fetch(API + "/connections", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: c.id, values }) });
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 401) { connModal().classList.remove("show"); return showLogin(); }
+      if (!r.ok) { form.querySelector(".err").textContent = "⚠️ " + (data.error || "не получилось"); return; }
+      conns = data.connections; drawConnList();
+      addBox("info", `✅ Подключено: ${c.title}. Можно спрашивать Троя.`);
+    } catch (err) { form.querySelector(".err").textContent = "⚠️ " + err.message; }
+    finally { btn.disabled = false; btn.textContent = "Проверить и подключить"; }
+  };
+  form.querySelector("input:not([style*=none])")?.focus();
+}
+$("conn-btn").onclick = openConnections;
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("help-modal")?.classList.contains("show")) $("conn-modal")?.classList.remove("show"); });
+
 // ── мастер первой настройки: шаги ведёт программа, не нейросеть ──
 let wizard = false, wizardSecret = false;
 function addChoices(buttons) {
@@ -952,7 +1053,7 @@ async function wizardSend(text, fromButton) {
 async function startWizard() {
   wizard = true; feed.innerHTML = ""; lastDay = "";
   $("login").classList.remove("show");
-  ["attach", "mic", "logout"].forEach((id) => { const b = $(id); if (b) b.style.display = "none"; });
+  ["attach", "mic", "logout", "conn-btn"].forEach((id) => { const b = $(id); if (b) b.style.display = "none"; });
   setStatus(true, "первая настройка");
   try { showWizard(await wizardCall({ action: "start" })); }
   catch (e) { flash("Мастер настройки не отвечает: " + e.message); }

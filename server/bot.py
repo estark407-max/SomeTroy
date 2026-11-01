@@ -34,6 +34,7 @@ import requests
 from dotenv import load_dotenv
 
 import bitrix
+import connectors
 import desktop_api
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
@@ -1020,6 +1021,7 @@ class Assistant:
         self.router = Router(self.llm)
         self.ideas = Ideas()
         self.bx = bitrix.Bitrix(BITRIX_WEBHOOK) if BITRIX_WEBHOOK else None
+        self.conns = connectors.Connections(db, TZ)      # календари, почта, умный дом, расписания
         self.lock = threading.Lock()     # Telegram и программа на компьютере — по очереди
         self.pc_used = False
         self.user_text = ""
@@ -1071,6 +1073,11 @@ class Assistant:
                                    str(args.get("date_to") or ""))
             if name == "pc_command":
                 return self.pc_command(chat_id, args)
+            if self.conns.owner_of(name):
+                if self.conns.is_write(name) and not YES_RE.match(self.user_text.strip()):
+                    return ("НЕ ВЫПОЛНЕНО: сначала покажи пользователю, что именно добавишь (название, дата, время), "
+                            "и спроси «Добавляю?». Вызови функцию снова только после его ответа «да».")
+                return self.conns.run(name, args)
             if name.startswith("bitrix_"):
                 if not self.bx:
                     return "Ошибка: Битрикс24 не подключён (нет BITRIX_WEBHOOK в настройках)."
@@ -1190,9 +1197,14 @@ class Assistant:
         recent = [self.user_text] + [h["content"] for h in history[-2:] if isinstance(h.get("content"), str)]
         use_pc = any(PC_HINT_RE.search(t or "") for t in recent)
         use_boiler = BOILER_ON and any(BOILER_HINT_RE.search(t or "") for t in recent)
+        conn_tools, conn_names = self.conns.tools_for(recent)
         tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
-                 + ([BOILER_TOOL] if use_boiler else []))
-        messages = ([{"role": "system", "content": system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)}]
+                 + ([BOILER_TOOL] if use_boiler else []) + conn_tools)
+        prompt = system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)
+        if conn_names:
+            prompt += ("\n- Подключено: " + ", ".join(conn_names) + ". Для событий, писем, умного дома и расписаний "
+                       "вызывай соответствующие функции, не выдумывай. Даты считай от сегодняшней.")
+        messages = ([{"role": "system", "content": prompt}]
                     + history + [{"role": "user", "content": content}])
         has_image = isinstance(content, list)
         must_pc = use_pc and bool(PC_ORDER_RE.search(self.user_text or ""))
@@ -1591,6 +1603,9 @@ def diagnostics(assistant: Optional["Assistant"] = None) -> str:
         lines.append(f"❌ База: {e}")
     if not ALLOWED_USER_ID:
         lines.append("❌ Хозяин не указан (ALLOWED_USER_ID) — Трой никому не отвечает")
+    # подключения
+    if assistant is not None:
+        lines += assistant.conns.diag() or ["⚪ Подключений нет (календари, почта, умный дом — в программе: «Подключения»)"]
     # компьютеры
     lines.append(pcs_status())
     # последние проблемы
@@ -2041,13 +2056,13 @@ def start_desktop_api(assistant: "Assistant"):
     if LOCAL_MODE:                      # программа и сервер на одном компьютере — связь не выходит наружу
         return desktop_api.start(DESKTOP_PORT, AppAuth(), PcHooks, None, None,
                                  lambda text, files: desktop_reply(assistant, text, files),
-                                 desktop_history, events_after, BOT_NAME, host="127.0.0.1")
+                                 desktop_history, events_after, BOT_NAME, host="127.0.0.1", conns=assistant.conns)
     if not (cert.exists() and key.exists()):
         log.warning("Нет сертификата в %s — программа на компьютере не запущена (его создаёт install.sh)", TLS_DIR)
         return None
     return desktop_api.start(DESKTOP_PORT, AppAuth(), PcHooks, str(cert), str(key),
                              lambda text, files: desktop_reply(assistant, text, files),
-                             desktop_history, events_after, BOT_NAME)
+                             desktop_history, events_after, BOT_NAME, conns=assistant.conns)
 
 
 # ───────────────────────── Проверка и запуск ─────────────────────────

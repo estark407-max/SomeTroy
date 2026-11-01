@@ -133,7 +133,7 @@ def settings_text(template: str, values: dict) -> str:
 
 # ───────────────────────── сервер (VPS) по SSH ─────────────────────────
 
-SERVER_FILES = ["bot.py", "bitrix.py", "desktop_api.py", "requirements.txt", "install.sh", "uninstall.sh"]
+SERVER_FILES = ["bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt", "install.sh", "uninstall.sh"]
 
 
 def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path, say: Callable[[str], None]) -> dict:

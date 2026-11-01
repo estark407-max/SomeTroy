@@ -51,9 +51,9 @@ rem --onedir (папка, а не один самораспаковывающи�
 if exist "dist\SomeTroy" rmdir /s /q "dist\SomeTroy" >nul 2>&1
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --windowed --name SomeTroy ^
     --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." ^
-    --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import desktop_api ^
+    --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import connectors --hidden-import desktop_api ^
     --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata ^
-    --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" ^
+    --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" --add-data "..\server\connectors.py;server_src" ^
     --add-data "..\server\desktop_api.py;server_src" --add-data "..\server\requirements.txt;server_src" ^
     --add-data "..\server\install.sh;server_src" --add-data "..\server\uninstall.sh;server_src" ^
     --add-data "..\server\settings.env.example;server_src" troy_desktop.py >build.log 2>&1

@@ -23,7 +23,7 @@ log = logging.getLogger("assistant.desktop")
 MAX_BODY = 25 * 1024 * 1024
 
 
-def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str):
+def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, conns=None):
     """auth: объект с методами login(password, device, ip) -> (session|None, error), check(session) -> bool,
     logout(session)."""
 
@@ -75,6 +75,8 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str):
             elif url.path == "/api/pc/poll":         # компьютер спрашивает команды для себя
                 ver = (parse_qs(url.query).get("v") or [""])[0][:20]
                 self.reply(200, {"commands": pc.poll(auth.device(self.session()) or "компьютер", ver)})
+            elif url.path == "/api/connections" and conns is not None:     # список подключений (без секретов)
+                self.reply(200, {"connections": conns.listing()})
             elif url.path == "/api/events":
                 after = int((parse_qs(url.query).get("after") or ["0"])[0] or 0)
                 self.reply(200, {"events": get_events(after)})
@@ -108,6 +110,18 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str):
                           str(data.get("text") or ""), bool(data.get("late")))
                 self.reply(200, {"ok": True})
                 return
+            if path in ("/api/connections", "/api/connections/remove") and conns is not None:
+                data = self.body()
+                if data is None:
+                    return
+                cid = str(data.get("id") or "")
+                if path.endswith("/remove"):
+                    conns.disconnect(cid)
+                    self.reply(200, {"ok": True, "connections": conns.listing()})
+                    return
+                err = conns.connect(cid, data.get("values") or {})
+                self.reply(200 if not err else 400, {"ok": not err, "error": err or "", "connections": conns.listing()})
+                return
             if path == "/api/pc/choose":
                 data = self.body()
                 if data is None:
@@ -138,9 +152,10 @@ class _Server(ThreadingHTTPServer):
         log.debug("Соединение с %s прервано", client_address[0])
 
 
-def start(port: int, auth, pc, cert, key, on_message, get_history, get_events, bot_name: str, host: str = "0.0.0.0"):
+def start(port: int, auth, pc, cert, key, on_message, get_history, get_events, bot_name: str, host: str = "0.0.0.0",
+          conns=None):
     """cert=None — без шифрования; так можно только на 127.0.0.1 (локальный режим: связь не выходит наружу)."""
-    server = _Server((host, port), make_handler(auth, pc, on_message, get_history, get_events, bot_name))
+    server = _Server((host, port), make_handler(auth, pc, on_message, get_history, get_events, bot_name, conns))
     if cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2

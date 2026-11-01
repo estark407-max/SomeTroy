@@ -297,7 +297,7 @@ def make_handler(remote: Remote, key: str):
                 ok, err = set_hotkey(data.get("hotkey"))
                 self.send(200 if ok else 400, jbytes({"ok": ok, "error": err, **load_settings()}))
                 return
-            if path == "/api/pc/choose":
+            if path in ("/api/pc/choose", "/api/connections", "/api/connections/remove"):
                 code, resp = remote.forward("POST", path, body)
                 self.send(code, resp)
                 return
