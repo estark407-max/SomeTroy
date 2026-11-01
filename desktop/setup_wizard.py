@@ -372,58 +372,60 @@ class Wizard:
         if t != self.password:
             self.state = "password"
             return [msg("Пароли не совпали. Давай ещё раз — придумай пароль.", secret=True, placeholder="Пароль")]
-        self.state = "extras"
         return self._extras("✅ Пароль запомнил.\n\n")
 
     def _extras(self, prefix: str = ""):
-        have = []
-        if self.v.get("MISTRAL_API_KEY"):
-            have.append("Mistral ✅")
-        if self.v.get("BITRIX_WEBHOOK"):
-            have.append("Битрикс24 ✅")
-        buttons = [b for b, k in (("Запасная модель Mistral", "MISTRAL_API_KEY"), ("Битрикс24", "BITRIX_WEBHOOK"))
-                   if not self.v.get(k)] + ["Дальше"]
-        return [msg(prefix + "Шаг 5 из 5 — по желанию (можно пропустить, добавить позже в настройках):\n"
-                    "- **Запасная модель Mistral** — бесплатная; выручает, когда у Groq кончился лимит.\n"
-                    "- **Битрикс24** — задачи, чаты, CRM и аналитика из твоего портала."
-                    + (f"\n\nУже подключено: {', '.join(have)}." if have else ""), buttons)]
+        """Шаг 5: запасная модель Mistral — по желанию."""
+        self.state = "extras"
+        return [msg(prefix + "Шаг 5 из 5 — запас на всякий случай (по желанию).\n\n"
+                    "У бесплатного Groq есть дневные лимиты. Если подключить ещё и бесплатный **Mistral**, "
+                    "я не замолчу, когда лимит Groq закончится. Подключим?",
+                    ["Подключить Mistral", "Пропустить"])]
 
     def s_extras(self, t: str):
-        low = t.lower()
-        if "mistral" in low:
+        if "mistral" in t.lower() or t.lower().startswith("подключ"):
             self.state = "mistral"
             return [msg("Ключ Mistral: открой https://console.mistral.ai/api-keys, войди, выбери бесплатный план "
-                        "(Experiment), нажми **Create new key** и вставь ключ сюда.", ["Назад"], secret=True)]
-        if "битрикс" in low:
+                        "(Experiment), нажми **Create new key** и вставь ключ сюда.", ["Пропустить"], secret=True)]
+        return self._ask_bitrix()
+
+    def s_mistral(self, t: str):
+        if t.lower() in ("пропустить", "назад"):
+            return self._ask_bitrix()
+        err = check_mistral(t)
+        if err:
+            return [msg(err, ["Пропустить"], secret=True)]
+        self.v["MISTRAL_API_KEY"] = t
+        return self._ask_bitrix("✅ Mistral подключён.\n\n")
+
+    def _ask_bitrix(self, prefix: str = ""):
+        self.state = "bitrix_q"
+        return [msg(prefix + "Пользуешься **Битрикс24** на работе? Могу смотреть задачи и чаты, искать в CRM "
+                    "и считать аналитику — а всё, что меняет, делать только после твоего «да».",
+                    ["Да, подключить", "Нет"])]
+
+    def s_bitrix_q(self, t: str):
+        if t.lower().startswith("да"):
             self.state = "bitrix"
             return [msg("Вебхук Битрикс24: в портале **Приложения → Разработчикам → Другое → Входящий вебхук**, "
-                        "права: task, im, crm, user. Скопируй адрес вебхука целиком и вставь сюда.", ["Назад"],
+                        "права: task, im, crm, user. Скопируй адрес вебхука целиком и вставь сюда.", ["Пропустить"],
                         secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
         return self._ask_zone()
 
-    def s_mistral(self, t: str):
-        if t.lower() != "назад":
-            err = check_mistral(t)
-            if err:
-                return [msg(err, ["Назад"], secret=True)]
-            self.v["MISTRAL_API_KEY"] = t
-        self.state = "extras"
-        return self._extras("✅ Mistral подключён.\n\n" if t.lower() != "назад" else "")
-
     def s_bitrix(self, t: str):
-        if t.lower() != "назад":
-            err = check_bitrix(t)
-            if err:
-                return [msg(err, ["Назад"], secret=True)]
-            self.v["BITRIX_WEBHOOK"] = t.rstrip("/") + "/"
-        self.state = "extras"
-        return self._extras("✅ Битрикс24 подключён.\n\n" if t.lower() != "назад" else "")
+        if t.lower() in ("пропустить", "назад"):
+            return self._ask_zone()
+        err = check_bitrix(t)
+        if err:
+            return [msg(err, ["Пропустить"], secret=True, placeholder="https://…bitrix24.ru/rest/1/…/")]
+        self.v["BITRIX_WEBHOOK"] = t.rstrip("/") + "/"
+        return self._ask_zone("✅ Битрикс24 подключён.\n\n")
 
-    def _ask_zone(self):
+    def _ask_zone(self, prefix: str = ""):
         city, zone = local_zone()
         self.zone_guess = zone
         self.state = "zone"
-        return [msg(f"Последнее: часовой пояс для напоминаний. По часам компьютера это **{city}**. Верно?",
+        return [msg(prefix + f"Последнее: часовой пояс для напоминаний. По часам компьютера это **{city}**. Верно?",
                     [f"Да, {city}", "Другой"])]
 
     def s_zone(self, t: str):
@@ -616,15 +618,21 @@ Groq — сервис, где бесплатно работают нейросе
 Повтори тот же пароль ещё раз — так Трой убедится, что опечатки нет.
 Если не совпадёт, он попросит придумать пароль заново.
 """),
-    "extras": ("Дополнительно (по желанию)", """
-Оба пункта можно пропустить кнопкой «Дальше» и подключить потом.
+    "extras": ("Запасная модель Mistral", """
+Mistral — ещё один бесплатный сервис с нейросетями. Он нужен как запас: когда у Groq закончился
+дневной лимит, Трой ответит через Mistral, а не замолчит.
 
-**Запасная модель Mistral** — тоже бесплатная. Нужна, когда у Groq закончился лимит: Трой не замолчит,
-а ответит через Mistral. Ключ: https://console.mistral.ai/api-keys
+Можно пропустить и подключить потом. Ключ берётся здесь: https://console.mistral.ai/api-keys
 (при входе выбери бесплатный план **Experiment**; может попросить подтвердить номер телефона).
+"""),
+    "bitrix_q": ("Битрикс24", """
+Если ты пользуешься Битрикс24 (обычно — на работе), Трой может:
+- показывать твои задачи и непрочитанные сообщения;
+- искать сделки, контакты и компании в CRM;
+- считать аналитику: например, сколько сделок закрыли за месяц по менеджерам;
+- ставить задачи, писать в чаты и менять CRM — но только после твоего «да».
 
-**Битрикс24** — если пользуешься Битриксом на работе: Трой сможет смотреть задачи и чаты, искать в CRM,
-считать аналитику, а всё, что меняет, делать только после твоего «да».
+Трой работает от твоего имени и с твоими правами. Не пользуешься Битриксом — нажми «Нет», этот шаг пропустится.
 """),
     "mistral": ("Ключ Mistral", """
 1. Открой https://console.mistral.ai/api-keys и войди (Google или почта).
