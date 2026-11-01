@@ -545,11 +545,15 @@ def rasp_suggest(query: str) -> List[dict]:
     return out
 
 
-def _rasp_code(q: str) -> tuple:
+def _rasp_code(q: str, station_only: bool = False) -> tuple:
     q = q.strip()
+    if not q:
+        raise ValueError("не указана станция")
     if re.fullmatch(r"[sc]\d+", q):
         return q, q
     found = rasp_suggest(q)
+    if station_only:                                   # для табло нужна станция, а не город
+        found = [f for f in found if str(f["code"]).startswith("s")] or found
     if not found:
         raise ValueError(f"не нашёл станцию или город «{q}»")
     return found[0]["code"], found[0]["title"]
@@ -566,7 +570,47 @@ def rasp_test(cfg: dict) -> Optional[str]:
     return None if r.status_code == 200 else f"Яндекс ответил ошибкой {r.status_code}"
 
 
+def rasp_station(cfg: dict, args: dict, tz) -> str:
+    """Табло станции: ближайшие отправления всего транспорта, который там останавливается."""
+    try:
+        code, title = _rasp_code(str(args.get("station") or cfg.get("home") or ""), station_only=True)
+    except ValueError as e:
+        return f"Ошибка: {e}. Уточни название станции."
+    if code.startswith("c"):
+        return (f"«{title}» — это город, а нужна конкретная станция или остановка "
+                "(например «Подольск» → станция Подольск, «Курский вокзал»).")
+    now = datetime.now(tz)
+    params = {"apikey": cfg["apikey"], "station": code, "date": now.strftime("%Y-%m-%d"), "format": "json",
+              "lang": "ru_RU", "event": "departure", "limit": 300}
+    if args.get("transport") in RASP_TYPES:
+        params["transport_types"] = args["transport"]
+    r = requests.get(RASP_API + "schedule/", params=params, timeout=20, headers=UA)
+    if r.status_code != 200:
+        return f"Яндекс Расписания ответили ошибкой {r.status_code}."
+    rows, limit = [], int(args.get("limit") or 8)
+    for it in r.json().get("schedule", []):
+        try:
+            dep = datetime.fromisoformat(it.get("departure") or "").astimezone(tz)
+        except ValueError:
+            continue
+        if dep < now - timedelta(minutes=1):
+            continue
+        th = it.get("thread", {})
+        kind = RASP_TYPES.get(th.get("transport_type", ""), th.get("transport_type", ""))
+        extra = " (экспресс)" if th.get("express_type") else ""
+        plat = f", {it['platform']}" if it.get("platform") else ""
+        rows.append(f"- {dep:%H:%M} {kind}{extra} {th.get('title', '')}{plat}".rstrip())
+        if len(rows) >= limit:
+            break
+    return (f"Ближайшие отправления со станции {title}:\n" + ("\n".join(rows) if rows else "сегодня больше нет")
+            + "\n(Данные: Яндекс Расписания, rasp.yandex.ru)")
+
+
 def rasp_run(cfg: dict, name: str, args: dict, tz) -> str:
+    if name == "rasp_station":
+        return rasp_station(cfg, args, tz)
+    if not (args.get("from") or cfg.get("home")):
+        return "Ошибка: откуда ехать? Спроси у пользователя станцию отправления."
     try:
         frm, frm_t = _rasp_code(str(args.get("from") or cfg.get("home") or ""))
         to, to_t = _rasp_code(str(args.get("to") or ""))
@@ -720,17 +764,21 @@ CONNECTORS: Dict[str, dict] = {
 """},
     "rasp": {
         "title": "Электрички и автобусы (Яндекс Расписания)",
-        "about": "«Когда ближайшая электричка до города?» — расписание поездов, электричек, автобусов.",
+        "about": "«Что ближайшее идёт со станции Подольск?», «когда электричка до Москвы?» — поезда, электрички, автобусы.",
         "fields": [{"name": "apikey", "label": "Ключ API Яндекс Расписаний", "secret": True},
-                   {"name": "home", "label": "Твоя станция по умолчанию (необязательно)",
+                   {"name": "home", "label": "Твоя станция по умолчанию (необязательно — можно всегда называть станцию)",
                     "placeholder": "например «Подольск»", "optional": True}],
-        "hint": r"электричк|поезд|автобус|расписани|рейс|станци|вокзал|ласточк|когда (?:ближайш|следующ)",
+        "hint": r"электричк|поезд|автобус|расписани|рейс|станци|вокзал|ласточк|когда (?:ближайш|следующ)|что (?:идёт|идет|ближайш)|остановк|табло|платформ|ближайш\w* (?:транспорт|отправлен)",
         "tools": [fn("rasp_search", "Расписание транспорта между станциями/городами на дату (ближайшие рейсы).", {
             "from": {"type": "string", "description": "откуда — станция или город; пусто — станция пользователя"},
             "to": {"type": "string", "description": "куда — станция или город"},
             "date": {"type": "string", "description": "YYYY-MM-DD, по умолчанию сегодня"},
             "transport": {"type": "string", "enum": list(RASP_TYPES)},
-            "limit": {"type": "integer"}}, ["to"])],
+            "limit": {"type": "integer"}}, ["to"]),
+                  fn("rasp_station", "Табло станции: ближайший транспорт, который отправляется с неё (все направления).", {
+                      "station": {"type": "string", "description": "станция или остановка; пусто — станция пользователя"},
+                      "transport": {"type": "string", "enum": list(RASP_TYPES)},
+                      "limit": {"type": "integer"}})],
         "test": rasp_test, "run": rasp_run,
         "help": """
 Ключ бесплатный — для личного некоммерческого использования.
@@ -741,7 +789,14 @@ CONNECTORS: Dict[str, dict] = {
 4. Выбери страну → **Продолжить** → прими условия использования → **Подключить**.
 5. Ключ появится сразу (он же — на вкладке **Ключи**). Скопируй его и вставь сюда.
 
-По желанию укажи свою станцию — тогда можно спрашивать просто «когда электричка до Москвы».
+Спрашивать можно двумя способами:
+- **табло станции** — «что ближайшее идёт со станции Царицыно?»: Трой покажет ближайшие отправления во все стороны;
+- **маршрут** — «когда электричка из Подольска до Москвы?».
+
+Станцию по умолчанию указывать не обязательно — тогда просто называй станцию в вопросе.
+
+Что есть в Яндекс Расписаниях: электрички, поезда, пригородные и междугородние автобусы, самолёты.
+Городских автобусов, трамваев и метро там нет — это данные Яндекс Карт, у них нет открытого API.
 """},
 }
 
