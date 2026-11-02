@@ -885,6 +885,17 @@ PC_TOOL = fn("pc_command", "Управление компьютером, где 
                                              "(Telegram, Google Chrome, Блокнот, Word, Steam…)"},
     "device": {"type": "string", "description": "имя компьютера, только если пользователь назвал его явно"}},
     ["action"])
+SITE_TOOL = fn("open_site", "Открыть сайт в браузере на компьютере пользователя (вход, капча, скачивание — делает сам "
+                           "пользователь). mode: direct — напрямую с компьютера, server — через сервер Троя, как VPN "
+                           "(сайт видит адрес сервера; помогает, если сайт не открывается). Не знаешь mode — не передавай: "
+                           "Трой сам спросит или возьмёт запомненный.", {
+    "url": {"type": "string", "description": "полный адрес сайта, https://…; не знаешь адрес — сначала web_search"},
+    "mode": {"type": "string", "enum": ["direct", "server"]}}, ["url"])
+SITE_HINT_RE = re.compile(r"сайт|страниц|https?://|\b[\w-]+\.(?:ru|com|org|net|io|me|su|рф|info|tv|online|site|to)\b|"
+                          r"через сервер|напрямую|\bв браузер|зайди на|перейди на", re.I)
+SITE_DIRECT_RE = re.compile(r"^(?:\[голосовое\]\s*)?(?:давай\s+)?(?:напрямую|прямо|обычно|стандартно|как обычно|сам[оа]?|"
+                            r"с компьютера|без сервера)\b", re.I)
+SITE_SERVER_RE = re.compile(r"^(?:\[голосовое\]\s*)?(?:давай\s+)?(?:через сервер|сервер|через впн|впн|vpn|через vpn)\b", re.I)
 FILE_MAX_MB = 50
 FILE_TOOL = fn("pc_file", f"Переслать файл (до {FILE_MAX_MB} МБ) с одного компьютера с Троем на другой. Файл ищется по имени "
                          "на рабочем столе, в Документах и Загрузках (или по полному пути) и приходит в «Загрузки\\Трой». "
@@ -1079,7 +1090,7 @@ def pc_fast_match(text: str):
     t = re.sub(rf"^(?:{re.escape(BOT_NAME.lower())}|трой|эй|слушай)[\s,!.:—-]+", "", t)
     t = re.sub(r"\b(?:пожалуйста|плиз|please|быстро|мне)\b", " ", t)
     t = re.sub(r"[.!?,]+$", "", re.sub(r"\s+", " ", t)).strip(" ,")
-    if BOILER_HINT_RE.search(t) or HOME_RE.search(t):      # котёл и умный дом — не программы на компьютере
+    if BOILER_HINT_RE.search(t) or HOME_RE.search(t) or SITE_HINT_RE.search(t):   # котёл, умный дом, сайты — не программы
         return None
     device, m = device_span(t)              # «выключи office pc», «открой телеграм на офисном»
     if device:
@@ -1148,6 +1159,8 @@ APP_RULES = """
 
 
 PC_RULES = """
+- Сайты («открой сайт X», «зайди на X.ru», «открой рутрекер в браузере») — open_site с полным адресом https://…
+  (не знаешь адрес — сначала web_search). Программы на компьютере — pc_command, сайты — open_site.
 - Файл с одного компьютера на другой («перекинь отчёт с ZEON на EEZ40») — pc_file; до 50 МБ.
 - Компьютеры, где запущен Трой: pc_command. Выключение и перезагрузку — только после «да» (спроси «Выключаю?»).
   Остальное (сон, блокировка, открыть/закрыть программу, музыка, громкость) — сразу. Если компьютеров несколько,
@@ -1224,6 +1237,9 @@ class Assistant:
                                    str(args.get("date_to") or ""))
             if name == "pc_command":
                 return self.pc_command(chat_id, args)
+            if name == "open_site":
+                self.pc_used = True
+                return self.open_site(chat_id, str(args.get("url") or ""), str(args.get("mode") or ""))
             if name == "pc_file":
                 self.pc_used = True
                 return file_command(str(args.get("file") or ""), str(args.get("source") or ""),
@@ -1302,8 +1318,56 @@ class Assistant:
             self.pc_choice = choice
         return text
 
+    def open_site(self, chat_id: str, url: str, mode: str = "") -> str:
+        url = url.strip().strip("«»\"'")
+        if not url:
+            return "Ошибка: укажи url — адрес сайта."
+        if not re.match(r"https?://", url, re.I):
+            url = "https://" + url
+        host = re.sub(r"^www\.", "", re.sub(r"^https?://", "", url, flags=re.I).split("/")[0].lower())
+        if getattr(self, "channel", "") != "desktop":    # браузер — только в программе на компьютере
+            return ("Сайты Трой открывает только в программе на компьютере — попроси там. "
+                    "Передай это пользователю коротко.")
+        modes = kv_json("site_modes")
+        local = LOCAL_MODE
+        if local:
+            mode = "direct"                           # Трой живёт на этом компьютере — «через сервер» не бывает
+        if mode in ("direct", "server"):
+            if not local and modes.get(host) != mode:
+                modes[host] = mode
+                kv_json_set("site_modes", modes)
+        else:
+            mode = modes.get(host, "")
+        if not mode:
+            if not hasattr(self, "pending_site"):
+                self.pending_site = {}
+            self.pending_site[chat_id] = (url, time.time())
+            return (f"НЕ ОТКРЫТО: спроси пользователя одной фразой — открыть {host} напрямую с компьютера или через сервер "
+                    "(как VPN: сайт увидит адрес сервера, помогает, если сайт не открывается)? Ответ запомню для этого сайта.")
+        device = getattr(self, "caller_device", "")      # тот компьютер, с которого попросили
+        text, choice = pc_create("open_site", json.dumps({"url": url, "mode": mode}, ensure_ascii=False), device,
+                                 self.channel, chat_id)
+        if choice:
+            self.pc_choice = choice
+        return text + (" Режим: через сервер." if mode == "server" else " Режим: напрямую.")
+
     def fast_pc(self, chat_id: str) -> Optional[str]:
         """Простые команды компьютеру — без модели."""
+        if getattr(self, "channel", "") != "desktop" and SITE_HINT_RE.search(self.user_text or "") and re.match(
+                r"^(?:\[голосовое\]\s*)?(?:трой[,\s]+)?(?:открой|зайди|перейди)\b", (self.user_text or "").strip(), re.I):
+            return "🌐 Сайты я открываю в программе Трой на компьютере — попроси там, и я открою окно браузера."
+        pend = getattr(self, "pending_site", {}).get(chat_id)
+        if pend and time.time() - pend[1] < 600:     # ответ на «напрямую или через сервер?»
+            mode = "server" if SITE_SERVER_RE.match(self.user_text.strip()) else \
+                "direct" if SITE_DIRECT_RE.match(self.user_text.strip()) else ""
+            if mode:
+                self.pending_site.pop(chat_id, None)
+                self.pc_used = True
+                text = self.open_site(chat_id, pend[0], mode)
+                host = re.sub(r"^https?://", "", pend[0]).split("/")[0]
+                return ("Выбери компьютер." if self.pc_choice else
+                        f"Открываю {host} {'через сервер' if mode == 'server' else 'напрямую'}. Запомнил — "
+                        "в следующий раз не спрошу (сказать иначе: «открой … напрямую» / «через сервер»).")
         ycfg = self.conns.enabled().get("yhome")
         if ycfg:                                 # «выключи ферма 2» — устройство умного дома, а не программа
             home = connectors.yiot_fast(ycfg, self.user_text, TZ)
@@ -1341,6 +1405,9 @@ class Assistant:
 
     def run(self, chat_id: str, content, channel: str = "telegram") -> str:
         """Текст не в той раскладке («ghbdtn») сначала переводим — и говорим, как поняли."""
+        self.caller_device = getattr(threading.current_thread(), "troy_device", "")   # компьютер, с которого спросили
+        self.reply_quote = getattr(threading.current_thread(), "troy_reply", "")      # ответ на конкретное сообщение
+        threading.current_thread().troy_reply = ""
         fixed = connectors.fix_layout(content) if isinstance(content, str) else content
         answer = self._run_main(chat_id, fixed, channel)
         if fixed != content and isinstance(answer, str):
@@ -1394,7 +1461,8 @@ class Assistant:
     def _run(self, chat_id: str, content) -> str:
         history = get_history(chat_id)
         use_bx = self.bitrix_needed(history)
-        recent = [self.user_text] + [h["content"] for h in history[-2:] if isinstance(h.get("content"), str)]
+        recent = ([self.user_text, getattr(self, "reply_quote", "")]
+                  + [h["content"] for h in history[-2:] if isinstance(h.get("content"), str)])
         use_pc = any(PC_HINT_RE.search(t or "") for t in recent)
         use_boiler = BOILER_ON and any(BOILER_HINT_RE.search(t or "") for t in recent)
         conn_tools, conn_names = self.conns.tools_for(recent)
@@ -1402,8 +1470,9 @@ class Assistant:
         if use_route:
             conn_tools = conn_tools + connectors.ROUTE_TOOLS
         use_file = any(FILE_HINT_RE.search(t or "") for t in recent)
+        use_site = getattr(self, "channel", "") == "desktop" and any(SITE_HINT_RE.search(t or "") for t in recent)
         tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
-                 + ([FILE_TOOL] if use_file else [])
+                 + ([FILE_TOOL] if use_file else []) + ([SITE_TOOL] if use_site else [])
                  + ([BOILER_TOOL] if use_boiler else []) + conn_tools)
         prompt = system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)
         if use_route:
@@ -1411,10 +1480,16 @@ class Assistant:
         if conn_names:
             prompt += ("\n- Подключено: " + ", ".join(conn_names) + ". Для событий, писем, умного дома и расписаний "
                        "вызывай соответствующие функции, не выдумывай. Даты считай от сегодняшней.")
+        quote = getattr(self, "reply_quote", "")
+        if quote:                                        # «ответить» на конкретное сообщение Троя
+            head = f"[Это ответ на твоё сообщение: «{quote[:1500]}»]\n"
+            content = head + content if isinstance(content, str) else \
+                [{"type": "text", "text": head}] + content
         messages = ([{"role": "system", "content": prompt}]
                     + history + [{"role": "user", "content": content}])
         has_image = isinstance(content, list)
-        must_pc = use_pc and bool(PC_ORDER_RE.search(self.user_text or "")) and not HOME_RE.search(self.user_text or "")
+        must_pc = (use_pc and bool(PC_ORDER_RE.search(self.user_text or "")) and not HOME_RE.search(self.user_text or "")
+                   and not SITE_HINT_RE.search(self.user_text or ""))
         nudged = False
         skip: set = set()
         provider, model = None, None
@@ -1672,6 +1747,9 @@ class Bot:
             return
 
         note = "[сообщение]"
+        rep_msg = msg.get("reply_to_message") or {}
+        quote = (rep_msg.get("text") or rep_msg.get("caption") or "") if (rep_msg.get("from") or {}).get("is_bot") else ""
+        threading.current_thread().troy_reply = quote
         with KeepTyping(self.tg, chat_id):
             try:
                 content, note = self.build_content(chat_id, msg)
@@ -1698,6 +1776,9 @@ class Bot:
         if getattr(self.assistant, "secret_seen", False):  # пароль/ключ: в историю не пишем, из чата убираем
             self.assistant.secret_seen, note = False, "[сообщение с паролем или ключом — не сохранено]"
             self.forget_message(msg)
+        if quote and isinstance(note, str):
+            note = f"↩ «{re.sub(chr(10), ' ', quote)[:80]}» {note}"
+        threading.current_thread().troy_reply = ""
         add_history(chat_id, "pc_user" if pc else "user", note)
         add_history(chat_id, "pc_reply" if pc else "assistant", answer)
         self.tg.send(chat_id, answer)
@@ -2018,6 +2099,9 @@ def desktop_message(assistant: "Assistant", text: str, files: Optional[list]) ->
         answer = (f"Бесплатные лимиты моделей сейчас исчерпаны ({e.text}). Попробуй чуть позже." if e.status == 429
                   else f"Ошибка модели: {e}")
     pc = getattr(assistant, "pc_used", False)
+    quote = getattr(assistant, "reply_quote", "")
+    if quote:
+        note = [f"↩ «{re.sub(chr(10), ' ', quote)[:80]}»"] + list(note)
     if getattr(assistant, "secret_seen", False):
         assistant.secret_seen, note = False, ["[сообщение с паролем или ключом — не сохранено]"]
     add_history(chat_id, "pc_user" if pc else "user", " ".join(note))
@@ -2096,6 +2180,20 @@ def save_setting(key: str, value: str) -> None:
             pass
     os.environ[key] = value
     globals()[key] = value
+
+
+def kv_json(key: str) -> dict:
+    with closing(db()) as con:
+        row = con.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    try:
+        return json.loads(row[0]) if row else {}
+    except ValueError:
+        return {}
+
+
+def kv_json_set(key: str, value: dict) -> None:
+    with closing(db()) as con, con:
+        con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)", (key, json.dumps(value, ensure_ascii=False)))
 
 
 def link_owner(uid: str) -> None:
@@ -2497,6 +2595,12 @@ def online_pcs() -> list:
 
 
 def pc_label(action: str, arg: str) -> str:
+    if action == "open_site":
+        try:
+            info = json.loads(arg or "{}")
+        except ValueError:
+            info = {}
+        return f"открыть сайт {re.sub(r'^https?://', '', info.get('url', '')).split('/')[0]}"
     if action in ("file_send", "file_get"):
         try:
             info = json.loads(arg or "{}")

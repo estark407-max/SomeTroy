@@ -431,3 +431,31 @@ def file_get(remote, arg: str):
     except OSError:
         pass
     return True, f"📄 получил «{target.name}» ({_mb(len(data))}) с {src} → {target.parent}"
+
+
+def relay(a, b, idle: int = 300) -> None:
+    """Окно браузера «через сервер»: перекладываем байты в обе стороны, пока кто-то не закроет соединение."""
+    import select
+    import ssl
+    try:
+        a.settimeout(None)
+        b.settimeout(None)
+        while True:
+            ready = [x for x in (a, b) if isinstance(x, ssl.SSLSocket) and x.pending()]
+            if not ready:
+                ready, _, _ = select.select([a, b], [], [], idle)
+                if not ready:
+                    return
+            for src in ready:
+                data = src.recv(65536)
+                if not data:
+                    return
+                (b if src is a else a).sendall(data)
+    except (OSError, ssl.SSLError):
+        return
+    finally:
+        for x in (a, b):
+            try:
+                x.close()
+            except OSError:
+                pass

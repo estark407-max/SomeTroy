@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -601,6 +601,104 @@ def already_running() -> bool:
         return False
 
 
+# ── окно браузера: напрямую или «через сервер» (как VPN, через туннель к своему Трою) ──
+_PROXY = {"port": 0, "remote": None}
+
+
+def _tunnel(remote: "Remote", host: str, port: int):
+    """Соединение с сайтом через сервер Троя: TLS к серверу (его сертификат) + CONNECT с сессией программы."""
+    import socket
+    import ssl
+    from urllib.parse import urlparse
+    u = urlparse(remote.base)
+    ctx = ssl.create_default_context(cafile=str(CERT))
+    raw = socket.create_connection((u.hostname, u.port or 443), timeout=20)
+    s = ctx.wrap_socket(raw, server_hostname=u.hostname)
+    s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+              f"Authorization: Bearer {remote.session}\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    if not head.startswith((b"HTTP/1.1 200", b"HTTP/1.0 200")):
+        s.close()
+        raise OSError(head.split(b"\r\n")[0].decode("latin-1", "replace") or "сервер не открыл туннель")
+    return s
+
+
+def start_proxy(remote: "Remote") -> int:
+    """Маленький прокси на 127.0.0.1 для окна браузера: всё уходит через сервер Троя."""
+    import socketserver
+    from urllib.parse import urlsplit
+    _PROXY["remote"] = remote
+    if _PROXY["port"]:
+        return _PROXY["port"]
+
+    class H(socketserver.BaseRequestHandler):
+        def handle(self):
+            import pc_control
+            c = self.request
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 65536:
+                chunk = c.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            line, _, rest = head.partition(b"\r\n")
+            try:
+                method, target, ver = line.decode("latin-1").split(" ", 2)
+            except ValueError:
+                return
+            try:
+                if method.upper() == "CONNECT":
+                    host, _, port = target.rpartition(":")
+                    up = _tunnel(_PROXY["remote"], host, int(port or 443))
+                    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                else:                                   # обычный http://… — тоже через туннель
+                    u = urlsplit(target)
+                    up = _tunnel(_PROXY["remote"], u.hostname, u.port or 80)
+                    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+                    up.sendall(f"{method} {path} {ver}\r\n".encode("latin-1") + rest)
+            except OSError as e:
+                log.warning("Браузер через сервер: %s", e)
+                c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                return
+            pc_control.relay(c, up)
+
+    class S(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    srv = S(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="troy-proxy").start()
+    _PROXY["port"] = srv.server_address[1]
+    return _PROXY["port"]
+
+
+def open_site(remote: "Remote", arg: str):
+    """Отдельное окно браузера со своим профилем: вход на сайтах запоминается, основной браузер не трогаем."""
+    info = json.loads(arg or "{}")
+    url, mode = info.get("url", ""), info.get("mode", "direct")
+    host = url.split("://", 1)[-1].split("/")[0]
+    browser = find_browser()
+    if not browser:
+        if mode == "server":
+            return False, "для режима «через сервер» нужен Edge или Chrome — не нашёл их на компьютере"
+        webbrowser.open(url)
+        return True, f"открыл {host} в браузере по умолчанию"
+    args = [browser, f"--user-data-dir={DATA_DIR / ('browser-server' if mode == 'server' else 'browser')}",
+            "--no-first-run", "--no-default-browser-check"]
+    if mode == "server":
+        if not str(remote.base).startswith("https://"):
+            return False, "через сервер можно, только когда Трой живёт на сервере (VPS)"
+        port = start_proxy(remote)
+        args += [f"--proxy-server=http://127.0.0.1:{port}", "--proxy-bypass-list=<-loopback>"]
+    subprocess.Popen(args + ["--new-window", url], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return True, f"открыл {host} {'через сервер' if mode == 'server' else 'напрямую'}"
+
+
 # ── команды для этого компьютера ──
 def pc_worker(remote: Remote) -> None:
     """Каждые 4 секунды спрашиваем сервер, нет ли команд (заодно сервер видит, что компьютер в сети)."""
@@ -620,6 +718,8 @@ def pc_worker(remote: Remote) -> None:
                                 ok, text = pc_control.file_send(remote, cmd["id"], cmd.get("arg", ""))
                             elif cmd["action"] == "file_get":     # забрать файл, присланный с другого компьютера
                                 ok, text = pc_control.file_get(remote, cmd.get("arg", ""))
+                            elif cmd["action"] == "open_site":    # окно браузера: напрямую или через сервер
+                                ok, text = open_site(remote, cmd.get("arg", ""))
                             else:
                                 ok, text = pc_control.execute(cmd["action"], cmd.get("arg", ""), late)
                         except Exception as e:

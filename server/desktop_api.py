@@ -12,8 +12,11 @@ POST /api/message               — {"text": "...", "files": [{"name", "mime", "
 
 Всё, кроме входа, — только с заголовком Authorization: Bearer <session>.
 """
+import ipaddress
 import json
 import logging
+import select
+import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +24,31 @@ from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger("assistant.desktop")
 MAX_BODY = 25 * 1024 * 1024
+
+
+def relay(a, b, idle: int = 300) -> None:
+    """Перекладываем байты в обе стороны, пока кто-то не закроет соединение (или 5 минут тишины)."""
+    try:
+        a.settimeout(None)
+        b.settimeout(None)
+        while True:
+            ready = [x for x in (a, b) if isinstance(x, ssl.SSLSocket) and x.pending()]
+            if not ready:
+                ready, _, _ = select.select([a, b], [], [], idle)
+                if not ready:
+                    return
+            for src in ready:
+                data = src.recv(65536)
+                if not data:
+                    return
+                (b if src is a else a).sendall(data)
+    except (OSError, ssl.SSLError):
+        return
+    finally:
+        try:
+            b.close()
+        except OSError:
+            pass
 
 
 def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, conns=None):
@@ -94,6 +122,33 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             else:
                 self.reply(404, {"error": "нет такого адреса"})
 
+        def do_CONNECT(self):
+            """Окно браузера «через сервер»: туннель к сайту только для своих (вход по паролю программы).
+            Открытого прокси на сервере нет: без сессии — 401, во внутреннюю сеть сервера — нельзя."""
+            if not auth.check(self.session()):
+                self.send_error(401)
+                return
+            host, _, port = self.path.rpartition(":")
+            try:
+                port = int(port)
+                addrs = {ipaddress.ip_address(a[4][0]) for a in socket.getaddrinfo(host.strip("[]"), port)}
+            except (ValueError, OSError):
+                self.send_error(502, "no such host")
+                return
+            if any(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast for a in addrs):
+                self.send_error(403, "local address")
+                return
+            try:
+                target = socket.create_connection((host.strip("[]"), port), timeout=20)
+            except OSError:
+                self.send_error(502, "cannot connect")
+                return
+            self.send_response(200, "Connection established")
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            relay(self.connection, target)
+
         def do_POST(self):
             path = urlparse(self.path).path
             if path == "/api/login":
@@ -159,6 +214,8 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 return
             try:
                 files = data.get("files") or ([data["file"]] if data.get("file") else [])
+                threading.current_thread().troy_device = auth.device(self.session()) or ""   # кто спросил
+                threading.current_thread().troy_reply = str(data.get("reply_to") or "")[:1500]   # «Ответить»
                 answer = on_message(str(data.get("text") or ""), files)
                 self.reply(200, answer if isinstance(answer, dict) else {"reply": answer})
             except Exception as e:
