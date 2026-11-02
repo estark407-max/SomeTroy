@@ -178,8 +178,11 @@ def _watch() -> None:
                         TABS.pop(i, None)
                         if STATE["active"] == i:
                             STATE["active"] = None
+                    troy = STATE["find_troy"]() if STATE["find_troy"] else None
                     for t in TABS.values():
                         t["title"] = (_title(t["hwnd"]) or t["host"])[:60]
+                        if troy and _get_style(u, t["hwnd"]) & (WS_CAPTION | WS_THICKFRAME):
+                            _embed(t["hwnd"], troy)          # Edge вернул окну сайта полосу — снова убираем
                     tab = TABS.get(STATE["active"])
                 if tab:
                     _place(tab)

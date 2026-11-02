@@ -1584,7 +1584,8 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
     body: JSON.stringify({ action, ...(extra || {}) }) }).then(r => r.json()).then(paint).catch(() => {});
   function paint(st) {
     if (!st) return;
-    if ("frameless" in st) document.body.classList.toggle("frameless", !!st.frameless);
+    // свои кнопки — только если над страницей правда нет полосы Windows (Edge мог её вернуть)
+    if ("frameless" in st) document.body.classList.toggle("frameless", !!st.frameless && outerHeight - innerHeight < 12);
     document.body.classList.toggle("maxed", !!st.max);
     const b = document.getElementById("win-max");
     b.title = st.max ? "Вернуть обычный размер" : "Развернуть";

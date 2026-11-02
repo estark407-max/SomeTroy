@@ -103,16 +103,12 @@ def strip(hwnd) -> bool:
     style = _style(u, hwnd)
     if not style & (WS_CAPTION | WS_THICKFRAME):
         return False
-    n = STATE["tries"].get(hwnd, 0) + 1
+    n = STATE["tries"].get(hwnd, 0) + 1          # Edge иногда возвращает полосу (при фокусе и т. п.) — снова убираем
     STATE["tries"][hwnd] = n
-    if n > 3:                                     # полоса упорно возвращается (так бывает в Windows 10) — оставляем как есть
-        STATE["gave_up"].add(hwnd)
-        log.warning("Окно: системная полоса возвращается (Windows %s, стиль %#x) — оставляю обычное окно",
-                    _winver(), style)
-        return False
     _set_style(u, hwnd, style & ~(WS_CAPTION | WS_THICKFRAME))
     after = _style(u, hwnd)
-    log.info("Окно: убираю системную полосу (Windows %s, попытка %d): стиль %#x → %#x", _winver(), n, style, after)
+    if n <= 3 or n % 100 == 0:
+        log.info("Окно: убираю системную полосу (Windows %s, раз %d): стиль %#x → %#x", _winver(), n, style, after)
     if after & WS_CAPTION:
         STATE["gave_up"].add(hwnd)
         log.warning("Окно: Windows не дала убрать полосу — оставляю обычное окно")
@@ -223,6 +219,6 @@ def keep(find_window) -> None:
                         STATE["gave_up"].discard(h)
             except Exception:
                 log.debug("window_frame", exc_info=True)
-            time.sleep(0.7)
+            time.sleep(0.3)
 
     threading.Thread(target=loop, daemon=True, name="troy-frame").start()
