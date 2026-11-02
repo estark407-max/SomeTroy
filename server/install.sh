@@ -13,6 +13,11 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip >/dev/null
 
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
+    echo "!! На сервере Python $(python3 -V 2>&1 | cut -d' ' -f2) — Трою нужен 3.8 или новее (Ubuntu 20.04+, Debian 11+)."
+    exit 1
+fi
+
 echo "==> Устанавливаю библиотеки бота..."
 python3 -m venv venv
 venv/bin/pip install -q --upgrade pip

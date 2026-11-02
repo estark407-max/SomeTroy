@@ -28,7 +28,10 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, List, Optional
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                      # Python 3.8 (Ubuntu 20.04): та же библиотека отдельным пакетом
+    from backports.zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv

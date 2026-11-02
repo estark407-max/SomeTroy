@@ -2,3 +2,4 @@ requests[socks]>=2.31
 python-dotenv>=1.0
 tzdata
 pypdf>=4.0
+backports.zoneinfo; python_version < "3.9"

@@ -245,7 +245,11 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
                 time.sleep(2)
             return False
 
-        if listening(port) and not tcp_open(ip, port):
+        if not listening(port):                 # служба не поднялась — показываем, почему, а не «готово»
+            _, journal = run("journalctl -u sometroy -n 25 --no-pager -o cat")
+            return {"ok": False, "error": "Трой на сервере установился, но не запустился.",
+                    "log": "\n".join(journal.strip().splitlines()[-12:])}
+        if not tcp_open(ip, port):
             # порт закрыт снаружи — чаще всего файрволом хостинга; 443 (HTTPS) хостинги почти никогда не закрывают
             if 443 not in used and port != 443:
                 say(f"Порт {port} закрыт снаружи — переключаю Троя на порт 443, его хостинги обычно не закрывают…")

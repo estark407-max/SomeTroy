@@ -49,7 +49,7 @@ findstr /c:"BUSY443" "%LOG%" >nul && (
     goto :end
 )
 findstr /c:"TROY_OK" "%LOG%" >nul || (
-    echo Не получилось — выше написано почему. Если сервер не принял пароль — сбрось его в панели хостинга.
+    echo Не получилось — выше написано почему (пришли это разработчику). Если сервер не принял пароль — сбрось его в панели хостинга.
     goto :end
 )
 
@@ -79,6 +79,15 @@ exit /b
 cd /opt/sometroy 2>/dev/null || { echo NOTROY; exit 2; }
 CUR=$(grep -E '^DESKTOP_PORT=' settings.env | cut -d= -f2 | tr -d ' ')
 if [ "$CUR" != "443" ] && ss -ltnH 'sport = :443' | grep -q LISTEN; then echo BUSY443; exit 3; fi
+# Python 3.8 (Ubuntu 20.04): в нём нет zoneinfo — ставим отдельным пакетом и чиним импорт
+if ! venv/bin/python -c 'import zoneinfo' 2>/dev/null; then
+    echo "Python на сервере: $(venv/bin/python -V 2>&1). Добавляю недостающую библиотеку часовых поясов..."
+    venv/bin/pip install -q backports.zoneinfo || { echo "Не смог поставить backports.zoneinfo"; exit 5; }
+    for f in bot.py connectors.py; do
+        grep -q 'backports.zoneinfo' $f || sed -i 's/^from zoneinfo import ZoneInfo$/try:\n    from zoneinfo import ZoneInfo\nexcept ImportError:\n    from backports.zoneinfo import ZoneInfo/' $f
+    done
+    grep -q backports requirements.txt || echo 'backports.zoneinfo; python_version < "3.9"' >> requirements.txt
+fi
 P=443
 (command -v ufw >/dev/null && ufw status | grep -q 'Status: active' && ufw allow $P/tcp >/dev/null && echo "ufw: открыл $P")
 (command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1 && firewall-cmd -q --permanent --add-port=$P/tcp && firewall-cmd -q --reload && echo "firewalld: открыл $P")

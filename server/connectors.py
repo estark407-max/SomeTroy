@@ -24,7 +24,10 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 from xml.etree import ElementTree as ET
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:                      # Python 3.8 (Ubuntu 20.04): та же библиотека отдельным пакетом
+    from backports.zoneinfo import ZoneInfo
 
 import requests
 
