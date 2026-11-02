@@ -2,7 +2,7 @@
 
 #define AppName "Трой"
 #ifndef AppVersion
-#define AppVersion "0.4.0"
+#define AppVersion "0.4.1"
 #endif
 #define AppExe "SomeTroy.exe"
 
@@ -107,7 +107,7 @@ Source: "..\tools\fix-connection.bat"; DestDir: "{app}\tools"; Flags: ignorevers
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
-Name: "{autoprograms}\{#AppName} — починить связь с сервером"; Filename: "{app}\tools\fix-connection.bat"; WorkingDir: "{app}\tools"
+Name: "{autoprograms}\{#AppName} — обновить и починить сервер"; Filename: "{app}\tools\fix-connection.bat"; WorkingDir: "{app}\tools"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--tray"; WorkingDir: "{app}"; Tasks: autostart
 

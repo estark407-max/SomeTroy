@@ -42,6 +42,7 @@ import desktop_api
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
 # указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
+SERVER_VERSION = "0.4.1"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
 BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
 load_dotenv(BASE / "settings.env", override=True)
 LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
@@ -1318,7 +1319,7 @@ class Assistant:
             self.pc_choice = choice
         return text
 
-    def open_site(self, chat_id: str, url: str, mode: str = "") -> str:
+    def open_site(self, chat_id: str, url: str, mode: str = "", _from_answer: bool = False) -> str:
         url = url.strip().strip("«»\"'")
         if not url:
             return "Ошибка: укажи url — адрес сайта."
@@ -1332,6 +1333,10 @@ class Assistant:
         local = LOCAL_MODE
         if local:
             mode = "direct"                           # Трой живёт на этом компьютере — «через сервер» не бывает
+        said = SITE_SERVER_RE.search(self.user_text or "") or SITE_DIRECT_RE.search(self.user_text or "") or re.search(
+            r"напрямую|через сервер|через впн|через vpn|без сервера", self.user_text or "", re.I)
+        if mode and not said and not local and not _from_answer:
+            mode = ""                                 # модель сама выбрала режим — нет: решает пользователь
         if mode in ("direct", "server"):
             if not local and modes.get(host) != mode:
                 modes[host] = mode
@@ -1363,7 +1368,7 @@ class Assistant:
             if mode:
                 self.pending_site.pop(chat_id, None)
                 self.pc_used = True
-                text = self.open_site(chat_id, pend[0], mode)
+                text = self.open_site(chat_id, pend[0], mode, _from_answer=True)
                 host = re.sub(r"^https?://", "", pend[0]).split("/")[0]
                 return ("Выбери компьютер." if self.pc_choice else
                         f"Открываю {host} {'через сервер' if mode == 'server' else 'напрямую'}. Запомнил — "
@@ -2879,6 +2884,7 @@ class PcHooks:
     result = staticmethod(pc_result)
     choose = staticmethod(pc_choose)
     file_upload = staticmethod(file_upload)
+    server_version = SERVER_VERSION
     file_download = staticmethod(file_download)
     FILE_MAX = FILE_MAX_MB * 1024 * 1024
 

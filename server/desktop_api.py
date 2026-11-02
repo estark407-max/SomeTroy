@@ -96,7 +96,7 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 return
             url = urlparse(self.path)
             if url.path == "/api/ping":
-                self.reply(200, {"ok": True, "name": bot_name})
+                self.reply(200, {"ok": True, "name": bot_name, "version": getattr(pc, "server_version", "")})
             elif url.path == "/api/history":
                 after = int((parse_qs(url.query).get("after") or ["0"])[0] or 0)
                 self.reply(200, {"messages": get_history(after)})

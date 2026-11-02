@@ -6,14 +6,14 @@ if not "%~1"=="--run" (
 )
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-title Трой: починить связь с сервером
+title Трой: обновить и починить сервер
 
 echo ============================================================
-echo   Трой: починить связь программы с сервером
+echo   Трой: обновить Троя на сервере и починить связь
 echo ============================================================
 echo.
-echo Что сделает: откроет на сервере порт 443, переключит на него Троя
-echo и пропишет новый адрес в программе на этом компьютере.
+echo Что сделает: обновит Троя на сервере до версии этой программы, откроет порт 443,
+echo переключит на него Троя и пропишет новый адрес и сертификат в программе.
 echo Переписка, напоминания и настройки не трогаются.
 echo.
 
@@ -40,7 +40,22 @@ echo Сейчас попросит пароль root от сервера. При
 echo Вставить пароль: правой кнопкой мыши, затем Enter.
 echo.
 set "LOG=%TEMP%\troy-fix.log"
-powershell -NoProfile -Command "$t = Get-Content -Raw -Encoding UTF8 '%~f0'; $i = $t.LastIndexOf('#SERVER-SCRIPT#'); [Console]::Out.Write($t.Substring($i))" | ssh -o StrictHostKeyChecking=accept-new root@%IP% "tr -d '\r' | bash -s -- %IP%" > "%LOG%" 2>&1
+rem свежий код Троя: из установленной программы или из папки проекта
+set "SRC="
+if exist "%~dp0..\_internal\server_src\bot.py" set "SRC=%~dp0..\_internal\server_src"
+if not defined SRC if exist "%~dp0..\server\bot.py" set "SRC=%~dp0..\server"
+set "PACK=%TEMP%\troyfix"
+if exist "%PACK%" rmdir /s /q "%PACK%"
+mkdir "%PACK%"
+if defined SRC (
+    copy /y "%SRC%\*.py" "%PACK%\" >nul
+    copy /y "%SRC%\requirements.txt" "%PACK%\" >nul
+    echo Код Троя для сервера: %SRC%
+) else (
+    echo Код Троя рядом не найден — сервер не обновляю, только чиню связь.
+)
+powershell -NoProfile -Command "$t = Get-Content -Raw -Encoding UTF8 '%~f0'; $i = $t.LastIndexOf('#SERVER-SCRIPT#'); [IO.File]::WriteAllText('%PACK%\fix.sh', $t.Substring($i).Replace([string][char]13, ''))"
+tar -cf - -C "%PACK%" . | ssh -o StrictHostKeyChecking=accept-new root@%IP% "rm -rf /tmp/troyfix && mkdir -p /tmp/troyfix && tar -xf - -C /tmp/troyfix && bash /tmp/troyfix/fix.sh %IP%" > "%LOG%" 2>&1
 type "%LOG%"
 echo.
 
@@ -84,6 +99,16 @@ exit /b
 
 #SERVER-SCRIPT#
 cd /opt/sometroy 2>/dev/null || { echo NOTROY; exit 2; }
+# 1) свежий код Троя из программы — проверяем, что он собирается, и кладём на место
+if [ -f /tmp/troyfix/bot.py ]; then
+    if venv/bin/python -m py_compile /tmp/troyfix/*.py; then
+        cp /tmp/troyfix/*.py /opt/sometroy/ && cp /tmp/troyfix/requirements.txt /opt/sometroy/
+        venv/bin/pip install -q -r requirements.txt || echo "pip: не все библиотеки поставились (см. выше)"
+        echo "Обновил Троя на сервере до версии $(grep -o 'SERVER_VERSION = \"[0-9.]*' bot.py | grep -o '[0-9.]*$')"
+    else
+        echo "Свежий код не собирается на этом сервере — оставляю прежний"
+    fi
+fi
 CUR=$(grep -E '^DESKTOP_PORT=' settings.env | cut -d= -f2 | tr -d ' ')
 if [ "$CUR" != "443" ] && ss -ltnH 'sport = :443' | grep -q LISTEN; then echo BUSY443; exit 3; fi
 # Python 3.8 (Ubuntu 20.04): в нём нет zoneinfo — ставим отдельным пакетом и чиним импорт

@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -172,11 +172,51 @@ def cert_check(base: str) -> str:
     except Exception:
         issuer = ""
     if issuer.strip() == "Troy":
-        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти «Трой — починить связь с сервером» "
+        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти «Трой — обновить и починить сервер» "
                 "из меню Пуск — он заберёт свежий сертификат с сервера.")
     return (f"\n   Вместо сертификата сервера приходит чужой: «{issuer or 'неизвестный'}». Так делает антивирус или прокси, "
             "который проверяет защищённые соединения. Добавь в нём исключение для программы SomeTroy.exe или для адреса "
             f"{host} (в Касперском: Настройки → Сетевые параметры → Проверка защищённых соединений → Исключения).")
+
+
+def bundled_server_version() -> str:
+    """Какую версию Троя для сервера везёт с собой эта программа."""
+    import re
+    try:
+        m = re.search(r'^SERVER_VERSION = "([\d.]+)"', (SERVER_SRC / "bot.py").read_text(encoding="utf-8"), re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def server_outdated(remote: "Remote") -> str:
+    """Трой на сервере старее программы? Тогда подсказка, как обновить (пустая строка — всё в порядке)."""
+    if not str(remote.base).startswith("https://"):
+        return ""                                   # локальный режим: код обновляется вместе с программой
+    code, body = remote._send("GET", "/api/ping")
+    if code != 200:
+        return ""
+    try:
+        have = json.loads(body).get("version") or "0"
+    except ValueError:
+        return ""
+    want = bundled_server_version()
+    num = lambda v: tuple(int(x) for x in v.split(".") if x.isdigit())
+    if want and num(have) < num(want):
+        return (f"Трой на сервере старее программы ({'старая версия' if have == '0' else have} → {want}): новые возможности "
+                "не заработают. Обнови его: Пуск → «Трой — обновить и починить сервер» (попросит пароль сервера).")
+    return ""
+
+
+def server_check_loop(remote: "Remote", icon) -> None:
+    time.sleep(20)
+    note = server_outdated(remote)
+    if note:
+        log.warning(note)
+        try:
+            icon.notify(note, WINDOW_TITLE)
+        except Exception:
+            pass
 
 
 def port_check(base: str) -> str:
@@ -233,6 +273,9 @@ def app_diagnostics(remote: "Remote") -> str:
         hint = " Перезапусти программу." if mode == "local" else (
             cert_check(remote.base) if "сертификат" in why else port_check(remote.base))
         lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}." + hint)
+    outdated = server_outdated(remote) if code == 200 else ""
+    if outdated:
+        lines.append("⚠️ " + outdated)
     lines.append(("✅" if find_browser() else "⚠️") + " Окно: " + ("Edge/Chrome найден" if find_browser()
                  else "Edge и Chrome не найдены — окно откроется в браузере по умолчанию"))
     hk = load_settings().get("hotkey")
@@ -1061,6 +1104,7 @@ def main():
         icon.visible = True
         threading.Thread(target=watch_events, args=(remote, icon), daemon=True).start()
         threading.Thread(target=pc_worker, args=(remote,), daemon=True).start()
+        threading.Thread(target=server_check_loop, args=(remote, icon), daemon=True).start()
         threading.Thread(target=remember_window, daemon=True).start()
         hk = load_settings().get("hotkey")
         if hk and not apply_hotkey(hk)[0]:
