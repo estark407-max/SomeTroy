@@ -136,9 +136,19 @@ def settings_text(template: str, values: dict) -> str:
 SERVER_FILES = ["bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt", "install.sh", "uninstall.sh"]
 
 
+def parse_vps_address(text: str) -> Optional[tuple]:
+    """«203.0.113.10», «admin@203.0.113.10», «203.0.113.10:2222», «ssh root@203.0.113.10 -p 2222» → (ip, user, port)."""
+    t = re.sub(r"^ssh\s+", "", (text or "").strip(), flags=re.I)
+    m = re.fullmatch(r"(?:([\w.-]+)@)?(\d{1,3}(?:\.\d{1,3}){3})(?:(?::|\s+-p\s*)(\d{1,5}))?", t)
+    if not m or any(int(x) > 255 for x in m.group(2).split(".")):
+        return None
+    return m.group(2), m.group(1) or "root", int(m.group(3) or 22)
+
+
 def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path, say: Callable[[str], None],
-                ssh_port: int = 22) -> dict:
-    """Ставит Троя на сервер. Возвращает {"ok", "port", "cert", "error", "log"}."""
+                ssh_port: int = 22, extra: Optional[dict] = None) -> dict:
+    """Ставит Троя на сервер. Возвращает {"ok", "port", "cert", "error", "log"}.
+    extra — файлы данных {путь в /opt/sometroy: байты} (база, идеи) при переезде с компьютера на сервер."""
     import paramiko
     out_lines: List[str] = []
     cli = paramiko.SSHClient()
@@ -172,6 +182,8 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
         port = int(prev.strip()) if prev.strip().isdigit() else next(p for p in range(8443, 8500) if p not in used)
         say(f"Подключился. Ставлю в /opt/sometroy, порт для программы — {port}.")
         settings = re.sub(r"(?m)^DESKTOP_PORT=.*$", f"DESKTOP_PORT={port}", settings)
+        if not re.search(r"(?m)^DESKTOP_PORT=", settings):
+            settings = settings.rstrip("\n") + f"\nDESKTOP_PORT={port}\n"
         run("mkdir -p /opt/sometroy")
         sftp = cli.open_sftp()
         for name in SERVER_FILES:          # переводы строк — как в Linux, даже если файлы прошли через Windows
@@ -181,6 +193,15 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
         with sftp.open("/opt/sometroy/settings.env", "wb") as f:
             f.write(settings.encode("utf-8"))
         sftp.chmod("/opt/sometroy/settings.env", 0o600)
+        if extra:                           # переезд: переписка, напоминания, идеи, вход в программу — как были
+            run("systemctl stop sometroy 2>/dev/null; true")
+            for rel, data in extra.items():
+                target = f"/opt/sometroy/{rel}"
+                run(f"mkdir -p '{target.rsplit('/', 1)[0]}'")
+                with sftp.open(target, "wb") as f:
+                    f.write(data)
+            run("chmod 600 /opt/sometroy/assistant.db 2>/dev/null; true")
+            say("Перенёс переписку, напоминания и идеи.")
         say("Файлы на месте. Устанавливаю — это займёт 1–3 минуты…")
         _in, o, _e = cli.exec_command(f"bash /opt/sometroy/install.sh {ip} 2>&1", timeout=900)
         for raw in iter(o.readline, ""):
@@ -190,7 +211,8 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
         code = o.channel.recv_exit_status()
         if code != 0:
             return {"ok": False, "error": "Установка на сервере не удалась.", "log": "\n".join(out_lines[-15:])}
-        code, text = run("cd /opt/sometroy && venv/bin/python bot.py --set-password", stdin_text=password_holder["pw"] + "\n")
+        code, text = (run("cd /opt/sometroy && venv/bin/python bot.py --set-password", stdin_text=password_holder["pw"] + "\n")
+                      if password_holder["pw"] else (0, ""))     # при переезде пароль уже в перенесённой базе
         if code != 0:
             return {"ok": False, "error": "Не получилось задать пароль программы: " + text[-300:]}
         with sftp.open("/opt/sometroy/tls/cert.pem") as f:
@@ -503,11 +525,10 @@ class Wizard:
 
     def s_vps_ip(self, t: str):
         # обычно просто IP; кому нужно — «имя@IP» или «IP:порт» (как в письме хостинга: ssh root@1.2.3.4 -p 2222)
-        t = re.sub(r"^ssh\s+", "", t.strip(), flags=re.I)
-        m = re.fullmatch(r"(?:([\w.-]+)@)?(\d{1,3}(?:\.\d{1,3}){3})(?:(?::|\s+-p\s*)(\d{1,5}))?", t)
-        if not m or any(int(x) > 255 for x in m.group(2).split(".")):
+        got = parse_vps_address(t)
+        if not got:
             return [msg("Нужен IP-адрес из четырёх чисел через точку, например 203.0.113.10.", placeholder="IP-адрес")]
-        self.vps.update(ip=m.group(2), user=m.group(1) or "root", ssh_port=int(m.group(3) or 22))
+        self.vps.update(ip=got[0], user=got[1], ssh_port=got[2])
         return [self._ask_vps_pass()]
 
     def _ask_vps_pass(self, prefix: str = ""):

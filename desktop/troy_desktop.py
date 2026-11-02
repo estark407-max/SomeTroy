@@ -752,6 +752,54 @@ def make_wizard():
     return setup_wizard.Wizard(finish_local, finish_vps, template, SERVER_SRC, DATA_DIR, finish_connect)
 
 
+APP_HOOKS = {"restart": None}
+
+
+def move_to_vps(values: dict) -> tuple:
+    """«Подключения → Сервер (VPS)»: перенести Троя с этого компьютера на свой сервер.
+    Ставим на сервер, переносим базу (переписка, напоминания, идеи, пароль программы), переключаем программу."""
+    import sqlite3
+    import tempfile
+    import local_server
+    import setup_wizard
+    got = setup_wizard.parse_vps_address(values.get("address", ""))
+    if not got:
+        return "Нужен IP-адрес сервера — четыре числа через точку, например 203.0.113.10.", ""
+    ip, user, ssh_port = got
+    password = values.get("password", "")
+    home = local_server.server_home(DATA_DIR)
+    settings = (home / "settings.env").read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as tmp:          # снимок базы целиком, даже пока Трой работает
+        src = sqlite3.connect(home / "assistant.db")
+        dst = sqlite3.connect(Path(tmp) / "db")
+        src.backup(dst)
+        dst.close()
+        src.close()
+        extra = {"assistant.db": (Path(tmp) / "db").read_bytes()}
+    ideas = home / "ideas"
+    for f in ideas.rglob("*") if ideas.exists() else []:
+        if f.is_file():
+            extra["ideas/" + f.relative_to(ideas).as_posix()] = f.read_bytes()
+    setup_wizard.password_holder["pw"] = ""
+    log.info("Переезд на сервер %s", ip)
+    res = setup_wizard.install_vps(ip, user, password, settings, SERVER_SRC, lambda t: log.info("VPS: %s", t),
+                                   ssh_port, extra)
+    if not res.get("ok"):
+        tail = f"\nПоследние строки установки:\n{res['log']}" if res.get("log") else ""
+        return res.get("error", "не получилось") + tail, ""
+    CERT.write_text(res["cert"], encoding="utf-8")
+    (DATA_DIR / "config.json").write_text(json.dumps({"mode": "vps", "server": f"https://{ip}:{res['port']}"}),
+                                          encoding="utf-8")
+    reach = setup_wizard.server_reachable(ip, res["port"], CERT)
+    if APP_HOOKS["restart"]:
+        threading.Timer(4, APP_HOOKS["restart"]).start()
+    return None, (f"🎉 Готово: Трой переехал на сервер {ip} и теперь работает круглосуточно. Переписка, напоминания и идеи "
+                  "переехали с ним, пароль программы тот же. Сейчас программа перезапустится."
+                  + ("" if reach else f"\n\n⚠️ Пока не достучался до сервера по порту {res['port']}: если у хостинга есть "
+                     f"файрвол в панели управления — открой там порт {res['port']} (TCP). Telegram работает и без этого.")
+                  + "\n\nКопия данных осталась на этом компьютере.")
+
+
 def show_diag() -> None:
     """Из трея: открыть окно и сразу показать диагностику."""
     hwnd = find_window() if window_open() else None
@@ -780,6 +828,7 @@ def main():
         import local_server
         try:
             port = local_server.start(DATA_DIR)
+            local_server._state["bot"].VPS_MOVE = move_to_vps      # «Подключения → Сервер (VPS)»
         except Exception as e:
             log.error("Локальный сервер: %s", e)
             message_box(f"Трой не смог запуститься на этом компьютере: {e}\nПодробности — в {LOG}")
@@ -847,6 +896,7 @@ def main():
         icon.stop()
 
     WIZARD["restart"] = after_wizard
+    APP_HOOKS["restart"] = after_wizard
 
     def setup(icon):
         icon.visible = True

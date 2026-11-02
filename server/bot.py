@@ -365,7 +365,8 @@ def get_history(chat_id: str) -> list:
 
 # «Сохрани переписку за неделю» — журнал сообщений файлом (в Telegram — документом, в программе — в «Загрузки\\Трой»)
 LOG_RE = re.compile(r"^(?:(?:трой|эй)[\s,!.:—-]+)?(?:сохрани|выгрузи|экспортируй|скачай|скинь|пришли|отправь|дай|сделай|"
-                    r"запиши в файл)\s+(?:мне\s+)?(?:(?:весь|всю|полный|полную)\s+)?(?:лог\w*|переписк\w*|чат|диалог|"
+                    r"собери|сформируй|выведи|запиши в файл)\s+(?:мне\s+)?(?:(?:весь|всю|полный|полную|текстовый|"
+                    r"текстовую|нашу|наш|эту|этот)\s+){0,2}(?:лог\w*|переписк\w*|чат|диалог|"
                     r"истори\w*\s+(?:сообщений|переписки|чата|разговора))\b(.*)$", re.I)
 _LOG_NUM = {"один": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "десять": 10}
 
@@ -410,6 +411,22 @@ def export_log(chat_id: str, rest: str = "") -> Optional[tuple]:
         out.append(f"{dt:%H:%M} {who}: {r['text']}" if who else f"{dt:%H:%M} 🖥 {r['text']}")
     name = f"Трой — переписка {now_local():%Y-%m-%d %H-%M}.txt"
     return name, "\n".join(out) + "\n", len(rows)
+
+
+# Пароли, ключи и токены в чате: нейросети не отправляем, в историю не пишем
+SECRET_IN_TEXT = re.compile(
+    r"парол\w*\s*(?:[:=—-]\s*\S+|(?:\s+\S+){0,3}?\s+(?=\S*\d)(?=\S*[A-Za-z])\S{6,})|\bpassword\s*[:=]\s*\S+|"
+    r"ssh-(?:rsa|ed25519|ecdsa)\s+AAAA[\w+/=]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"\bgsk_[\w-]{10,}|\b\d{6,12}:AA[\w-]{30,}|\bgithub_pat_\w{10,}|\bghp_\w{20,}|\bsk-[\w-]{20,}|\by0_[\w-]{20,}", re.I)
+
+
+def secret_guard(text: str) -> Optional[str]:
+    if not SECRET_IN_TEXT.search(text or ""):
+        return None
+    tip = ("Если это данные сервера — подключи его в программе: 🔌 «Подключения» → «Сервер (VPS)»."
+           if LOCAL_MODE else "Ключи и доступы вводятся в программе: 🔌 «Подключения».")
+    return ("🔒 Похоже, в сообщении пароль или ключ. Я не отправил его нейросети и не сохранил в переписке. "
+            f"Пароли и ключи в чат не пиши. {tip}\n\nЕсли этот пароль уже где-то засветился — лучше смени его.")
 
 
 def log_request(assistant, chat_id: str, text: str) -> Optional[str]:
@@ -1115,7 +1132,16 @@ def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = Fa
 - Сообщения с пометкой [голосовое] — это расшифровка речи пользователя: отвечай на смысл, не пересказывай.
   В расшифровке бывают ошибки распознавания — понимай по смыслу.
 - Фото и документы: сделай то, о чём просит подпись. Без подписи — коротко скажи, что там, и чем можешь помочь.
-- Если не уверен в факте — так и скажи.{BITRIX_RULES if bitrix_on else ""}{PC_RULES if pc_on else ""}{BOILER_RULES if boiler_on else ""}"""
+- Если не уверен в факте — так и скажи.{APP_RULES}{BITRIX_RULES if bitrix_on else ""}{PC_RULES if pc_on else ""}{BOILER_RULES if boiler_on else ""}"""
+
+
+APP_RULES = """
+- О себе (SomeTroy): настройки — в программе Трой на компьютере. Кнопка 🔌 «Подключения»: Telegram, запасная модель
+  Mistral, идеи в GitHub, Битрикс24, календари, почта, умный дом""" + (""", «Сервер (VPS)» — перенести тебя
+  с компьютера на свой сервер, чтобы ты работал круглосуточно (нужны только IP и пароль сервера, ввод — там же)"""
+  if LOCAL_MODE else "") + """. Переписку файлом — «сохрани переписку» или /log. Ошибку разработчикам — /bug.
+  Пароли, ключи и токены НИКОГДА не проси прислать в чат: их вводят только в окнах программы.
+  Сам ты на серверы по SSH не ходишь и ничего на них не ставишь — это делает программа."""
 
 
 PC_RULES = """
@@ -1325,6 +1351,10 @@ class Assistant:
             self.user_text = content if isinstance(content, str) else " ".join(
                 p.get("text", "") for p in content if p.get("type") == "text")
             if isinstance(content, str):
+                secret = secret_guard(self.user_text)
+                if secret:
+                    self.secret_seen = True
+                    return secret
                 saved = log_request(self, chat_id, self.user_text)
                 if saved:
                     return saved
@@ -1662,6 +1692,9 @@ class Bot:
                 answer = "Не достучался до Groq, попробуй ещё раз через минуту."
 
         pc = getattr(self.assistant, "pc_used", False)    # команды компьютеру модели не показываем (см. get_history)
+        if getattr(self.assistant, "secret_seen", False):  # пароль/ключ: в историю не пишем, из чата убираем
+            self.assistant.secret_seen, note = False, "[сообщение с паролем или ключом — не сохранено]"
+            self.forget_message(msg)
         add_history(chat_id, "pc_user" if pc else "user", note)
         add_history(chat_id, "pc_reply" if pc else "assistant", answer)
         self.tg.send(chat_id, answer)
@@ -1982,6 +2015,8 @@ def desktop_message(assistant: "Assistant", text: str, files: Optional[list]) ->
         answer = (f"Бесплатные лимиты моделей сейчас исчерпаны ({e.text}). Попробуй чуть позже." if e.status == 429
                   else f"Ошибка модели: {e}")
     pc = getattr(assistant, "pc_used", False)
+    if getattr(assistant, "secret_seen", False):
+        assistant.secret_seen, note = False, ["[сообщение с паролем или ключом — не сохранено]"]
     add_history(chat_id, "pc_user" if pc else "user", " ".join(note))
     add_history(chat_id, "pc_reply" if pc else "assistant", answer)
     if export:
@@ -2295,6 +2330,34 @@ def register_modules(assistant: "Assistant") -> None:
 **Как потом обсуждать с ИИ:** подключи GitHub в своём ИИ-ассистенте (у Claude — в настройках подключений),
 дай доступ к этому репозиторию и попроси «подтяни идеи».
 """},
+        **({"vps": {
+            "title": "Сервер (VPS): работать круглосуточно",
+            "about": "Перенести Троя с этого компьютера на твой сервер — он будет отвечать в Telegram, даже когда "
+                     "компьютер выключен. Переписка, напоминания и идеи переедут вместе с ним.",
+            "fields": [{"name": "address", "label": "IP-адрес сервера", "placeholder": "203.0.113.10"},
+                       {"name": "password", "label": "Пароль сервера (root)", "secret": True}],
+            "state": lambda: (False, "", ""),
+            "connect": lambda v: (globals().get("VPS_MOVE") or (lambda _v: ("Обнови программу Трой — в этой версии "
+                                                                             "переезда на сервер ещё нет.", "")))(v),
+            "disconnect": lambda: None,
+            "help": """
+Сейчас Трой живёт на этом компьютере и отвечает, только пока компьютер включён. На своём сервере (VPS) он
+работает круглосуточно.
+
+**Что нужно:** сервер на **Ubuntu** (22.04 или 24.04) или **Debian**, его IP-адрес и пароль root — они есть в
+письме хостинга или в его панели управления. Хватит самого простого тарифа: 1 ядро и 1 ГБ памяти.
+
+**Что сделает Трой (1–3 минуты):**
+- подключится к серверу, поставит себя в /opt/sometroy и запустит как службу;
+- перенесёт переписку, напоминания, идеи и подключения — пароль программы останется тем же;
+- переключит программу на сервер и перезапустит её.
+
+Пароль сервера нужен только для установки и **нигде не сохраняется**. В чат его не пиши — только сюда.
+
+Другое имя пользователя — впиши адрес как **имя@IP**, другой порт SSH — **IP:порт**.
+Если у хостинга есть файрвол в панели — после переезда открой порт, который назовёт Трой (TCP).
+Удалить Троя с сервера: bash /opt/sometroy/uninstall.sh
+"""}} if LOCAL_MODE else {}),
         "bitrix": {
             "title": "Битрикс24",
             "about": "Задачи, чаты, CRM и аналитика. Всё, что меняет, — только после твоего «да».",
