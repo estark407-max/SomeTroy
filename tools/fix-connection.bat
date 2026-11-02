@@ -1,4 +1,9 @@
 @echo off
+rem окно не закроется само, даже если что-то пойдёт не так
+if not "%~1"=="--run" (
+    cmd /k ""%~f0" --run"
+    exit /b
+)
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
 title Трой: починить связь с сервером
@@ -49,7 +54,7 @@ findstr /c:"BUSY443" "%LOG%" >nul && (
     goto :end
 )
 findstr /c:"TROY_OK" "%LOG%" >nul || (
-    echo Не получилось — выше написано почему (пришли это разработчику). Если сервер не принял пароль — сбрось его в панели хостинга.
+    echo Не получилось — выше написано почему ^(пришли это разработчику^). Если сервер не принял пароль — сбрось его в панели хостинга.
     goto :end
 )
 
@@ -68,11 +73,12 @@ timeout /t 2 /nobreak >nul
 powershell -NoProfile -Command "$c = Get-Content -Raw '%CFG%' | ConvertFrom-Json; $c.server = 'https://%IP%:443'; $c | ConvertTo-Json -Compress | Set-Content -Encoding ASCII '%CFG%'"
 if exist "%EXE%" start "" "%EXE%"
 echo.
-echo Готово! Трой снова на связи. Проверь: напиши ему /diag.
+echo Готово. Трой снова на связи. Проверь: напиши ему /diag.
 
 :end
 echo.
-pause
+echo Журнал этого запуска: %TEMP%\troy-fix.log
+echo Окно можно закрыть.
 exit /b
 
 #SERVER-SCRIPT#
