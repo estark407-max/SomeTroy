@@ -1,7 +1,9 @@
 ﻿; Установщик программы «Трой» (Inno Setup 6). Собирается из build.bat.
 
 #define AppName "Трой"
+#ifndef AppVersion
 #define AppVersion "0.3.0"
+#endif
 #define AppExe "SomeTroy.exe"
 
 [Setup]
@@ -17,7 +19,7 @@ DisableProgramGroupPage=yes
 DisableDirPage=yes
 PrivilegesRequired=lowest
 OutputDir=.
-OutputBaseFilename=SomeTroySetup
+OutputBaseFilename=SomeTroySetup-{#AppVersion}
 SetupIconFile=troy.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName} — личный ассистент

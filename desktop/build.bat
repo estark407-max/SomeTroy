@@ -46,6 +46,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem версия — из APP_VERSION в troy_desktop.py: попадает в свойства exe и в имя установщика
+".venv\Scripts\python.exe" set_version.py > "%TEMP%\sometroy-ver.txt"
+set /p VER=<"%TEMP%\sometroy-ver.txt"
+if not defined VER set "VER=0.0.0"
+echo        Версия: %VER%
+
 echo [2/4] Собираю SomeTroy.exe...
 rem --onedir (папка, а не один самораспаковывающийся exe): антивирус почти не путает с вредоносной программой
 if exist "dist\SomeTroy" rmdir /s /q "dist\SomeTroy" >nul 2>&1
@@ -84,12 +90,13 @@ if not defined ISCC (
 echo [4/4] Собираю установщик...
 rem Собираем во временной папке и при неудаче повторяем: антивирус иногда держит свежий файл
 set "OUTTMP=%TEMP%\SomeTroySetupBuild"
-if exist "SomeTroySetup.exe" del /f /q "SomeTroySetup.exe" >nul 2>&1
+set "SETUP=SomeTroySetup-%VER%.exe"
+if exist "%SETUP%" del /f /q "%SETUP%" >nul 2>&1
 set "OK="
 for %%N in (1 2 3 4) do (
     if not defined OK (
         if exist "%OUTTMP%" rmdir /s /q "%OUTTMP%" >nul 2>&1
-        "%ISCC%" /Q /O"%OUTTMP%" troy.iss >>build.log 2>&1
+        "%ISCC%" /Q /DAppVersion=%VER% /O"%OUTTMP%" troy.iss >>build.log 2>&1
         if not errorlevel 1 (
             set "OK=1"
         ) else (
@@ -103,7 +110,7 @@ if not defined OK (
     pause
     exit /b 1
 )
-copy /y "%OUTTMP%\SomeTroySetup.exe" "SomeTroySetup.exe" >nul
+copy /y "%OUTTMP%\%SETUP%" "%SETUP%" >nul
 if errorlevel 1 (
     echo Не удалось скопировать установщик из %OUTTMP%
     pause
@@ -111,12 +118,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo Готово: %~dp0SomeTroySetup.exe
+echo Готово: %~dp0%SETUP%
 echo Его можно ставить и на другие компьютеры. Паролей и ключей внутри нет: при первом запуске
 echo Трой сам проведёт настройку в своём окне.
 echo.
 set /p RUN=Установить Троя на этот компьютер сейчас? [Y/n]:
-if /i not "%RUN%"=="n" start "" "%~dp0SomeTroySetup.exe"
+if /i not "%RUN%"=="n" start "" "%~dp0%SETUP%"
 exit /b 0
 
 :find_iscc
