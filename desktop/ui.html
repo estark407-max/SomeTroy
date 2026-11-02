@@ -751,6 +751,11 @@ function setReply(text) {
   if (replyTo) input.focus();
 }
 document.addEventListener("click", (e) => { if (e.target.closest("#reply-bar button")) setReply(""); });
+let lastAsk = null;                                      // последний вопрос — для «Повторить» у ответа Троя
+function resend(ask) {                                  // «Повторить»: отправить тот же текст ещё раз
+  if (!ask || !ask.text || busy) return;
+  input.value = ask.text; autosize(); setReply(ask.quote || ""); send();
+}
 function addUser(text, ts, files = [], quote = "") {
   $("empty")?.remove(); addDay(ts);
   const qm = text.match(/^↩ «([^»]*)»\s*/);             // из истории: «↩ «цитата» текст»
@@ -764,6 +769,12 @@ function addUser(text, ts, files = [], quote = "") {
       ${imgs ? `<div class="thumbs">${imgs}</div>` : ""}
       ${text || others ? `<div class="bubble">${quote ? `<span class="quote">↩ ${esc(quote)}</span>` : ""}${esc(text)}${others}</div>` : ""}
       <div class="meta"><span>${fmtTime(ts)}</span></div></div>`;
+  const ask = { text: text.replace(/^🎤\s*/, "").trim(), quote };
+  if (ask.text) {
+    const b = document.createElement("button"); b.textContent = "Повторить"; b.title = "Отправить это сообщение ещё раз";
+    b.onclick = () => resend(ask); el.querySelector(".meta").appendChild(b);
+  }
+  lastAsk = ask.text ? ask : null;
   feed.appendChild(el); toBottom();
 }
 function addTroy(text, ts) {
@@ -772,6 +783,11 @@ function addTroy(text, ts) {
   el.innerHTML = `<div class="avatar"><img src="favicon.png" alt=""></div><div class="content">${render(text)}
       <div class="meta"><span>${fmtTime(ts)}</span><button>Копировать</button><button data-a="reply">Ответить</button></div></div>`;
   el.querySelector('[data-a="reply"]').onclick = () => setReply(text);
+  const ask = lastAsk;                                  // «Повторить» у ответа — ещё раз задать вопрос, на который он отвечал
+  if (ask) {
+    const b = document.createElement("button"); b.textContent = "Повторить"; b.title = "Задать этот вопрос ещё раз: «" + ask.text.slice(0, 60) + "»";
+    b.onclick = () => resend(ask); el.querySelector(".meta").appendChild(b);
+  }
   el.querySelector(".meta button").onclick = (e) => {
     navigator.clipboard.writeText(text); e.target.textContent = "Скопировано"; setTimeout(() => (e.target.textContent = "Копировать"), 1500);
   };

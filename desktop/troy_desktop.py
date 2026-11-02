@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.6.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -553,8 +553,12 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes({"frameless": window_frame.STATE["enabled"] and window_frame.frameless(hwnd),
                                        "max": window_frame.is_max(hwnd)}))
             elif path == "/tabs":                        # вкладки сайтов в шапке
-                import site_tabs
-                self.send(200, jbytes({"tabs": site_tabs.listing()}))
+                sh = _shell()
+                if sh and sh.started():
+                    self.send(200, jbytes({"tabs": sh.listing()}))
+                else:
+                    import site_tabs
+                    self.send(200, jbytes({"tabs": site_tabs.listing()}))
             elif path == "/whatsnew":
                 self.send(200, jbytes({**whats_new(), "product": PRODUCT}))
             elif path == "/version":
@@ -661,6 +665,20 @@ def make_handler(remote: Remote, key: str):
                         threading.Thread(target=close_window, daemon=True).start()
                 self.send(200, jbytes({"max": window_frame.is_max(hwnd)}))
                 return
+            if path in ("/tabs/show", "/tabs/close", "/tabs/layout") and _shell() and _shell().started():
+                sh = _shell()
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                if "top" in data:
+                    sh.set_top(data.get("top"))
+                if path == "/tabs/show":
+                    sh.show_tab(data.get("id"))
+                elif path == "/tabs/close":
+                    sh.close(data.get("id"))
+                self.send(200, jbytes({"tabs": sh.listing()}))
+                return
             if path in ("/tabs/show", "/tabs/close", "/tabs/layout"):
                 import site_tabs
                 try:
@@ -762,11 +780,15 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 WHATS_NEW = [
  {
-  "version": "0.5.3",
+  "version": "0.6.0",
   "added": [
-   "Окно в едином дизайне: белой полосы Windows сверху больше нет. Кнопки «свернуть / развернуть / закрыть» — справа в шапке Троя. Окно перетаскивается за шапку, разворачивается двойным щелчком по ней и растягивается за края."
+   "Новое окно Троя: теперь это своё окно программы (на движке WebView2), а не окно Edge. Белой полосы Windows нет ни в Windows 10, ни в 11 — кнопки «свернуть / развернуть / закрыть» в шапке Троя. Окно тянется за шапку, разворачивается двойным щелчком и растягивается за края.",
+   "Сайты открываются настоящими вкладками внутри окна Троя: «💬 Чат | 🌐 сайт ×». Вход на сайтах запоминается; 🛡 — сайт открыт через сервер.",
+   "Кнопка «Повторить» у сообщений: у твоего — отправить его ещё раз, у ответа Троя — ещё раз задать вопрос, на который он отвечал."
   ],
-  "fixed": []
+  "fixed": [
+   "Шапка аккуратно помещается в узком окне."
+  ]
  },
  {
   "version": "0.5.2",
@@ -901,7 +923,34 @@ def remember_window() -> None:
         time.sleep(2)
 
 
+def _shell():
+    """Окно Троя на WebView2 (своё окно, без полосы Windows) — если оно работает на этом компьютере."""
+    if os.name != "nt":
+        return None
+    try:
+        import shell_window
+    except Exception:
+        return None
+    return shell_window
+
+
 def open_window(url: str) -> None:
+    sh = _shell()
+    if sh and (sh.started() or sh.available()):
+        if sh.started():
+            sh.show(url)
+            return
+        sh.S["on_fail"] = lambda: _open_edge_window(url)
+        sh.start(url, DATA_DIR, WINDOW_TITLE, load_settings().get("window") or {})
+        return
+    _open_edge_window(url)
+
+
+def _open_edge_window(url: str) -> None:
+    """Запасной путь: окно Edge в режиме приложения (полосу Windows снимаем снаружи)."""
+    if os.name == "nt":
+        import window_frame
+        window_frame.keep(find_window)
     browser = find_browser()
     if not browser:
         webbrowser.open(url)
@@ -917,7 +966,10 @@ APP_URL = ""
 
 
 def find_window():
-    """Окно Троя (Edge в режиме приложения) — по заголовку."""
+    """Окно Троя: своё окно на WebView2, а запасное (Edge в режиме приложения) — по заголовку."""
+    sh = _shell()
+    if sh and sh.started():
+        return sh.hwnd_of()
     try:
         import ctypes
         from ctypes import wintypes
@@ -942,11 +994,18 @@ def find_window():
 
 
 def window_open() -> bool:
+    sh = _shell()
+    if sh and sh.started():
+        return sh.visible()
     return bool(last_alive) and time.time() - last_alive < 12
 
 
 def show_window() -> None:
     """Показать окно: развернуть, если открыто, иначе открыть заново."""
+    sh = _shell()
+    if sh and sh.started():
+        sh.show()
+        return
     hwnd = find_window() if window_open() else None
     if hwnd:
         import ctypes
@@ -957,6 +1016,10 @@ def show_window() -> None:
 
 
 def close_window() -> None:
+    sh = _shell()
+    if sh and sh.started():
+        sh.hide()
+        return
     hwnd = find_window()
     if hwnd:
         import ctypes
@@ -1055,6 +1118,18 @@ def open_site(remote: "Remote", arg: str):
     info = json.loads(arg or "{}")
     url, mode = info.get("url", ""), info.get("mode", "direct")
     host = url.split("://", 1)[-1].split("/")[0]
+    sh = _shell()
+    if sh and (sh.started() or sh.available()):  # вкладкой прямо в окне Троя (WebView2)
+        port = 0
+        if mode == "server":
+            if not str(remote.base).startswith("https://"):
+                return False, "через сервер можно, только когда Трой живёт на сервере (VPS)"
+            port = start_proxy(remote)
+        if not sh.visible():
+            open_window(APP_URL)
+            sh.wait_ready(15)
+        if sh.started():
+            return sh.open_tab(url, host, mode, port)
     browser = find_browser()
     if not browser:
         if mode == "server":
@@ -1475,6 +1550,13 @@ def main():
         message_box(f"Нет сертификата сервера: положи troy-cert.pem рядом с программой\n{CERT}")
         return
 
+    if os.name == "nt" and _shell() and _shell().available():
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            pass
+
     import pystray
     from PIL import Image
 
@@ -1495,6 +1577,9 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     def on_close(icon, _item):            # закрыть программу, вход сохраняется
+        sh = _shell()
+        if sh and sh.started():
+            sh.exit_app()
         close_window()
         icon.stop()
 
@@ -1543,9 +1628,6 @@ def main():
         threading.Thread(target=pc_worker, args=(remote,), daemon=True).start()
         threading.Thread(target=server_check_loop, args=(remote, icon), daemon=True).start()
         threading.Thread(target=remember_window, daemon=True).start()
-        if os.name == "nt":                     # окно без белой полосы Windows — кнопки окна в шапке Троя
-            import window_frame
-            window_frame.keep(find_window)
         hk = load_settings().get("hotkey")
         if hk and not apply_hotkey(hk)[0]:
             icon.notify(f"Горячая клавиша {hk.get('label', '')} занята другой программой — назначь другую.", WINDOW_TITLE)

@@ -45,6 +45,13 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+rem окно Троя на WebView2: pythonnet + файлы WebView2 из пакета pywebview
+".venv\Scripts\python.exe" -m pip install -q pywebview pythonnet
+".venv\Scripts\python.exe" -c "import webview,os;print(os.path.join(os.path.dirname(webview.__file__),'lib'))" > "%TEMP%\troy-wvlib.txt"
+set /p WVLIB=<"%TEMP%\troy-wvlib.txt"
+set "WVOPT="
+if exist "%WVLIB%" set WVOPT=--add-data "%WVLIB%;webview\lib" --hidden-import clr --hidden-import shell_window --collect-all pythonnet --collect-all clr_loader
+if not defined WVOPT echo        Не нашёл файлы WebView2 - окно будет по-старому, через Edge.
 
 rem версия — из APP_VERSION в troy_desktop.py: попадает в свойства exe и в имя установщика
 ".venv\Scripts\python.exe" set_version.py > "%TEMP%\sometroy-ver.txt"
@@ -56,7 +63,7 @@ echo [2/4] Собираю SomeTroy.exe...
 rem --onedir (папка, а не один самораспаковывающийся exe): антивирус почти не путает с вредоносной программой
 if exist "dist\SomeTroy" rmdir /s /q "dist\SomeTroy" >nul 2>&1
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --windowed --name SomeTroy ^
-    --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." ^
+    --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." %WVOPT% ^
     --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import connectors --hidden-import desktop_api ^
     --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata ^
     --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" --add-data "..\server\connectors.py;server_src" ^
