@@ -281,6 +281,19 @@ textarea::placeholder { color: var(--muted); }
 .about-epi { font-style: italic; font-size: 12.5px; line-height: 1.5; color: var(--text); border-left: 3px solid var(--accent);
   padding: 6px 0 6px 10px; margin: 4px 0 12px; }
 .about-copy { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.about-pop .bug-btn { display: block; width: 100%; margin-top: 12px; text-align: center; border: 1px solid var(--line);
+  border-radius: 9px; padding: 7px; background: var(--surface); color: var(--text); font-size: 13.5px; cursor: pointer; }
+.about-pop .bug-btn::before { content: none; }
+.about-pop .bug-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+.bug-form { display: grid; gap: 10px; }
+.bug-form textarea { width: 100%; min-height: 110px; resize: vertical; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg); color: var(--text); padding: 10px; font: inherit; font-size: 14px; }
+.bug-form .muted { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.bug-form .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.bug-form button { border: 1px solid var(--line); background: var(--surface); color: var(--text); border-radius: 9px;
+  padding: 7px 12px; cursor: pointer; font-size: 13.5px; }
+.bug-form button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.bug-form button:disabled { opacity: .5; cursor: default; }
 .hk-title { font-weight: 600; margin-bottom: 4px; }
 .hk-desc { color: var(--muted); font-size: 12.5px; margin-bottom: 12px; line-height: 1.45; }
 .hk-cur { font-family: ui-monospace, Consolas, monospace; background: var(--chip); border-radius: 8px; padding: 8px 10px;
@@ -462,6 +475,7 @@ THEME_DARK.addEventListener("change", applyTheme);
     <div class="about-epi">«Сей модуль является симбиозом дружеского взаимодействия лысого бородатого человека и сверхумной, но очень приятной машины»</div>
     <div class="about-authors">Авторы: <b>Claude</b> и <b>Egor Zhidetskiy</b></div>
     <div class="about-copy">© 2026 Claude и Egor Zhidetskiy</div>
+    <button class="bug-btn" id="bug-btn">🐞 Сообщить об ошибке</button>
   </div>
   </div>
   <button class="text-btn" id="logout" title="Выйти из аккаунта — в следующий раз спрошу пароль">
@@ -754,6 +768,7 @@ async function send(voice) {
     showTyping(false); addTroy(res.reply || "…", Date.now() / 1000); play("received");
     if (res.hist) lastHist = Math.max(lastHist, res.hist);
     if (res.choice) addPcChoice(res.choice);
+    if (res.copy) copyText(res.copy);
   } catch (e) {
     showTyping(false); flash("Не получилось: " + e.message);
   } finally { busy = false; updateSend(); input.focus(); }
@@ -1084,6 +1099,53 @@ function drawConnForm(c) {
   form.querySelector("input:not([style*=none])")?.focus();
 }
 $("conn-btn").onclick = openConnections;
+
+// ── сообщить об ошибке: отчёт уходит в задачи (Issues) репозитория SomeTroy на GitHub ──
+function copyText(t) {
+  try { navigator.clipboard.writeText(t).catch(() => fallback()); } catch (e) { fallback(); }
+  function fallback() {
+    const ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e) {} ta.remove();
+  }
+}
+function openBugReport() {
+  $("about-pop").classList.remove("show");
+  let m = $("bug-modal");
+  if (!m) {
+    m = document.createElement("div"); m.id = "bug-modal"; m.className = "help-modal";
+    m.innerHTML = `<div class="help-card" role="dialog"><h3><span>Сообщить об ошибке</span><button title="Закрыть">×</button></h3>
+      <form class="bug-form">
+        <textarea name="text" placeholder="Что случилось? Например: «попросил открыть музыку — Трой открыл браузер»"></textarea>
+        <div class="muted">Трой соберёт отчёт: версию, диагностику и последние ошибки. Ключи, пароли, адреса серверов и почта
+          в отчёт не попадают. Откроется страница GitHub — проверь текст и нажми <b>Submit new issue</b>
+          (нужен бесплатный аккаунт GitHub). Без аккаунта — нажми «Скопировать отчёт» и отправь его, как удобно.</div>
+        <div class="row"><button type="submit" class="primary">Открыть на GitHub</button>
+          <button type="button" data-a="copy">Скопировать отчёт</button></div>
+        <div class="muted" data-a="status"></div>
+      </form></div>`;
+    m.onclick = (e) => { if (e.target === m || e.target.closest("h3 button")) m.classList.remove("show"); };
+    document.body.appendChild(m);
+    const form = m.querySelector("form"), status = form.querySelector('[data-a="status"]');
+    const go = async (open) => {
+      form.querySelectorAll("button").forEach((b) => (b.disabled = true)); status.textContent = "Собираю отчёт…";
+      try {
+        const r = await fetch(BASE + "/bugreport", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: form.text.value.trim(), open }) }).then((x) => x.json());
+        if (!open || r.trimmed) copyText(r.full);
+        status.textContent = open
+          ? "✅ Открыл GitHub." + (r.trimmed ? " Отчёт длинный — полный текст в буфере обмена, вставь его в задачу (Ctrl+V)." : "")
+          : "✅ Отчёт скопирован — вставь его в письмо или сообщение (Ctrl+V).";
+      } catch (e) { status.textContent = "⚠️ Не получилось: " + e.message; }
+      finally { form.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
+    };
+    form.onsubmit = (e) => { e.preventDefault(); go(true); };
+    form.querySelector('[data-a="copy"]').onclick = () => go(false);
+  }
+  m.querySelector('[data-a="status"]').textContent = "";
+  m.classList.add("show"); m.querySelector("textarea").focus();
+}
+$("bug-btn").onclick = (e) => { e.stopPropagation(); openBugReport(); };
+$("about-pop").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("help-modal")?.classList.contains("show")) $("conn-modal")?.classList.remove("show"); });
 
 // ── мастер первой настройки: шаги ведёт программа, не нейросеть ──

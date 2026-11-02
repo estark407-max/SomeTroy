@@ -1329,7 +1329,8 @@ HELP = """Я {name}, твой помощник. Пиши текстом, гол�
 /status — какие модели сейчас работают, какие на перерыве
 /apps слово — какие программы с этим словом Трой видит на компьютере
 /connect — код, чтобы подключить ещё один компьютер
-/diag — диагностика: что работает, что нет и почему"""
+/diag — диагностика: что работает, что нет и почему
+/bug текст — сообщить об ошибке разработчикам (готовый отчёт на GitHub)"""
 
 
 class Bot:
@@ -1349,6 +1350,9 @@ class Bot:
             self.set_app_password(chat_id, arg.strip())
         elif cmd == "/connect":
             self.tg.send(chat_id, connect_text())
+        elif cmd in ("/bug", "/ошибка"):
+            self.tg.typing(chat_id)
+            self.tg.send(chat_id, bug_text(arg, self.assistant))
         elif cmd == "/diag":
             self.tg.typing(chat_id)
             self.tg.send(chat_id, diagnostics(self.assistant))
@@ -1675,6 +1679,36 @@ def diagnostics(assistant: Optional["Assistant"] = None) -> str:
     else:
         lines.append("Проблем за последние сутки не было.")
     return "\n".join(lines)
+
+
+BUG_REPO = "https://github.com/estark407-max/SomeTroy"
+
+
+def scrub(text: str) -> str:
+    """Для отчёта об ошибке: без ключей, адресов серверов и почты."""
+    text = redact(text)
+    text = re.sub(r"\b(y0_)[\w-]{10,}", r"\1•••", text)
+    text = re.sub(r"troy://\S+", "troy://•••", text)
+    text = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "•.•.•.•", text)
+    return re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "•••@•••", text)
+
+
+def bug_text(what: str, assistant: Optional["Assistant"] = None) -> str:
+    """/bug в Telegram: ссылка на новую задачу в GitHub с описанием и короткой диагностикой."""
+    from urllib.parse import quote
+    what = (what or "").strip()
+    if not what:
+        return ("Напиши так: /bug что случилось — например «/bug не ставятся напоминания». Я соберу отчёт с "
+                "диагностикой и дам ссылку на GitHub: проверишь и отправишь (нужен бесплатный аккаунт GitHub).")
+    title = "Ошибка: " + re.sub(r"\s+", " ", what)[:80]
+    diag = scrub(diagnostics(assistant))
+    head = f"**Что случилось**\n{what}\n\n**Откуда:** Telegram, Трой {'на компьютере' if LOCAL_MODE else 'на сервере'}\n\n"
+    url = lambda d: (f"{BUG_REPO}/issues/new?labels=bug&title={quote(title)}&body="
+                     + quote(head + "<details><summary>Диагностика</summary>\n\n```\n" + d + "\n```\n</details>\n"))
+    while len(url(diag)) > 3500 and len(diag) > 100:      # длинные ссылки Telegram режет — диагностику укорачиваем
+        diag = diag[: int(len(diag) * 0.8)] + "\n…"
+    return ("🐞 Отчёт готов. Открой ссылку, проверь текст и нажми «Submit new issue» (нужен бесплатный аккаунт GitHub). "
+            "Ключи, пароли и адреса серверов я из отчёта убрал. Полная диагностика — в программе: /bug там же.\n\n" + url(diag))
 
 
 def connect_code() -> Optional[str]:
@@ -2487,6 +2521,7 @@ def telegram_session(assistant: "Assistant") -> None:
         {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
         {"command": "connect", "description": "Подключить ещё один компьютер"},
         {"command": "diag", "description": "Диагностика: что работает и что нет"},
+        {"command": "bug", "description": "Сообщить об ошибке разработчикам"},
         {"command": "help", "description": "Что я умею"},
     ], ensure_ascii=False)})
     log.info("Ассистент @%s запущен. Модели: %s%s, идеи: %s", me["username"], ", ".join(GROQ_MODELS),

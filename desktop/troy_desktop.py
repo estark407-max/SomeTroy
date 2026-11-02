@@ -14,6 +14,7 @@ Edge без адресной строки. Окно рисует ui.html, а в�
 Рядом с программой: config.json (адрес сервера и пароль) и troy-cert.pem.
 """
 import json
+import re
 import logging
 import traceback
 import os
@@ -193,6 +194,50 @@ def app_diagnostics(remote: "Remote") -> str:
     return "\n".join(lines)
 
 
+# ── сообщить об ошибке: готовый отчёт открывается на GitHub, человек проверяет и отправляет ──
+BUG_REPO = "https://github.com/estark407-max/SomeTroy"
+_SCRUB = [(re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}|(y0_)[\w-]{10,}"),
+           lambda m: next(g for g in m.groups() if g) + "•••"),
+          (re.compile(r"troy://\S+"), lambda m: "troy://•••"),
+          (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), lambda m: "•.•.•.•"),
+          (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), lambda m: "•••@•••"),
+          (re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+", re.I), lambda m: m.group(0)[:3] + "Users\\•••")]
+
+
+def scrub(text: str) -> str:
+    """Перед отправкой отчёта: без ключей, адресов серверов, почты и имени пользователя Windows."""
+    for rx, fn in _SCRUB:
+        text = rx.sub(fn, text)
+    return text
+
+
+def bug_report(remote: "Remote", text: str) -> dict:
+    """Текст для GitHub Issues + ссылка «новая задача» с ним. Ссылка не длиннее ~7500 символов:
+    если диагностика не влезает — обрезаем её, а полный отчёт программа кладёт в буфер обмена."""
+    from urllib.parse import quote
+    text = (text or "").strip()
+    first = re.sub(r"\s+", " ", text.splitlines()[0] if text else "")[:80]
+    title = "Ошибка: " + (first or "без описания")
+    try:
+        diag = scrub(app_diagnostics(remote))
+    except Exception as e:
+        diag = f"(диагностика не собралась: {e})"
+    import platform
+    head = (f"**Что случилось**\n{text or '(не описано)'}\n\n"
+            f"**Версия:** SomeTroy {APP_VERSION}, Windows {platform.release()} ({platform.version()})\n\n")
+
+    def body_with(d: str) -> str:
+        return head + "<details><summary>Диагностика</summary>\n\n```\n" + d + "\n```\n</details>\n"
+
+    full = body_with(diag)
+    url = lambda b: f"{BUG_REPO}/issues/new?labels=bug&title={quote(title)}&body={quote(b)}"
+    d, trimmed = diag, False
+    while len(url(body_with(d))) > 7500 and len(d) > 200:
+        d, trimmed = d[: int(len(d) * 0.8)], True
+    body = body_with(d + ("\n… (обрезано — полный отчёт в буфере обмена, вставь сюда Ctrl+V)" if trimmed else ""))
+    return {"url": url(body), "full": full, "trimmed": trimmed, "title": title}
+
+
 def make_handler(remote: Remote, key: str):
     prefix = f"/{key}"
     files = {"/": ("ui.html", "text/html; charset=utf-8"), "/favicon.png": ("favicon.png", "image/png")}
@@ -297,6 +342,16 @@ def make_handler(remote: Remote, key: str):
                 ok, err = set_hotkey(data.get("hotkey"))
                 self.send(200 if ok else 400, jbytes({"ok": ok, "error": err, **load_settings()}))
                 return
+            if path == "/bugreport":                       # окно «Сообщить об ошибке»
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                rep_ = bug_report(remote, str(data.get("text") or ""))
+                if data.get("open"):
+                    webbrowser.open(rep_["url"])
+                self.send(200, jbytes(rep_))
+                return
             if path in ("/api/pc/choose", "/api/connections", "/api/connections/remove"):
                 code, resp = remote.forward("POST", path, body)
                 self.send(code, resp)
@@ -305,9 +360,17 @@ def make_handler(remote: Remote, key: str):
                 self.send(404, b"{}")
                 return
             try:
-                text = (json.loads(body or b"{}").get("text") or "").strip().lower()
+                raw = (json.loads(body or b"{}").get("text") or "").strip()
             except ValueError:
-                text = ""
+                raw = ""
+            text = raw.lower()
+            if text.split(" ")[0] in ("/bug", "/ошибка"):          # «/bug не открывается музыка»
+                rep_ = bug_report(remote, raw.partition(" ")[2])
+                webbrowser.open(rep_["url"])
+                self.send(200, jbytes({"reply": "🐞 Открыл GitHub с готовым отчётом об ошибке — проверь текст и нажми "
+                                                "**Submit new issue** (нужен бесплатный аккаунт GitHub). Ключи, пароли и "
+                                                "адреса серверов из отчёта убраны.", "copy": rep_["full"] if rep_["trimmed"] else ""}))
+                return
             if text in ("/diag", "/диагностика", "диагностика"):
                 self.send(200, jbytes({"reply": app_diagnostics(remote)}))
                 return
