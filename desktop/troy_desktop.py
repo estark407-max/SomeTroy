@@ -133,8 +133,8 @@ class Remote:
             if r.status_code >= 400:
                 log.info("%s %s → %s", method, path.split("?")[0], r.status_code)
             return r.status_code, r.content
-        except requests.exceptions.SSLError:
-            log.error("Сертификат сервера не совпал")
+        except requests.exceptions.SSLError as e:
+            log.error("Сертификат сервера не совпал: %s", str(e)[-300:])
             return 502, json.dumps({"error": "сертификат сервера не совпадает — нужен свежий troy-cert.pem"},
                                    ensure_ascii=False).encode()
         except requests.exceptions.ConnectionError as e:
@@ -145,6 +145,38 @@ class Remote:
 
 
 WIZARD = {"w": None, "restart": None}      # мастер первой настройки, пока он идёт
+
+
+def cert_check(base: str) -> str:
+    """Что за сертификат на самом деле отвечает на порту: наш, другой наш (переустановка) или чужой (антивирус)."""
+    import ssl
+    import tempfile
+    host, _, port = base.split("://", 1)[-1].rstrip("/").partition(":")
+    try:
+        pem = ssl.get_server_certificate((host, int(port or 443)), timeout=10)
+    except OSError as e:
+        return f"\n   Не получил сертификат с сервера: {e}"
+    try:
+        mine = CERT.read_text(encoding="utf-8")
+    except OSError:
+        mine = ""
+    der = lambda p: ssl.PEM_cert_to_DER_cert(p) if "BEGIN CERTIFICATE" in p else b""
+    if mine and der(pem) == der(mine):
+        return "\n   Сертификат на сервере тот же, что у программы — подробности ошибки в журнале программы (troy.log)."
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write(pem)
+        info = ssl._ssl._test_decode_cert(f.name)
+        os.unlink(f.name)
+        issuer = ", ".join(v for part in info.get("issuer", ()) for k, v in part if k in ("organizationName", "commonName"))
+    except Exception:
+        issuer = ""
+    if issuer.strip() == "Troy":
+        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти tools\\fix-connection.bat "
+                "из папки SomeTroy — он заберёт свежий сертификат с сервера.")
+    return (f"\n   Вместо сертификата сервера приходит чужой: «{issuer or 'неизвестный'}». Так делает антивирус или прокси, "
+            "который проверяет защищённые соединения. Добавь в нём исключение для программы SomeTroy.exe или для адреса "
+            f"{host} (в Касперском: Настройки → Сетевые параметры → Проверка защищённых соединений → Исключения).")
 
 
 def port_check(base: str) -> str:
@@ -198,8 +230,9 @@ def app_diagnostics(remote: "Remote") -> str:
             why = json.loads(body).get("error", "")
         except ValueError:
             why = ""
-        lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}." + (port_check(remote.base) if mode != "local"
-                     else " Перезапусти программу."))
+        hint = " Перезапусти программу." if mode == "local" else (
+            cert_check(remote.base) if "сертификат" in why else port_check(remote.base))
+        lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}." + hint)
     lines.append(("✅" if find_browser() else "⚠️") + " Окно: " + ("Edge/Chrome найден" if find_browser()
                  else "Edge и Chrome не найдены — окно откроется в браузере по умолчанию"))
     hk = load_settings().get("hotkey")
