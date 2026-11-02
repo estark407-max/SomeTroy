@@ -67,10 +67,11 @@ if /i not "%OPEN%"=="True" (
     goto :end
 )
 
-echo Порт открыт. Прописываю новый адрес в программе и перезапускаю её...
+echo Порт открыт. Прописываю новый адрес и сертификат сервера в программе и перезапускаю её...
 taskkill /im SomeTroy.exe /f >nul 2>&1
 timeout /t 2 /nobreak >nul
 powershell -NoProfile -Command "$c = Get-Content -Raw '%CFG%' | ConvertFrom-Json; $c.server = 'https://%IP%:443'; $c | ConvertTo-Json -Compress | Set-Content -Encoding ASCII '%CFG%'"
+powershell -NoProfile -Command "$t = Get-Content -Raw '%LOG%'; $m = [regex]::Match($t, '(?s)CERT-BEGIN\s*(-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----)'); if ($m.Success) { Set-Content -Encoding ASCII -NoNewline -Path '%LOCALAPPDATA%\SomeTroy\troy-cert.pem' -Value ($m.Groups[1].Value.Replace([string][char]13,'') + [string][char]10) }"
 if exist "%EXE%" start "" "%EXE%"
 echo.
 echo Готово. Трой снова на связи. Проверь: напиши ему /diag.
@@ -104,7 +105,11 @@ fi
 if grep -q '^DESKTOP_PORT=' settings.env; then sed -i 's/^DESKTOP_PORT=.*/DESKTOP_PORT=443/' settings.env; else echo 'DESKTOP_PORT=443' >> settings.env; fi
 systemctl restart sometroy
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ss -ltnH 'sport = :443' | grep -q LISTEN; then echo "Трой слушает порт 443"; echo TROY_OK; exit 0; fi
+    if ss -ltnH 'sport = :443' | grep -q LISTEN; then
+        echo "Трой слушает порт 443"
+        echo CERT-BEGIN; cat tls/cert.pem; echo CERT-END
+        echo TROY_OK; exit 0
+    fi
     sleep 2
 done
 echo "Трой не запустился. Последние строки журнала:"
