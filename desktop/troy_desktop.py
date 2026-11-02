@@ -389,6 +389,8 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes({"n": HOTKEY_HITS["n"], "down": HOTKEY_HITS["down"]}))
             elif path == "/settings":
                 self.send(200, jbytes(load_settings()))
+            elif path == "/whatsnew":
+                self.send(200, jbytes(whats_new()))
             elif path == "/version":
                 self.send(200, jbytes({"version": APP_VERSION}))
             elif path == "/session":
@@ -459,6 +461,10 @@ def make_handler(remote: Remote, key: str):
                 remote.logout()
                 self.send(200, b"{}")
                 return
+            if path == "/whatsnew/seen":
+                save_settings(seen_version=APP_VERSION)
+                self.send(200, b"{}")
+                return
             if path == "/settings":
                 try:
                     data = json.loads(body or b"{}")
@@ -516,6 +522,56 @@ def find_browser():
 
 
 DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вертикальное окно, как боковая панель
+
+
+WHATS_NEW = [
+ {
+  "version": "0.4.1",
+  "added": [
+   "Окно «Что нового» — вы его сейчас читаете: после каждого обновления Трой коротко рассказывает, что изменилось.",
+   "Пуск → «Трой — обновить и починить сервер»: обновляет Троя на вашем сервере до версии программы, открывает порт и обновляет сертификат.",
+   "Программа сама замечает, что Трой на сервере устарел, и подсказывает, как его обновить."
+  ],
+  "fixed": [
+   "Трой всегда спрашивает «напрямую или через сервер», когда сайт открывается впервые, — нейросеть больше не выбирает за вас."
+  ]
+ },
+ {
+  "version": "0.4.0",
+  "added": [
+   "Сайты в отдельном окне браузера: «открой сайт рутрекер». Напрямую или через сервер — как VPN; выбор запоминается для каждого сайта.",
+   "Кнопка «Ответить» под сообщением Троя — он поймёт, о чём именно речь. В Telegram — обычный ответ на сообщение бота."
+  ],
+  "fixed": []
+ },
+ {
+  "version": "0.3.0",
+  "added": [
+   "Светлая и тёмная тема и 7 цветов — кнопка с палитрой в шапке.",
+   "Переезд на свой сервер: 🔌 «Подключения» → «Сервер (VPS)» — только IP и пароль, переписка и идеи переезжают.",
+   "Файлы между компьютерами: «перекинь отчёт с одного ПК на другой» (до 50 МБ).",
+   "«Сохрани переписку» или /log — переписка файлом. Идеи — в ваш репозиторий GitHub.",
+   "Понимает текст в неправильной раскладке: «ghbdtn» → «привет».",
+   "🐞 «Сообщить об ошибке» и /bug; пароли и ключи из чата не уходят в нейросеть."
+  ],
+  "fixed": [
+   "Установка на сервер сама открывает порт, работает на старых серверах (Python 3.8) и делает правильный сертификат.",
+   "«Открой проводник» открывает Проводник, а не Internet Explorer. Одинаковые идеи не записываются дважды."
+  ]
+ }
+]
+
+
+def _vnum(v: str) -> tuple:
+    return tuple(int(x) for x in str(v).split(".") if x.isdigit())
+
+
+def whats_new() -> dict:
+    """Что показать после обновления: версии новее последней увиденной (при первом показе — только текущую)."""
+    seen = load_settings().get("seen_version")
+    notes = [n for n in WHATS_NEW if _vnum(n["version"]) <= _vnum(APP_VERSION)
+             and (_vnum(n["version"]) > _vnum(seen) if seen else n["version"] == APP_VERSION)]
+    return {"version": APP_VERSION, "notes": notes[:3]}
 
 
 def save_settings(**kw) -> None:
@@ -917,12 +973,14 @@ def make_wizard():
         if session:
             SESSION.write_text(json.dumps({"session": session}), encoding="utf-8")
         (DATA_DIR / "config.json").write_text(json.dumps({"mode": "local"}), encoding="utf-8")
+        save_settings(seen_version=APP_VERSION)
 
     def finish_vps(info: dict) -> None:
         cert = DATA_DIR / "troy-cert.pem"
         cert.write_text(info["cert"], encoding="utf-8")
         server = f"https://{info['ip']}:{info['port']}"
         (DATA_DIR / "config.json").write_text(json.dumps({"mode": "vps", "server": server}), encoding="utf-8")
+        save_settings(seen_version=APP_VERSION)
         try:                                    # сразу войти, чтобы не спрашивать только что придуманный пароль
             r = requests.post(server + "/api/login", json={"password": info["password"], "device": device},
                               timeout=15, verify=str(cert))

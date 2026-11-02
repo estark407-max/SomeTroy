@@ -117,6 +117,21 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
 .reply-bar button { border: 0; background: none; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1; }
 .bubble .quote { display: block; border-left: 3px solid var(--accent); padding: 2px 8px; margin-bottom: 6px; font-size: 12.5px;
   opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+.wn-modal { position: fixed; inset: 0; z-index: 45; background: rgba(0,0,0,.45); display: none; place-items: center; padding: 16px; }
+.wn-modal.show { display: grid; }
+.wn-card { width: min(520px, 100%); max-height: min(82vh, 720px); overflow: auto; background: var(--surface); color: var(--text);
+  border: 1px solid var(--line); border-radius: 18px; padding: 22px; box-shadow: 0 20px 60px rgba(0,0,0,.35); animation: rise .2s ease-out; }
+.wn-card .wn-head { display: flex; gap: 12px; align-items: center; margin-bottom: 6px; }
+.wn-card .wn-head img { width: 42px; height: 42px; border-radius: 10px; }
+.wn-card h3 { margin: 0; font-size: 18px; }
+.wn-card .wn-sub { color: var(--muted); font-size: 13px; }
+.wn-card h4 { margin: 16px 0 6px; font-size: 14px; color: var(--accent); }
+.wn-card ul { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 14px; line-height: 1.45; }
+.wn-card .wn-ver { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.wn-card .wn-ver:first-of-type { border-top: 0; margin-top: 4px; padding-top: 0; }
+.wn-card button { margin-top: 18px; width: 100%; border: 0; border-radius: 11px; padding: 10px; background: var(--accent); color: #fff;
+  font: inherit; font-weight: 600; cursor: pointer; }
+.wn-card button:hover { background: var(--accent-hover); }
 .msg.user .bubble {
   background: var(--user); color: var(--user-text);
   padding: 9px 15px; border-radius: 18px 18px 6px 18px;
@@ -972,6 +987,26 @@ function toast(text) {
   t.onclick = () => t.remove(); document.body.appendChild(t); setTimeout(() => t.remove(), 20000);
   if (document.hidden && "Notification" in window && Notification.permission === "granted") new Notification(botName, { body: text });
 }
+// ── «Что нового» после обновления программы ──
+async function showWhatsNew() {
+  let wn;
+  try { wn = await fetch(BASE + "/whatsnew").then((r) => r.json()); } catch (e) { return; }
+  if (!wn || !wn.notes || !wn.notes.length || $("wn-modal")) return;
+  const list = (items) => `<ul>${items.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`;
+  const m = document.createElement("div"); m.id = "wn-modal"; m.className = "wn-modal show";
+  m.innerHTML = `<div class="wn-card" role="dialog">
+    <div class="wn-head"><img src="favicon.png" alt=""><div><h3>Что нового в Трое</h3>
+      <div class="wn-sub">Обновился до версии ${esc(wn.version)}</div></div></div>
+    ${wn.notes.map((n) => `<div class="wn-ver">
+      ${n.added.length ? `<h4>В версии ${esc(n.version)} мы добавили</h4>${list(n.added)}` : ""}
+      ${n.fixed.length ? `<h4>${n.added.length ? "И исправили" : `В версии ${esc(n.version)} мы исправили`}</h4>${list(n.fixed)}` : ""}
+    </div>`).join("")}
+    <button type="button">Понятно</button></div>`;
+  const close = () => { m.remove(); fetch(BASE + "/whatsnew/seen", { method: "POST" }).catch(() => {}); };
+  m.querySelector("button").onclick = close;
+  m.onclick = (e) => { if (e.target === m) close(); };
+  document.body.appendChild(m);
+}
 async function boot() {
   try {
     const ping = await api("/ping"); botName = ping.name || botName;
@@ -989,6 +1024,7 @@ async function boot() {
     setStatus(false, "нет связи"); flash("Не удалось подключиться к серверу: " + e.message); setTimeout(boot, 10000); return;
   }
   clearInterval(pollTimer); pollTimer = setInterval(poll, 4000);
+  showWhatsNew();
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
 }
 let polling = false;
