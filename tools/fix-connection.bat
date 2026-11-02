@@ -40,7 +40,7 @@ echo Сейчас попросит пароль root от сервера. При
 echo Вставить пароль: правой кнопкой мыши, затем Enter.
 echo.
 set "LOG=%TEMP%\troy-fix.log"
-powershell -NoProfile -Command "$t = Get-Content -Raw -Encoding UTF8 '%~f0'; $i = $t.LastIndexOf('#SERVER-SCRIPT#'); [Console]::Out.Write($t.Substring($i))" | ssh -o StrictHostKeyChecking=accept-new root@%IP% "tr -d '\r' | bash -s" > "%LOG%" 2>&1
+powershell -NoProfile -Command "$t = Get-Content -Raw -Encoding UTF8 '%~f0'; $i = $t.LastIndexOf('#SERVER-SCRIPT#'); [Console]::Out.Write($t.Substring($i))" | ssh -o StrictHostKeyChecking=accept-new root@%IP% "tr -d '\r' | bash -s -- %IP%" > "%LOG%" 2>&1
 type "%LOG%"
 echo.
 
@@ -94,6 +94,17 @@ if ! venv/bin/python -c 'import zoneinfo' 2>/dev/null; then
         grep -q 'backports.zoneinfo' $f || sed -i 's/^from zoneinfo import ZoneInfo$/try:\n    from zoneinfo import ZoneInfo\nexcept ImportError:\n    from backports.zoneinfo import ZoneInfo/' $f
     done
     grep -q backports requirements.txt || echo 'backports.zoneinfo; python_version < "3.9"' >> requirements.txt
+fi
+IP_ARG="$1"
+# сертификат: один набор расширений и правильный IP (на старом OpenSSL расширения дублировались — программа ему не верит)
+DUPS=$(openssl x509 -in tls/cert.pem -noout -text | grep -c 'X509v3 Basic Constraints')
+echo "Сертификат сервера: $(openssl x509 -in tls/cert.pem -noout -subject 2>&1); Basic Constraints: $DUPS; $(openssl x509 -in tls/cert.pem -noout -text | grep -o 'IP Address:[0-9.]*' | tr '\n' ' ')"
+if [ "$DUPS" -gt 1 ] || { [ -n "$IP_ARG" ] && ! openssl x509 -in tls/cert.pem -noout -text | grep -q "IP Address:$IP_ARG"; }; then
+    echo "Пересоздаю сертификат сервера (IP $IP_ARG)..."
+    CNF=$(mktemp)
+    printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=Troy\n[ext]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:%s\n' "$IP_ARG" > "$CNF"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 -keyout tls/key.pem -out tls/cert.pem -config "$CNF" 2>/dev/null && chmod 600 tls/key.pem
+    rm -f "$CNF"
 fi
 P=443
 (command -v ufw >/dev/null && ufw status | grep -q 'Status: active' && ufw allow $P/tcp >/dev/null && echo "ufw: открыл $P")

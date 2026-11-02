@@ -33,14 +33,13 @@ sed -i 's/\r$//' settings.env  # убираем виндовые перевод�
 PUBLIC_IP="${1:-$(hostname -I | awk '{print $1}')}"
 PORT="$(grep -E '^DESKTOP_PORT=' settings.env | cut -d= -f2)"; PORT="${PORT:-8443}"
 mkdir -p tls
-if [ ! -f tls/cert.pem ] || ! openssl x509 -in tls/cert.pem -noout -text | grep -q "IP Address:$PUBLIC_IP"; then
+CERT_DUPS="$( [ -f tls/cert.pem ] && openssl x509 -in tls/cert.pem -noout -text | grep -c 'X509v3 Basic Constraints' || echo 0)"
+if [ ! -f tls/cert.pem ] || ! openssl x509 -in tls/cert.pem -noout -text | grep -q "IP Address:$PUBLIC_IP" || [ "$CERT_DUPS" -gt 1 ]; then
     echo "==> Создаю сертификат для программы на компьютере (IP $PUBLIC_IP)..."
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 \
-        -keyout tls/key.pem -out tls/cert.pem -subj "/CN=Troy" \
-        -addext "subjectAltName=IP:$PUBLIC_IP" \
-        -addext "basicConstraints=critical,CA:TRUE" \
-        -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
-        -addext "extendedKeyUsage=serverAuth" 2>/dev/null
+    CNF="$(mktemp)"
+    printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=Troy\n[ext]\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,digitalSignature,keyEncipherment,keyCertSign\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:%s\n' "$PUBLIC_IP" > "$CNF"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 -keyout tls/key.pem -out tls/cert.pem -config "$CNF" 2>/dev/null
+    rm -f "$CNF"
     chmod 600 tls/key.pem
 fi
 # Открываем порт для программы во всех файрволах сервера, какие есть (файрвол в панели хостинга отсюда не виден)
