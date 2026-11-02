@@ -145,6 +145,26 @@ def parse_vps_address(text: str) -> Optional[tuple]:
     return m.group(2), m.group(1) or "root", int(m.group(3) or 22)
 
 
+def tcp_open(ip: str, port: int, timeout: float = 8) -> bool:
+    """Достучится ли этот компьютер до порта сервера."""
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+# открыть порт во всех файрволах сервера (ufw, firewalld, iptables) — то же, что делает install.sh
+OPEN_PORT_SH = (
+    "P={port}; "
+    "(command -v ufw >/dev/null && ufw status | grep -q 'Status: active' && ufw allow $P/tcp >/dev/null); "
+    "(command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1 && "
+    " firewall-cmd -q --permanent --add-port=$P/tcp && firewall-cmd -q --reload); "
+    "(command -v iptables >/dev/null && iptables -S INPUT | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)' && "
+    " ! iptables -C INPUT -p tcp --dport $P -j ACCEPT 2>/dev/null && iptables -I INPUT -p tcp --dport $P -j ACCEPT && "
+    " (netfilter-persistent save >/dev/null 2>&1 || ([ -d /etc/iptables ] && iptables-save > /etc/iptables/rules.v4))); true")
+
+
 def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path, say: Callable[[str], None],
                 ssh_port: int = 22, extra: Optional[dict] = None) -> dict:
     """Ставит Троя на сервер. Возвращает {"ok", "port", "cert", "error", "log"}.
@@ -217,6 +237,26 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
             return {"ok": False, "error": "Не получилось задать пароль программы: " + text[-300:]}
         with sftp.open("/opt/sometroy/tls/cert.pem") as f:
             cert = f.read().decode()
+
+        def listening(p: int) -> bool:          # служба поднялась и слушает порт (ждём до 20 с)
+            for _ in range(10):
+                if run(f"ss -ltnH 'sport = :{p}' | grep -q LISTEN")[0] == 0:
+                    return True
+                time.sleep(2)
+            return False
+
+        if listening(port) and not tcp_open(ip, port):
+            # порт закрыт снаружи — чаще всего файрволом хостинга; 443 (HTTPS) хостинги почти никогда не закрывают
+            if 443 not in used and port != 443:
+                say(f"Порт {port} закрыт снаружи — переключаю Троя на порт 443, его хостинги обычно не закрывают…")
+                run(OPEN_PORT_SH.format(port=443))
+                run("sed -i 's/^DESKTOP_PORT=.*/DESKTOP_PORT=443/' /opt/sometroy/settings.env && systemctl restart sometroy")
+                if listening(443) and tcp_open(ip, 443):
+                    port = 443
+                    say("Порт 443 открыт — программа будет подключаться через него.")
+                else:                           # не помогло — возвращаем как было
+                    run(f"sed -i 's/^DESKTOP_PORT=.*/DESKTOP_PORT={port}/' /opt/sometroy/settings.env && "
+                        "systemctl restart sometroy")
         return {"ok": True, "port": port, "cert": cert, "log": "\n".join(out_lines[-15:])}
     finally:
         cli.close()

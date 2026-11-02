@@ -38,8 +38,21 @@ if [ ! -f tls/cert.pem ] || ! openssl x509 -in tls/cert.pem -noout -text | grep 
         -addext "extendedKeyUsage=serverAuth" 2>/dev/null
     chmod 600 tls/key.pem
 fi
+# Открываем порт для программы во всех файрволах сервера, какие есть (файрвол в панели хостинга отсюда не виден)
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
     ufw allow "$PORT/tcp" >/dev/null && echo "==> Открыл порт $PORT в ufw"
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd -q --permanent --add-port="$PORT/tcp" && firewall-cmd -q --reload && echo "==> Открыл порт $PORT в firewalld"
+fi
+if command -v iptables >/dev/null 2>&1; then
+    if iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)'; then
+        if ! iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT && echo "==> Открыл порт $PORT в iptables"
+            if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null 2>&1 || true
+            elif [ -d /etc/iptables ]; then iptables-save > /etc/iptables/rules.v4 || true; fi
+        fi
+    fi
 fi
 
 echo "==> Проверяю ключи и доступ к сервисам..."
