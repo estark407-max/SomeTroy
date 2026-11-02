@@ -1,6 +1,6 @@
 ﻿; Установщик программы «Трой» (Inno Setup 6). Собирается из build.bat.
 
-#define AppName "Трой"
+#define AppName "Troy"
 #ifndef AppVersion
 #define AppVersion "0.5.2"
 #endif
@@ -22,7 +22,7 @@ OutputDir=.
 OutputBaseFilename=SomeTroySetup-{#AppVersion}
 SetupIconFile=troy.ico
 UninstallDisplayIcon={app}\{#AppExe}
-UninstallDisplayName={#AppName} — личный ассистент
+UninstallDisplayName={#AppName} — личный ассистент Трой
 WizardStyle=modern
 VersionInfoVersion={#AppVersion}
 VersionInfoCompany=Claude и Egor Zhidetskiy
@@ -42,6 +42,12 @@ Name: "defender"; Description: "Добавить Троя в исключени�
 Name: "autostart"; Description: "Запускать вместе с Windows (свёрнутым в трей)"; GroupDescription: "Дополнительно:"; Flags: unchecked
 
 [InstallDelete]
+; ярлыки со старым названием «Трой» — убираем, новые создадутся с названием Troy
+Type: files; Name: "{autoprograms}\Трой.lnk"
+Type: files; Name: "{autodesktop}\Трой.lnk"
+Type: files; Name: "{userstartup}\Трой.lnk"
+Type: files; Name: "{autoprograms}\Трой — обновить и починить сервер.lnk"
+Type: files; Name: "{autoprograms}\Трой — починить связь с сервером.lnk"
 ; после каждой установки — снова вход по паролю
 Type: files; Name: "{localappdata}\SomeTroy\session.json"
 

@@ -515,7 +515,7 @@ THEME_DARK.addEventListener("change", applyTheme);
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   </button>
   <div class="snd-menu hk-pop about-pop" id="about-pop">
-    <div class="about-head"><img src="favicon.png" alt=""><div><div class="hk-title">Трой</div>
+    <div class="about-head"><img src="favicon.png" alt=""><div><div class="hk-title">Troy</div>
       <div class="hk-desc" id="about-ver">Личный ассистент</div></div></div>
     <div class="hk-desc">Помощник в Telegram и на компьютере: напоминания, поиск, идеи для проектов, Битрикс24,
       управление компьютером голосом и текстом.</div>
@@ -1053,7 +1053,7 @@ async function showWhatsNew() {
   const list = (items) => `<ul>${items.map((t) => `<li>${esc(t)}</li>`).join("")}</ul>`;
   const m = document.createElement("div"); m.id = "wn-modal"; m.className = "wn-modal show";
   m.innerHTML = `<div class="wn-card" role="dialog">
-    <div class="wn-head"><img src="favicon.png" alt=""><div><h3>Что нового в Трое</h3>
+    <div class="wn-head"><img src="favicon.png" alt=""><div><h3>Что нового в ${esc(wn.product || "Troy")}</h3>
       <div class="wn-sub">Обновился до версии ${esc(wn.version)}</div></div></div>
     ${wn.notes.map((n) => `<div class="wn-ver">
       ${n.added.length ? `<h4>В версии ${esc(n.version)} мы добавили</h4>${list(n.added)}` : ""}

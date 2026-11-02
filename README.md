@@ -1,6 +1,7 @@
 <p align="center"><img src="art/icon-256.png" width="128" alt="Трой"></p>
 
-<h1 align="center">SomeTroy</h1>
+<h1 align="center">Troy</h1>
+<p align="center"><sub>проект SomeTroy</sub></p>
 <p align="center"><b>Трой — бесплатный личный ассистент, которого каждый ставит себе сам</b></p>
 
 > «Сей модуль является симбиозом дружеского взаимодействия лысого бородатого человека

@@ -58,13 +58,14 @@ def setup_log() -> None:
         pass
     logging.basicConfig(filename=str(LOG), level=logging.INFO, encoding="utf-8",
                         format="%(asctime)s %(levelname)s %(message)s")
-WINDOW_TITLE = "Трой"
+WINDOW_TITLE = "Трой"                 # заголовок окна (по нему программа находит своё окно)
+PRODUCT = "Troy"                  # название программы: значок у часов, «О программе», установщик
 
 
 def message_box(text: str) -> None:
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(0, text, "Трой", 0x10)
+        ctypes.windll.user32.MessageBoxW(0, text, PRODUCT, 0x10)
     except Exception:
         print(text)
 
@@ -382,7 +383,7 @@ def bug_details(remote: "Remote") -> str:
     import platform
     cfg = load_config()
     mode = cfg.get("mode") or ("сервер" if cfg.get("server") else "не настроена")
-    lines = [f"Программа: SomeTroy {APP_VERSION} (код сервера в программе: {bundled_server_version() or '?'})",
+    lines = [f"Программа: Troy {APP_VERSION} (код сервера в программе: {bundled_server_version() or '?'})",
              f"Windows: {platform.release()} {platform.version()} ({platform.machine()}), "
              f"Python {platform.python_version()}, {'собранная программа' if getattr(sys, 'frozen', False) else 'из исходников'}",
              f"Режим: {'на этом компьютере' if mode == 'local' else 'сервер ' + str(remote.base)}",
@@ -422,7 +423,7 @@ def bug_report(remote: "Remote", text: str) -> dict:
         diag = bug_details(remote)
     except Exception as e:
         diag = f"(подробности не собрались: {e})"
-    head = (f"**Что случилось**\n{text or '(не описано)'}\n\n**Версия:** SomeTroy {APP_VERSION}\n\n"
+    head = (f"**Что случилось**\n{text or '(не описано)'}\n\n**Версия:** Troy {APP_VERSION}\n\n"
             + ("**Скриншот:** вставьте сюда — он уже в буфере обмена (Ctrl+V)\n\n" if BUG["shot"] else ""))
 
     def body_with(d: str) -> str:
@@ -550,7 +551,7 @@ def make_handler(remote: Remote, key: str):
                 import site_tabs
                 self.send(200, jbytes({"tabs": site_tabs.listing()}))
             elif path == "/whatsnew":
-                self.send(200, jbytes(whats_new()))
+                self.send(200, jbytes({**whats_new(), "product": PRODUCT}))
             elif path == "/version":
                 self.send(200, jbytes({"version": APP_VERSION}))
             elif path == "/session":
@@ -739,6 +740,7 @@ WHATS_NEW = [
  {
   "version": "0.5.2",
   "added": [
+   "Программа теперь называется Troy (проект — SomeTroy). Ассистента по-прежнему зовут Трой.",
    "Сайты открываются вкладками прямо в окне Троя: «💬 Чат | 🌐 сайт ×» под шапкой. Переключайтесь между чатом и сайтами, закрывайте крестиком. 🛡 — сайт открыт через сервер."
   ],
   "fixed": []
@@ -1471,12 +1473,12 @@ def main():
     def on_about(_icon, _item):
         import ctypes
         threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(
-            0, f"Трой {APP_VERSION}\nЛичный ассистент — в Telegram и на компьютере.\n\n"
+            0, f"{PRODUCT} {APP_VERSION}\nЛичный ассистент — в Telegram и на компьютере.\n\n"
                "«Сей модуль является симбиозом дружеского взаимодействия лысого бородатого человека и сверхумной, но очень приятной машины»\n\n"
                "Авторы: Claude и Egor Zhidetskiy\n© 2026 Claude и Egor Zhidetskiy",
             "О программе", 0x40 | 0x10000), daemon=True).start()
 
-    icon = pystray.Icon("troy", Image.open(RES_DIR / "favicon.png"), WINDOW_TITLE, menu=pystray.Menu(
+    icon = pystray.Icon("troy", Image.open(RES_DIR / "favicon.png"), PRODUCT, menu=pystray.Menu(
         pystray.MenuItem("Открыть Троя", lambda icon, item: show_window(), default=True),
         pystray.MenuItem("О программе", on_about),
         pystray.MenuItem("Диагностика", lambda icon, item: show_diag()),
