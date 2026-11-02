@@ -94,8 +94,6 @@ def frameless(hwnd) -> bool:
 def strip(hwnd) -> bool:
     """Убрать системную полосу и рамку. True — если что-то поменяли."""
     u = _u()
-    if hwnd in STATE["gave_up"]:
-        return False
     if u.IsZoomed(hwnd):                          # Edge сам развернул окно — разворачиваем «по-нашему»
         u.ShowWindow(hwnd, SW_RESTORE)
         time.sleep(0.2)
@@ -109,9 +107,6 @@ def strip(hwnd) -> bool:
     after = _style(u, hwnd)
     if n <= 3 or n % 100 == 0:
         log.info("Окно: убираю системную полосу (Windows %s, раз %d): стиль %#x → %#x", _winver(), n, style, after)
-    if after & WS_CAPTION:
-        STATE["gave_up"].add(hwnd)
-        log.warning("Окно: Windows не дала убрать полосу — оставляю обычное окно")
     return True
 
 
