@@ -93,12 +93,12 @@ log = logging.getLogger("assistant")
 STARTED = time.time()
 
 
-_SECRET_RE = re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}")
+_SECRET_RE = re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}|(github_pat_|ghp_)[\w]{10,}")
 
 
 def redact(text: str) -> str:
     """Убрать из текста ошибки токены и ключи (Telegram вставляет токен прямо в адрес запроса)."""
-    return _SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or m.group(3)) + "•••", str(text))
+    return _SECRET_RE.sub(lambda m: next(g for g in m.groups() if g) + "•••", str(text))
 
 
 def human_error(e: BaseException) -> str:
@@ -472,6 +472,26 @@ def slugify(name: str) -> str:
     return s[:60] or "inbox"
 
 
+def _idea_norm(text: str) -> str:
+    return " ".join(re.sub(r"[^\w]+", " ", (text or "").lower().replace("ё", "е")).split())
+
+
+def idea_duplicate(content: str, text: str) -> Optional[str]:
+    """Дата записи, если такая идея в проекте уже есть (модель любит сохранять одно и то же дважды)."""
+    import difflib
+    new = _idea_norm(text)
+    if not new:
+        return None
+    for line in reversed(content.splitlines()[-200:]):
+        m = re.match(r"- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — (.*)", line)
+        if not m:
+            continue
+        old = _idea_norm(m.group(2))
+        if old == new or (len(new) > 20 and new in old) or difflib.SequenceMatcher(None, old, new).ratio() >= 0.85:
+            return m.group(1)
+    return None
+
+
 class Ideas:
     def __init__(self):
         self.github = bool(GITHUB_TOKEN and GITHUB_REPO)
@@ -538,6 +558,9 @@ class Ideas:
             content, sha = self._get(path)
             if content is None:
                 content = f"# {project.strip() or slug}\n\n"
+            dup = idea_duplicate(content, text)
+            if dup:
+                return f"Такая идея уже записана в «{slug}» ({dup}) — повтор не сохраняю."
             if not content.endswith("\n"):
                 content += "\n"
             content += f"- {stamp} — {text.strip()}\n"
@@ -762,6 +785,14 @@ PC_TOOL = fn("pc_command", "Управление компьютером, где 
                                              "(Telegram, Google Chrome, Блокнот, Word, Steam…)"},
     "device": {"type": "string", "description": "имя компьютера, только если пользователь назвал его явно"}},
     ["action"])
+FILE_MAX_MB = 50
+FILE_TOOL = fn("pc_file", f"Переслать файл (до {FILE_MAX_MB} МБ) с одного компьютера с Троем на другой. Файл ищется по имени "
+                         "на рабочем столе, в Документах и Загрузках (или по полному пути) и приходит в «Загрузки\\Трой». "
+                         "После доставки копия с сервера удаляется.", {
+    "file": {"type": "string", "description": "имя файла или его часть («отчёт.xlsx», «договор»), или полный путь"},
+    "source": {"type": "string", "description": "с какого компьютера взять"},
+    "target": {"type": "string", "description": "на какой компьютер положить"}}, ["file"])
+FILE_HINT_RE = re.compile(r"файл|документ|папк|перекин|перешл|пересл|скин[уь]|закин|забер|перетащ|переда[йт]", re.I)
 # Пасхалка: Трой назван в честь Троя Маклюра из «Симпсонов» — и представляется так же
 WHO_RE = re.compile(r"^\s*(?:\S+[,!]\s*)?(?:кто ты|ты кто|кто ты такой|ты кто такой|представься|представьтесь|"
                     r"как тебя зовут|расскажи о себе|who are you)\s*[?!.]*\s*$", re.I)
@@ -1008,6 +1039,7 @@ def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = Fa
 
 
 PC_RULES = """
+- Файл с одного компьютера на другой («перекинь отчёт с ZEON на EEZ40») — pc_file; до 50 МБ.
 - Компьютеры, где запущен Трой: pc_command. Выключение и перезагрузку — только после «да» (спроси «Выключаю?»).
   Остальное (сон, блокировка, открыть/закрыть программу, музыка, громкость) — сразу. Если компьютеров несколько,
   пользователю покажут кнопки выбора — просто скажи «Выбери компьютер». device передавай, только если его назвали.
@@ -1083,6 +1115,10 @@ class Assistant:
                                    str(args.get("date_to") or ""))
             if name == "pc_command":
                 return self.pc_command(chat_id, args)
+            if name == "pc_file":
+                self.pc_used = True
+                return file_command(str(args.get("file") or ""), str(args.get("source") or ""),
+                                    str(args.get("target") or ""), self.channel, chat_id, self.user_text)
             if name == "route_link":
                 return connectors.route_link(self.places, args)
             if name == "taxi_link":
@@ -1195,6 +1231,14 @@ class Assistant:
         return text
 
     def run(self, chat_id: str, content, channel: str = "telegram") -> str:
+        """Текст не в той раскладке («ghbdtn») сначала переводим — и говорим, как поняли."""
+        fixed = connectors.fix_layout(content) if isinstance(content, str) else content
+        answer = self._run_main(chat_id, fixed, channel)
+        if fixed != content and isinstance(answer, str):
+            answer = f"⌨️ Понял как: «{fixed.strip()}»\n\n{answer}"
+        return answer
+
+    def _run_main(self, chat_id: str, content, channel: str = "telegram") -> str:
         with self.lock:
             self.channel = channel
             self.pc_choice, self.pc_used = None, False
@@ -1241,7 +1285,9 @@ class Assistant:
         use_route = any(re.search(connectors.ROUTE_HINT, t or "", re.I) for t in recent)
         if use_route:
             conn_tools = conn_tools + connectors.ROUTE_TOOLS
+        use_file = any(FILE_HINT_RE.search(t or "") for t in recent)
         tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
+                 + ([FILE_TOOL] if use_file else [])
                  + ([BOILER_TOOL] if use_boiler else []) + conn_tools)
         prompt = system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)
         if use_route:
@@ -1994,6 +2040,79 @@ def _bitrix_disconnect(assistant: "Assistant") -> None:
     assistant.bx = None
 
 
+def _gh_connect(assistant: "Assistant", v: dict) -> tuple:
+    """Идеи — в свой репозиторий GitHub: проверяем доступ, переносим уже записанное, кладём README."""
+    m = re.search(r"(?:github\.com/)?([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", v.get("repo", "").strip())
+    token = v.get("token", "").strip()
+    if not m:
+        return "Репозиторий пишется так: имя/репозиторий — например ivan/troy-ideas (или ссылкой на GitHub).", ""
+    repo = f"{m.group(1)}/{m.group(2)}"
+    s = make_session()
+    s.headers.update({"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        r = s.get(f"https://api.github.com/repos/{repo}", timeout=20)
+    except requests.RequestException as e:
+        return f"Не достучался до GitHub: {human_error(e)}", ""
+    if r.status_code == 401:
+        return "GitHub не принял токен. Создай новый по инструкции и скопируй его целиком (github_pat_…).", ""
+    if r.status_code == 404:
+        return (f"Не вижу репозиторий {repo}: проверь имя или дай токену доступ к нему "
+                "(Repository access → Only select repositories → выбери репозиторий)."), ""
+    if r.status_code != 200:
+        return f"GitHub ответил ошибкой {r.status_code}. Попробуй через минуту.", ""
+    info = r.json()
+    if not (info.get("permissions") or {}).get("push", False):
+        return "У токена нет права записи. В настройках токена: Permissions → Contents → Read and write.", ""
+    save_setting("GITHUB_REPO", repo)
+    save_setting("GITHUB_BRANCH", info.get("default_branch") or "main")
+    save_setting("GITHUB_TOKEN", token)
+    local = Ideas.__new__(Ideas)                      # что уже записано на этом Трое — переносим
+    local.github, local.s, local._projects, local._projects_at = False, make_session(), [], 0.0
+    assistant.ideas = Ideas()
+    moved = 0
+    d = LOCAL_IDEAS_DIR / "projects"
+    for f in sorted(d.glob("*.md")) if d.exists() else []:
+        content, _ = local._get(f"projects/{f.name}")
+        for line in (content or "").splitlines():
+            mm = re.match(r"- \d{4}-\d{2}-\d{2} \d{2}:\d{2} — (.*)", line)
+            if mm:
+                remote, sha = assistant.ideas._get(f"projects/{f.name}")
+                if remote is None:
+                    remote = (content.splitlines()[0] if content.startswith("#") else f"# {f.stem}") + "\n\n"
+                if not idea_duplicate(remote, mm.group(1)):
+                    assistant.ideas._put(f"projects/{f.name}", remote.rstrip("\n") + "\n" + line + "\n", sha,
+                                         f"Идея: {f.stem} (перенос)")
+                    moved += 1
+    readme, _ = assistant.ideas._get("README.md")
+    if readme is None or len(readme.strip()) < 40:
+        assistant.ideas._put("README.md", IDEAS_README, None if readme is None else assistant.ideas._get("README.md")[1],
+                             "Идеи Троя: README")
+    return None, (f"Готово: идеи теперь пишутся в {repo}." + (f" Перенёс уже записанные: {moved}." if moved else "")
+                  + " Чтобы обсудить их с ИИ, дай ему доступ к этому репозиторию и попроси «подтяни идеи».")
+
+
+def _gh_disconnect(assistant: "Assistant") -> None:
+    for k in ("GITHUB_TOKEN", "GITHUB_REPO", "GITHUB_BRANCH"):
+        save_setting(k, "")
+    assistant.ideas = Ideas()
+
+
+IDEAS_README = """# Идеи
+
+Сюда мой ассистент **Трой** ([SomeTroy](https://github.com/estark407-max/SomeTroy)) записывает идеи по проектам —
+из Telegram, из программы на компьютере, текстом или голосом.
+
+- `projects/<проект>.md` — идеи одного проекта, по одной в строке: `- ГГГГ-ММ-ДД ЧЧ:ММ — текст`.
+- `projects/inbox.md` — то, что пока не относится ни к какому проекту.
+
+## Как обсудить идеи с ИИ
+
+Дай ассистенту (Claude, ChatGPT и т. п.) доступ к этому репозиторию и попроси:
+«Подтяни идеи из репозитория» или «что нового по проекту X». Новые записи — внизу каждого файла.
+"""
+
+
 def _host(url: str) -> str:
     m = re.match(r"https?://([^/]+)", url or "")
     return m.group(1) if m else ""
@@ -2037,6 +2156,35 @@ def register_modules(assistant: "Assistant") -> None:
 
 Бесплатный Mistral может использовать переписку для улучшения своих моделей. Если это важно —
 отключи в настройках Mistral (Admin → Privacy).
+"""},
+        "github": {
+            "title": "Идеи в GitHub",
+            "about": "Трой записывает идеи в твой репозиторий GitHub — оттуда их удобно обсуждать с Claude или другим ИИ.",
+            "fields": [{"name": "repo", "label": "Репозиторий", "placeholder": "имя/репозиторий или ссылка"},
+                       {"name": "token", "label": "Токен GitHub", "secret": True, "placeholder": "github_pat_…"}],
+            "state": lambda: (bool(GITHUB_TOKEN and GITHUB_REPO), GITHUB_REPO if GITHUB_TOKEN else "", ""),
+            "connect": lambda v: _gh_connect(assistant, v),
+            "disconnect": lambda: _gh_disconnect(assistant),
+            "help": """
+Без этого идеи хранятся у самого Троя. С GitHub они лежат в твоём репозитории: их видно с любого устройства,
+а ИИ-ассистент (Claude, ChatGPT…) может прочитать их и обсудить с тобой.
+
+**1. Репозиторий (один раз)**
+1. Войди на https://github.com (или зарегистрируйся — бесплатно).
+2. Открой https://github.com/new, назови, например, **troy-ideas**, выбери **Private** (идеи видишь только ты) → **Create repository**.
+
+**2. Токен — ключ только к этому репозиторию**
+1. Открой https://github.com/settings/personal-access-tokens/new
+2. Имя — «Трой»; срок (Expiration) — какой удобно, можно **No expiration**.
+3. **Repository access → Only select repositories** → выбери свой репозиторий с идеями.
+4. **Permissions → Repository permissions → Contents → Read and write**.
+5. Нажми **Generate token** и скопируй его (начинается с github_pat_, показывается один раз).
+
+**3. Вставь сюда** имя репозитория (например ivan/troy-ideas) и токен.
+Трой проверит доступ, перенесёт уже записанные идеи и положит в репозиторий README с подсказкой для ИИ.
+
+**Как потом обсуждать с ИИ:** подключи GitHub в своём ИИ-ассистенте (у Claude — в настройках подключений),
+дай доступ к этому репозиторию и попроси «подтяни идеи».
 """},
         "bitrix": {
             "title": "Битрикс24",
@@ -2174,6 +2322,12 @@ def online_pcs() -> list:
 
 
 def pc_label(action: str, arg: str) -> str:
+    if action in ("file_send", "file_get"):
+        try:
+            info = json.loads(arg or "{}")
+        except ValueError:
+            info = {}
+        return f"переслать файл «{info.get('q') or info.get('name') or ''}»"
     return PC_ACTIONS.get(action, action) + (f" «{arg}»" if arg else "")
 
 
@@ -2249,10 +2403,15 @@ def expire_stale() -> None:
     """Команда компьютеру висит 2 минуты — говорим владельцу, что именно не так, а не молчим."""
     now = int(time.time())
     with closing(db()) as con, con:
-        stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent','choose') AND created < ?",
-                            (now - 120,)).fetchall()
+        stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent','choose') AND created < ? "
+                            "AND (action NOT IN ('file_send', 'file_get') OR created < ?)",   # файл до 50 МБ — даём 10 минут
+                            (now - 120, now - 600)).fetchall()
         for r in stale:
             con.execute("UPDATE pc_commands SET status='expired' WHERE id=?", (r["id"],))
+    for r in stale:
+        if r["action"] == "file_get":
+            file_forget(r["arg"])
+    files_cleanup()
     for r in stale:
         label = pc_label(r["action"], r["arg"])
         if r["status"] == "choose":
@@ -2285,11 +2444,112 @@ def pc_result(device: str, cmd_id: int, ok: bool, text: str, late: bool = False)
         pc_notify(row["channel"], row["chat_id"], f"{'⏻' if ok else '↩️'} {device}: {text}")
         add_history(row["chat_id"], "pc_result", f"{device}: {text}")
         return
+    if row["action"] == "file_get":
+        file_forget(row["arg"])                            # доставлено (или не вышло) — с сервера убираем
+    if row["action"] == "file_send" and ok:                # источник отдал файл — ждём получателя, без лишних сообщений
+        add_history(row["chat_id"], "pc_result", f"{device}: {text}")
+        return
     pc_notify(row["channel"], row["chat_id"], f"{'✅' if ok else '⚠️'} {device}: {text}")
     add_history(row["chat_id"], "pc_result", f"{device}: {'выполнено' if ok else 'не получилось'} — {text}")
     if ok and row["action"] in ("shutdown", "restart", "sleep"):
         POWER_WATCH[cmd_id] = {"device": device, "action": row["action"], "channel": row["channel"],
                                "chat_id": row["chat_id"], "t0": time.time(), "gone": False}
+
+
+# ───────────────────────── Файлы между компьютерами ─────────────────────────
+# Компьютер-источник находит файл и отдаёт его серверу, компьютер-получатель забирает и сохраняет.
+# На сервере файл лежит только до доставки (и не дольше часа, если получатель так и не забрал).
+
+FILES_DIR = BASE / "transfer"
+
+
+def _pick_pc(name: str, online: list) -> Optional[str]:
+    h = re.sub(r"[^\w]", "", (find_device(name) or name or "").lower())
+    hits = [d for d in online if h and (h in re.sub(r"[^\w]", "", d.lower()) or re.sub(r"[^\w]", "", d.lower()) in h)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def file_command(file: str, source: str, target: str, channel: str, chat_id: str, user_text: str = "") -> str:
+    """Задание компьютеру-источнику: найти файл и передать его на компьютер-получатель."""
+    file = file.strip().strip("«»\"'")
+    if not file:
+        return "Ошибка: укажи file — какой файл переслать."
+    online = online_pcs()
+    if len(online) < 2:
+        return ("Чтобы переслать файл, нужны два компьютера с запущенной программой Трой. Сейчас в сети: "
+                + (", ".join(online) or "ни одного") + ".")
+    src, dst = _pick_pc(source, online), _pick_pc(target, online)
+    if not src and dst and len(online) == 2:
+        src = next(d for d in online if d != dst)
+    if not dst and src and len(online) == 2:
+        dst = next(d for d in online if d != src)
+    if channel == "desktop" and not dst and src:        # «забери с ZEON» из программы — сюда, если это понятно
+        others = [d for d in online if d != src]
+        dst = others[0] if len(others) == 1 else None
+    if not src or not dst or src == dst:
+        return (f"Уточни у пользователя, с какого компьютера на какой переслать файл. В сети: {', '.join(online)}.")
+    with closing(db()) as con, con:
+        con.execute("INSERT INTO pc_commands(device, action, arg, status, channel, chat_id, created) VALUES (?,?,?,?,?,?,?)",
+                    (src, "file_send", json.dumps({"q": file, "to": dst}, ensure_ascii=False), "pending", channel,
+                     chat_id, int(time.time())))
+    return (f"Задание отправлено: {src} ищет «{file}» и передаёт на {dst}. Когда файл дойдёт, придёт отдельное "
+            "сообщение. Коротко скажи пользователю, что пересылаешь.")
+
+
+def file_upload(device: str, cmd_id: int, name: str, data: bytes) -> tuple:
+    """Источник прислал файл → кладём во временную папку и даём задание получателю."""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", (name or "файл").strip())[:120] or "файл"
+    with closing(db()) as con, con:
+        row = con.execute("SELECT * FROM pc_commands WHERE id=? AND device=? AND action='file_send'",
+                          (cmd_id, device)).fetchone()
+        if not row or row["status"] != "sent":
+            return False, "задание на пересылку не найдено или устарело"
+        info = json.loads(row["arg"] or "{}")
+        FILES_DIR.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(16)
+        (FILES_DIR / token).write_bytes(data)
+        con.execute("INSERT INTO pc_commands(device, action, arg, status, channel, chat_id, created) VALUES (?,?,?,?,?,?,?)",
+                    (info.get("to"), "file_get", json.dumps({"id": token, "name": name, "size": len(data), "from": device},
+                                                            ensure_ascii=False), "pending", row["channel"], row["chat_id"],
+                     int(time.time())))
+    return True, ""
+
+
+def file_download(device: str, token: str) -> Optional[tuple]:
+    """Получатель забирает файл — только тот компьютер, которому он адресован."""
+    if not re.fullmatch(r"[0-9a-f]{32}", token or ""):
+        return None
+    with closing(db()) as con:
+        rows = con.execute("SELECT arg FROM pc_commands WHERE device=? AND action='file_get' AND status IN ('sent','pending')",
+                           (device,)).fetchall()
+    for r in rows:
+        info = json.loads(r["arg"] or "{}")
+        if info.get("id") == token and (FILES_DIR / token).exists():
+            return (FILES_DIR / token).read_bytes(), info.get("name") or "файл"
+    return None
+
+
+def file_forget(arg: str) -> None:
+    """После доставки (или неудачи) — копию с сервера удаляем."""
+    try:
+        token = json.loads(arg or "{}").get("id", "")
+        if re.fullmatch(r"[0-9a-f]{32}", token):
+            (FILES_DIR / token).unlink(missing_ok=True)
+    except (ValueError, OSError) as e:
+        log.warning("Не удалил временный файл: %s", e)
+
+
+def files_cleanup(max_age: int = 3600) -> None:
+    """Подстраховка: всё, что лежит дольше часа, удаляем."""
+    if not FILES_DIR.exists():
+        return
+    now = time.time()
+    for f in FILES_DIR.iterdir():
+        try:
+            if now - f.stat().st_mtime > max_age:
+                f.unlink()
+        except OSError:
+            pass
 
 
 # Отчёт после выключения/перезагрузки/сна: компьютер сам уже не напишет — смотрим, когда он пропал из сети
@@ -2339,6 +2599,9 @@ class PcHooks:
     poll = staticmethod(pc_poll)
     result = staticmethod(pc_result)
     choose = staticmethod(pc_choose)
+    file_upload = staticmethod(file_upload)
+    file_download = staticmethod(file_download)
+    FILE_MAX = FILE_MAX_MB * 1024 * 1024
 
 
 def start_desktop_api(assistant: "Assistant"):

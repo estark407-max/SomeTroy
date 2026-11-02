@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -126,7 +126,8 @@ class Remote:
             headers["Authorization"] = f"Bearer {self.session}"
         try:
             if method == "GET":
-                r = self.s.get(self.base + path, timeout=30, verify=self.verify, headers=headers)
+                r = self.s.get(self.base + path, timeout=300 if path.startswith("/api/files/") else 30,
+                               verify=self.verify, headers=headers)
             else:
                 r = self.s.post(self.base + path, data=body, timeout=300, verify=self.verify, headers=headers)
             if r.status_code >= 400:
@@ -534,7 +535,12 @@ def pc_worker(remote: Remote) -> None:
                             def late(ok2, text2, cid=cmd["id"]):      # например, «выключение отменили на компьютере»
                                 remote.forward("POST", "/api/pc/result",
                                                jbytes({"id": cid, "ok": ok2, "text": text2, "late": True}))
-                            ok, text = pc_control.execute(cmd["action"], cmd.get("arg", ""), late)
+                            if cmd["action"] == "file_send":      # переслать файл на другой компьютер
+                                ok, text = pc_control.file_send(remote, cmd["id"], cmd.get("arg", ""))
+                            elif cmd["action"] == "file_get":     # забрать файл, присланный с другого компьютера
+                                ok, text = pc_control.file_get(remote, cmd.get("arg", ""))
+                            else:
+                                ok, text = pc_control.execute(cmd["action"], cmd.get("arg", ""), late)
                         except Exception as e:
                             log.error("Команда упала:\n%s", traceback.format_exc())
                             ok, text = False, f"ошибка: {e}"

@@ -72,6 +72,17 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             elif url.path == "/api/history":
                 after = int((parse_qs(url.query).get("after") or ["0"])[0] or 0)
                 self.reply(200, {"messages": get_history(after)})
+            elif url.path == "/api/files/get" and hasattr(pc, "file_download"):    # получатель забирает файл
+                got = pc.file_download(auth.device(self.session()) or "", (parse_qs(url.query).get("id") or [""])[0])
+                if not got:
+                    self.reply(404, {"error": "файл не найден или уже доставлен"})
+                    return
+                data, _name = got
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             elif url.path == "/api/pc/poll":         # компьютер спрашивает команды для себя
                 ver = (parse_qs(url.query).get("v") or [""])[0][:20]
                 self.reply(200, {"commands": pc.poll(auth.device(self.session()) or "компьютер", ver)})
@@ -101,6 +112,17 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             if path == "/api/logout":
                 auth.logout(self.session())
                 self.reply(200, {"ok": True})
+                return
+            if path == "/api/files/upload" and hasattr(pc, "file_upload"):        # источник отдаёт файл
+                q = parse_qs(urlparse(self.path).query)
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > pc.FILE_MAX:
+                    self.reply(413, {"error": f"файл больше {pc.FILE_MAX // 1024 // 1024} МБ"})
+                    return
+                data = self.rfile.read(length)
+                ok, err = pc.file_upload(auth.device(self.session()) or "", int((q.get("cmd") or ["0"])[0] or 0),
+                                         (q.get("name") or ["файл"])[0], data)
+                self.reply(200 if ok else 400, {"ok": ok, "error": err})
                 return
             if path == "/api/pc/result":
                 data = self.body()

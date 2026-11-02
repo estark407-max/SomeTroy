@@ -320,3 +320,114 @@ def execute(action: str, arg: str = "", report=None):
         return True, ("выключится" if action == "shutdown" else "перезагрузится") + \
             " через 60 секунд (на компьютере можно нажать «Отмена»)"
     return False, f"не знаю команду {action}"
+
+
+# ── файлы между компьютерами (до 50 МБ) ──
+FILE_MAX = 50 * 1024 * 1024
+_SKIP_DIRS = {"node_modules", ".git", "appdata", "$recycle.bin", "venv", ".venv", "__pycache__"}
+
+
+def _user_dirs() -> list:
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    one = [Path(os.environ[v]) for v in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial") if os.environ.get(v)]
+    roots = []
+    for base in [home] + one:
+        for sub in ("Desktop", "Рабочий стол", "Documents", "Документы", "Downloads", "Загрузки"):
+            p = base / sub
+            if p.is_dir() and p not in roots:
+                roots.append(p)
+    return roots
+
+
+def find_files(query: str, limit: int = 400) -> list:
+    """Файлы, в имени которых есть запрос (без учёта регистра и «ё»); свежие — первыми."""
+    q = query.strip().strip("«»\"'")
+    p = Path(os.path.expandvars(q))
+    if p.is_absolute():
+        return [p] if p.is_file() else []
+    want = norm(q).replace(" ", "")
+    words = [w for w in norm(q).split() if len(w) > 1]
+    found = []
+    for root in _user_dirs():
+        for dirpath, dirnames, filenames in os.walk(root):
+            if len(Path(dirpath).relative_to(root).parts) >= 3:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS and not d.startswith(".")]
+            for fname in filenames:
+                n = norm(fname)
+                if want in n.replace(" ", "") or (words and all(w in n for w in words)):
+                    found.append(Path(dirpath) / fname)
+                    if len(found) >= limit:
+                        break
+    exact = [f for f in found if norm(f.name) == norm(q) or norm(f.stem) == norm(q)]
+    return sorted(exact or found, key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True)
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1024 / 1024:.1f} МБ" if n >= 100 * 1024 else f"{max(1, n // 1024)} КБ"
+
+
+def file_send(remote, cmd_id: int, arg: str):
+    """Найти файл и отдать серверу — он передаст его на другой компьютер."""
+    import json
+    from urllib.parse import quote
+    info = json.loads(arg or "{}")
+    q, to = info.get("q", ""), info.get("to", "другой компьютер")
+    files = find_files(q)
+    if not files:
+        return False, (f"не нашёл файл «{q}» на рабочем столе, в Документах и Загрузках. "
+                       "Скажи имя точнее или полный путь (например D:\\Работа\\отчёт.xlsx)")
+    names = list(dict.fromkeys(f.name for f in files))
+    if len(names) > 1 and norm(names[0]) not in (norm(q), norm(Path(q).stem)):
+        return False, f"нашёл несколько файлов «{q}»: " + ", ".join(names[:6]) + ". Какой переслать?"
+    f = files[0]
+    size = f.stat().st_size
+    if size > FILE_MAX:
+        return False, f"«{f.name}» весит {_mb(size)} — пересылаю файлы только до 50 МБ"
+    code, body = remote.forward("POST", f"/api/files/upload?cmd={cmd_id}&name={quote(f.name)}", f.read_bytes())
+    if code != 200:
+        try:
+            why = json.loads(body).get("error", "")
+        except ValueError:
+            why = ""
+        return False, f"не смог передать «{f.name}»: {why or 'код ' + str(code)}"
+    return True, f"отдал «{f.name}» ({_mb(size)}) для {to}"
+
+
+def _downloads() -> Path:
+    try:                                    # настоящая папка «Загрузки», даже если её перенесли на другой диск
+        import ctypes
+        from ctypes import wintypes
+        import uuid
+        g = uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")
+        buf = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(ctypes.create_string_buffer(g.bytes_le, 16)), 0, None,
+                                                      ctypes.byref(buf)) == 0:
+            path = Path(buf.value)
+            ctypes.windll.ole32.CoTaskMemFree(buf)
+            return path
+    except Exception:
+        pass
+    return Path(os.environ.get("USERPROFILE") or Path.home()) / "Downloads"
+
+
+def file_get(remote, arg: str):
+    """Забрать файл с сервера и положить в «Загрузки\\Трой» (одноимённые не затираем)."""
+    import json
+    info = json.loads(arg or "{}")
+    name, src = info.get("name") or "файл", info.get("from") or "другого компьютера"
+    code, data = remote.forward("GET", f"/api/files/get?id={info.get('id', '')}")
+    if code != 200:
+        return False, f"не смог забрать «{name}» с сервера (код {code})"
+    folder = _downloads() / "Трой"
+    folder.mkdir(parents=True, exist_ok=True)
+    target, n = folder / name, 1
+    while target.exists():
+        target = folder / f"{Path(name).stem} ({n}){Path(name).suffix}"
+        n += 1
+    target.write_bytes(data)
+    try:                                    # открыть папку с выделенным файлом — видно, что пришло
+        subprocess.Popen(["explorer.exe", "/select,", str(target)], creationflags=NO_WINDOW)
+    except OSError:
+        pass
+    return True, f"📄 получил «{target.name}» ({_mb(len(data))}) с {src} → {target.parent}"

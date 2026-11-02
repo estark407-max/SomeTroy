@@ -1276,3 +1276,95 @@ class Connections:
                 err = str(e)
             lines.append(("✅ " if not err else "❌ ") + c["title"] + ("" if not err else f": {err}"))
         return lines
+
+
+# ═════════════════════════ Текст не в той раскладке ═════════════════════════
+# «ghbdtn» → «привет», «jnrhjq ntktuhfv» → «открой телеграм»; и обратно — «ызщешан» → «spotify».
+
+_EN = "`qwertyuiop[]asdfghjkl;'zxcvbnm,."
+_RU = "ёйцукенгшщзхъфывапролджэячсмитьбю"
+_EN2RU = {**dict(zip(_EN, _RU)), **dict(zip(_EN.upper().replace("[", "{").replace("]", "}").replace(";", ":")
+                                             .replace("'", '"').replace(",", "<").replace(".", ">").replace("`", "~"),
+                                             _RU.upper()))}
+_RU2EN = {v: k for k, v in _EN2RU.items()}
+_RU_BI = set("""ст но то на ен ов ни ра во ко ро ер ал по ре ли пр ет ол ан ле от ел ва ка не ор ос де ит ла од ти та ве ть ак
+ри тр ск ом ес ой ем ат ин ло ез ид ды ым ам ие мо ми ма ую ня ег ив ая ог за ик ки ко лю ий ых ах им ию ши че че ше уж же ту
+ру ду ну му лу су ку бо бы ми ди си зи ви ри сл се со сь ся чт ег ее ие ле ме не пе ре те фо он ей ев ял ям яв бе ба ги го гр
+да до др ду ел ен ер ет жд жи за зд зн иг из ил ис ич кр кт ла ли ло лс мн мы на не ни но об од ок ол ом оп ор ос от оч пи пл
+по пр пу ра ре ри ро ры са св се сп ст су сы та те ти то ту тя уд уп ус уч хо цы ча чи шк ща щи эт юб юч яз яз ыв ых ьн ьс ьк
+ющ ящ ой ий ый ое ые ая ую юю ть ст ич ик ам ям ом ем им ым ах ях ов ев""".split())
+_EN_BI = set("""th he in er an re on at en nd ti es or te of ed is it al ar st to nt ng se ha as ou io le ve co me de hi ri ro ic
+ne ea ra ce li ch ll be ma si om ur ca el ta la ns di fo ho pe ec pr no ct us ac ot il tr ly nc et ut ss so rs un lo wa ge ie
+wh ee wi em ad ol rt po we na ul ni ts mo ow pa im mi ai sh ir su id os iv ia am fi ci vi pl ig tu ev ld ry mp fe bl ab gh ty
+op wo sa ay ex ke fr oo av ag if ap gr od bo sp rd do uc bu ei ov by rm ep tt oc fa ef cu rn sc gi da yo cr cl du ga qu ue ff
+ba ey ls va um pp ua up lu go ht ru ug ds lt pi rc rr eg au ck ew mu br bi pt ak pu ui rg ib tl ny ki rk ys ob mm fu ph og ms
+ye ud mb ip ub oi rl gu dr hr cc tw ft wn nu af hu nn eo vo rv nf xp gn sm fl iz ok nl my gl aw ju oa eq sy sl ps jo lf nv je
+nk kn gs dy hy ze ks xt bs ik dd cy rp sk xi oe oy ws lv dl rf eu dg wr xa yi nm eb rb tm xc eh tc gy ja hn yp za""".split())
+# Частые русские слова — из них добираем русские пары букв (чтобы «звук», «ферме» не сочли ошибкой раскладки)
+_RU_WORDS = """привет пока спасибо пожалуйста да нет хорошо ладно как дела что где когда почему зачем сколько кто какой
+открой закрой включи выключи запусти поставь сделай напомни найди покажи скажи напиши отправь позвони прочитай запиши
+звук громкость тише громче музыку музыка песню трек паузу дальше назад следующий компьютер ноутбук экран свет лампу ферму
+ферме ферма дом дома работа работу завтра сегодня вчера утром вечером ночью неделю месяц год время часов минут через
+телеграм браузер почту письмо файл папку документ фото картинку видео погода курс доллар евро рубль такси маршрут адрес
+задачи задачу сделки встречу календарь событие идея идеи проект проекты котел котла температура давление влажность
+мне тебе нам вам его её их меня тебя себя мой твой наш ваш свой этот тот весь всё все очень уже еще ещё только тоже также
+можно нужно надо хочу могу может будет было есть был была были буду будешь сейчас потом теперь тогда здесь там туда сюда
+человек люди друг брат сестра мама папа жена муж сын дочь ребенок деньги цена купить продать заказ доставка курьер приедет
+кухня спальня зал гостиная коридор ванная туалет окно дверь шторы кондиционер обогреватель чайник пылесос телевизор розетка
+проводник диск диске рабочий каталог перекинь перешли скинь забери файлы второй первый третий быстро срочно спокойной ночи
+доброе утро добрый день вечер""".split()
+_RU_BI |= {w[i:i + 2] for w in _RU_WORDS for i in range(len(w) - 1)}
+# Латинские названия, которые часто набирают русскими буквами («ызщешан» → spotify)
+_EN_NAMES = set("""spotify chrome telegram steam discord youtube google word excel zoom skype whatsapp viber opera firefox
+notepad yandex outlook photoshop obs aimp winamp rekordbox edge paint teams slack notion github figma vlc netflix twitch
+windows office powerpoint teamviewer anydesk bitrix explorer total commander utorrent qbittorrent""".split())
+_SKIP = re.compile(r"[\d/@:_\\#&=%]|^https?|www\.")
+
+
+def _score(word: str, bigrams: set) -> float:
+    w = word.lower()
+    pairs = [w[i:i + 2] for i in range(len(w) - 1)]
+    return sum(p in bigrams for p in pairs) / len(pairs) if pairs else 0.0
+
+
+def _layout_word(tok: str) -> str:
+    """Одно слово: если в своей раскладке оно бессмысленно, а в другой — похоже на слово, меняем."""
+    core, tail = re.match(r"^(.*?)([!?.,]*)$", tok).groups()
+    if len(core) < 3 or _SKIP.search(core):
+        return tok
+    if all(c.lower() in _EN or c.lower() in _EN.upper() or c in _EN2RU for c in core):        # латиница → русский?
+        ru = "".join(_EN2RU.get(c, c) for c in core)
+        en_s, ru_s = _score(core, _EN_BI), _score(ru, _RU_BI)
+        no_vowel = not re.search(r"[aeiouy]", core, re.I)
+        if ru_s >= 0.5 and (ru_s - en_s >= 0.3 or (no_vowel and len(core) >= 4)):
+            return ru + tail
+    elif re.fullmatch(r"[а-яё]+", core, re.I) and len(core) >= 3:                 # русскими буквами — латинское название
+        en = "".join(_RU2EN.get(c, c) for c in core)
+        if en.lower() in _EN_NAMES:
+            return en + tail
+    return tok
+
+
+_SHIFT_RU = {"&": "?", "?": ",", "^": ":", "$": ";", "@": '"', "#": "№", "/": "."}
+
+
+def fix_layout(text: str) -> str:
+    """Исправить слова, набранные не в той раскладке. Команды (/…), ссылки, коды и голосовые не трогаем.
+    Если почти всё сообщение набрано латиницей вместо русского — переводим и короткие слова («d» → «в»)."""
+    t = text or ""
+    if not t.strip() or t.lstrip().startswith(("/", "[")) or len(t) > 1000:   # команды, голосовые, файлы, длинные тексты
+        return t
+    toks = re.findall(r"\S+", t)
+    fixed = [_layout_word(x) for x in toks]
+    latin = [i for i, x in enumerate(toks) if re.search(r"[a-z]", x, re.I) and not _SKIP.search(x.rstrip("&?"))]
+    changed = [i for i in latin if fixed[i] != toks[i] and re.search(r"[а-яё]", fixed[i], re.I)]
+    if changed and not re.search(r"[а-яё]", t, re.I):   # всё сообщение — русский в английской раскладке
+        for i in latin:
+            if i in changed or not re.fullmatch(r"[a-z`\[\];',.&?^$@#/{}:\"<>~]+", toks[i], re.I):
+                continue
+            core = toks[i].rstrip("&?.,!")
+            ru = "".join(_EN2RU.get(c, _SHIFT_RU.get(c, c)) for c in toks[i])
+            if len(core) <= 2 or _score(ru.rstrip("?.,!"), _RU_BI) >= _score(core, _EN_BI) - 0.25:
+                fixed[i] = ru
+    it = iter(fixed)
+    return re.sub(r"\S+", lambda m: next(it), t)
