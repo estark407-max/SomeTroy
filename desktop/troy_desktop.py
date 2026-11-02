@@ -172,8 +172,8 @@ def cert_check(base: str) -> str:
     except Exception:
         issuer = ""
     if issuer.strip() == "Troy":
-        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти «Трой — обновить и починить сервер» "
-                "из меню Пуск — он заберёт свежий сертификат с сервера.")
+        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Нажми ⓘ «О программе» → «🛠 Обновить и починить сервер» "
+                "— он заберёт свежий сертификат с сервера.")
     return (f"\n   Вместо сертификата сервера приходит чужой: «{issuer or 'неизвестный'}». Так делает антивирус или прокси, "
             "который проверяет защищённые соединения. Добавь в нём исключение для программы SomeTroy.exe или для адреса "
             f"{host} (в Касперском: Настройки → Сетевые параметры → Проверка защищённых соединений → Исключения).")
@@ -204,7 +204,7 @@ def server_outdated(remote: "Remote") -> str:
     num = lambda v: tuple(int(x) for x in v.split(".") if x.isdigit())
     if want and num(have) < num(want):
         return (f"Трой на сервере старее программы ({'старая версия' if have == '0' else have} → {want}): новые возможности "
-                "не заработают. Обнови его: Пуск → «Трой — обновить и починить сервер» (попросит пароль сервера).")
+                "не заработают. Обнови его: ⓘ «О программе» → «🛠 Обновить и починить сервер» (попросит пароль сервера).")
     return ""
 
 
@@ -536,6 +536,12 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes({"n": HOTKEY_HITS["n"], "down": HOTKEY_HITS["down"]}))
             elif path == "/settings":
                 self.send(200, jbytes(load_settings()))
+            elif path == "/server/repair":
+                cfg_ = load_config()
+                self.send(200, jbytes({**REPAIR, "mode": cfg_.get("mode") or ("vps" if cfg_.get("server") else ""),
+                                       "host": remote.base.split("://", 1)[-1].split(":")[0],
+                                       "outdated": _with_timeout(lambda: server_outdated(remote), 6, "")
+                                       if "full=1" in (url.query or "") and remote.logged_in and REPAIR["state"] != "run" else ""}))
             elif path == "/update/check":
                 self.send(200, jbytes(check_update()))
             elif path == "/update/status":
@@ -610,6 +616,16 @@ def make_handler(remote: Remote, key: str):
                 return
             if path == "/logout":
                 remote.logout()
+                self.send(200, b"{}")
+                return
+            if path == "/server/repair":                 # пароль сервера — только сюда (127.0.0.1), не в чат и не в нейросеть
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                if REPAIR["state"] != "run":
+                    threading.Thread(target=repair_server, args=(remote, str(data.get("address") or ""),
+                                                                 str(data.get("password") or "")), daemon=True).start()
                 self.send(200, b"{}")
                 return
             if path == "/update/install":
@@ -705,6 +721,7 @@ WHATS_NEW = [
  {
   "version": "0.5.0",
   "added": [
+   "«🛠 Обновить и починить сервер» — прямо в программе (ⓘ «О программе» и меню у часов): Трой на сервере обновится до версии программы, порт и сертификат проверятся. Нужен только пароль сервера.",
    "«Проверить обновления» в «О программе»: как только выходит новая версия, Трой предложит поставить её прямо из программы — без поиска установщика.",
    "Отчёт об ошибке со скриншотом: «Снимок окна Троя» или своя картинка. На GitHub скриншот вставляется через Ctrl+V.",
    "«Сохранить в файл» — отчёт архивом, если нет аккаунта GitHub: его можно просто переслать разработчику.",
@@ -1250,6 +1267,87 @@ def move_to_vps(values: dict) -> tuple:
                   + "\n\nКопия данных осталась на этом компьютере.")
 
 
+# ── «Обновить и починить сервер» прямо из программы: тот же сценарий, что в fix-connection.bat, но без консоли ──
+REPAIR = {"state": "", "log": [], "error": ""}
+
+
+def _repair_script() -> str:
+    """Серверная часть сценария — берём из fix-connection.bat, чтобы обе дороги делали одно и то же."""
+    for bat in (APP_DIR / "tools" / "fix-connection.bat", APP_DIR.parent / "tools" / "fix-connection.bat"):
+        if bat.exists():
+            t = bat.read_text(encoding="utf-8")
+            return t[t.rfind("#SERVER-SCRIPT#"):].replace("\r", "")
+    raise RuntimeError("не нашёл tools\\fix-connection.bat рядом с программой — переустанови Троя")
+
+
+def repair_server(remote: "Remote", address: str, password: str) -> None:
+    """Обновить Троя на сервере до версии программы, открыть порт 443, обновить сертификат, переключить программу."""
+    import paramiko
+    import setup_wizard
+    say = lambda t: (REPAIR["log"].append(t), log.info("Сервер: %s", t))
+    REPAIR.update(state="run", log=[], error="")
+    try:
+        host = remote.base.split("://", 1)[-1].split(":")[0]
+        ip, user, ssh_port = setup_wizard.parse_vps_address(address or host) or (host, "root", 22)
+        script = _repair_script()
+        cli = paramiko.SSHClient()
+        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        say(f"Подключаюсь к {ip}…")
+        try:
+            cli.connect(ip, port=ssh_port, username=user, password=password, timeout=20, look_for_keys=False,
+                        allow_agent=False, banner_timeout=20, auth_timeout=20)
+        except paramiko.AuthenticationException:
+            raise RuntimeError(f"сервер не принял пароль пользователя {user}")
+        try:
+            cli.exec_command("rm -rf /tmp/troyfix && mkdir -p /tmp/troyfix")[1].channel.recv_exit_status()
+            sftp = cli.open_sftp()
+            for name in ("bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt"):
+                with sftp.open(f"/tmp/troyfix/{name}", "wb") as f:
+                    f.write((SERVER_SRC / name).read_bytes().replace(b"\r\n", b"\n"))
+            with sftp.open("/tmp/troyfix/fix.sh", "wb") as f:
+                f.write(script.encode("utf-8"))
+            say(f"Обновляю Троя на сервере до {bundled_server_version()} — это займёт до пары минут…")
+            _in, out, _err = cli.exec_command(f"bash /tmp/troyfix/fix.sh {ip} 2>&1", timeout=900)
+            text = []
+            in_cert = False
+            for raw in iter(out.readline, ""):
+                for line in raw.splitlines():
+                    line = line.rstrip()
+                    text.append(line)
+                    in_cert = (in_cert or line == "CERT-BEGIN") and line != "CERT-END"
+                    if line and not in_cert and line not in ("CERT-END", "TROY_OK"):
+                        say(line)
+        finally:
+            cli.close()
+        full = "\n".join(text)
+        if "NOTROY" in full:
+            raise RuntimeError("Трой на этом сервере не найден (/opt/sometroy) — проверь адрес")
+        if "BUSY443" in full:
+            raise RuntimeError("порт 443 на сервере занят другой программой — открой порт 8443 в панели хостинга")
+        if "TROY_OK" not in full:
+            raise RuntimeError("Трой на сервере не запустился — строки выше пригодятся разработчику")
+        m = re.search(r"CERT-BEGIN\s*(-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----)", full, re.S)
+        if not setup_wizard.tcp_open(ip, 443):
+            raise RuntimeError("Трой на сервере обновлён, но порт 443 закрыт в панели хостинга — открой его (TCP) и повтори")
+        if m:
+            (DATA_DIR / "troy-cert.pem").write_text(m.group(1) + "\n", encoding="utf-8")
+        cfg = load_config()
+        cfg.update(mode="vps", server=f"https://{ip}:443")
+        (DATA_DIR / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        if CONFIG != DATA_DIR / "config.json" and CONFIG.exists():   # старая раскладка: настройки рядом с программой
+            try:
+                CONFIG.write_text(json.dumps(cfg), encoding="utf-8")
+            except OSError:
+                pass
+        say("✅ Готово: Трой на сервере обновлён, связь настроена. Программа перезапустится через пару секунд.")
+        REPAIR["state"] = "done"
+        if APP_HOOKS["restart"]:
+            threading.Timer(3, APP_HOOKS["restart"]).start()
+    except Exception as e:
+        REPAIR.update(state="error", error=str(e))
+        log.warning("Обновление сервера: %s", e)
+
+
 def show_diag() -> None:
     """Из трея: открыть окно и сразу показать диагностику."""
     hwnd = find_window() if window_open() else None
@@ -1257,6 +1355,14 @@ def show_diag() -> None:
         close_window()
         time.sleep(0.8)
     open_window(APP_URL + "?diag=1")
+
+
+def show_repair() -> None:
+    """Из трея: открыть окно и сразу «Обновить и починить сервер»."""
+    if window_open():
+        close_window()
+        time.sleep(0.8)
+    open_window(APP_URL + "?repair=1")
 
 
 def restart_program() -> None:
@@ -1328,6 +1434,8 @@ def main():
         pystray.MenuItem("Открыть Троя", lambda icon, item: show_window(), default=True),
         pystray.MenuItem("О программе", on_about),
         pystray.MenuItem("Диагностика", lambda icon, item: show_diag()),
+        pystray.MenuItem("Обновить и починить сервер", lambda icon, item: show_repair(),
+                         visible=lambda item: load_config().get("mode") != "local"),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Выйти из аккаунта", on_logout, enabled=lambda item: remote.logged_in),
         pystray.MenuItem("Закрыть Троя", on_close),

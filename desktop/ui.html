@@ -305,6 +305,12 @@ textarea::placeholder { color: var(--muted); }
 .about-copy { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .about-pop .bug-btn + .bug-btn { margin-top: 8px; }
 .wn-card .wn-notes { font-size: 14px; line-height: 1.5; }
+.wn-card label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); margin-top: 12px; }
+.wn-card input { border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 10px; padding: 9px 11px; font: inherit; }
+.wn-card pre.wn-log { white-space: pre-wrap; font: 12.5px/1.45 ui-monospace, Consolas, monospace; background: var(--chip); border-radius: 10px;
+  padding: 10px; margin: 12px 0 0; max-height: 220px; overflow: auto; }
+.wn-card pre.wn-log:empty { display: none; }
+.msg.info .box button { margin-left: 8px; border: 0; border-radius: 8px; padding: 4px 10px; background: var(--accent); color: #fff; cursor: pointer; font: inherit; font-size: 13px; }
 .wn-card .wn-row { display: flex; gap: 8px; margin-top: 18px; }
 .wn-card .wn-row button { margin-top: 0; }
 .wn-card .wn-row button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
@@ -509,6 +515,7 @@ THEME_DARK.addEventListener("change", applyTheme);
     <div class="about-authors">Авторы: <b>Claude</b> и <b>Egor Zhidetskiy</b></div>
     <div class="about-copy">© 2026 Claude и Egor Zhidetskiy</div>
     <button class="bug-btn" id="upd-btn">🔄 Проверить обновления</button>
+    <button class="bug-btn" id="repair-btn" hidden>🛠 Обновить и починить сервер</button>
     <button class="bug-btn" id="bug-btn">🐞 Сообщить об ошибке</button>
   </div>
   </div>
@@ -1019,6 +1026,43 @@ async function showWhatsNew() {
   m.onclick = (e) => { if (e.target === m) close(); };
   document.body.appendChild(m);
 }
+// ── «Обновить и починить сервер»: пароль сервера вводится только здесь и уходит в программу на этом компьютере ──
+async function openRepair() {
+  $("about-pop")?.classList.remove("show");
+  if ($("repair-modal")) return;
+  const info = await fetch(BASE + "/server/repair?full=1").then((r) => r.json()).catch(() => ({}));
+  const m = document.createElement("div"); m.id = "repair-modal"; m.className = "wn-modal show";
+  m.innerHTML = `<div class="wn-card" role="dialog">
+    <div class="wn-head"><img src="favicon.png" alt=""><div><h3>Обновить и починить сервер</h3>
+      <div class="wn-sub">Трой на сервере обновится до версии этой программы, порт и сертификат — проверятся</div></div></div>
+    ${info.outdated ? `<div class="wn-sub" style="margin-top:8px">⚠️ ${esc(info.outdated)}</div>` : ""}
+    <form>
+      <label>Сервер<input name="address" value="${esc(info.host || "")}" placeholder="IP-адрес, имя@IP или IP:порт SSH"></label>
+      <label>Пароль сервера (root)<input name="password" type="password" autocomplete="off"></label>
+      <div class="wn-sub" style="margin-top:8px">Пароль нужен только сейчас, никуда не сохраняется и в чат не попадает.</div>
+      <pre class="wn-log"></pre><div class="wn-sub" data-a="st"></div>
+      <div class="wn-row"><button type="submit">Обновить</button><button type="button" class="ghost" data-a="close">Закрыть</button></div>
+    </form></div>`;
+  document.body.appendChild(m);
+  const form = m.querySelector("form"), logEl = m.querySelector(".wn-log"), st = m.querySelector('[data-a="st"]');
+  m.querySelector('[data-a="close"]').onclick = () => m.remove();
+  form.password.focus();
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (!form.password.value) { form.password.focus(); return; }
+    const btn = form.querySelector('button[type="submit"]'); btn.disabled = true;
+    await fetch(BASE + "/server/repair", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: form.address.value.trim(), password: form.password.value }) });
+    form.password.value = "";
+    const t = setInterval(async () => {
+      let r; try { r = await fetch(BASE + "/server/repair").then((x) => x.json()); } catch (e) { return; }   // перезапуск
+      logEl.textContent = (r.log || []).join("\n"); logEl.scrollTop = logEl.scrollHeight;
+      if (r.state === "error") { st.textContent = "⚠️ " + r.error; btn.disabled = false; clearInterval(t); }
+      if (r.state === "done") { st.textContent = "Перезапускаюсь…"; clearInterval(t); }
+    }, 800);
+  };
+}
+
 // ── обновления с GitHub ──
 async function checkUpdate(quiet) {
   $("about-pop")?.classList.remove("show");
@@ -1064,10 +1108,23 @@ async function boot() {
     setStatus(true, "на связи");
   } catch (e) {
     if (loginShown) return;
-    setStatus(false, "нет связи"); flash("Не удалось подключиться к серверу: " + e.message); setTimeout(boot, 10000); return;
+    setStatus(false, "нет связи"); flash("Не удалось подключиться к серверу: " + e.message); setTimeout(boot, 10000);
+    if (!$("repair-btn").hidden && !$("repair-offer")) {     // Трой на сервере — предлагаем починить связь
+      const el = document.createElement("div"); el.className = "msg info"; el.id = "repair-offer";
+      el.innerHTML = `<div class="box">Нет связи с Троем на сервере. Можно обновить его и проверить порт и сертификат. <button type="button">Починить</button></div>`;
+      el.querySelector("button").onclick = openRepair; feed.appendChild(el); toBottom();
+    }
+    return;
   }
   clearInterval(pollTimer); pollTimer = setInterval(poll, 4000);
   showWhatsNew();
+  fetch(BASE + "/server/repair?full=1").then((r) => r.json()).then((r) => {
+    if (r.outdated) {                                     // Трой на сервере старее программы — предлагаем обновить
+      const el = document.createElement("div"); el.className = "msg info";
+      el.innerHTML = `<div class="box">⚠️ ${esc(r.outdated.split(":")[0])}. <button type="button">Обновить сервер</button></div>`;
+      el.querySelector("button").onclick = openRepair; feed.appendChild(el); toBottom();
+    }
+  }).catch(() => {});
   let last = 0; try { last = +localStorage.getItem("troy-upd-check") || 0; } catch (e) {}
   if (Date.now() - last > 6 * 3600 * 1000) setTimeout(() => checkUpdate(true), 4000);   // не чаще раза в 6 часов
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
@@ -1289,6 +1346,7 @@ function openBugReport() {
 }
 $("bug-btn").onclick = (e) => { e.stopPropagation(); openBugReport(); };
 $("upd-btn").onclick = (e) => { e.stopPropagation(); checkUpdate(false); };
+$("repair-btn").onclick = (e) => { e.stopPropagation(); openRepair(); };
 $("about-pop").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("help-modal")?.classList.contains("show")) $("conn-modal")?.classList.remove("show"); });
 
@@ -1377,9 +1435,13 @@ $("logout").onclick = async () => {
 
 (async () => {
   const s = await fetch(BASE + "/session").then((r) => r.json()).catch(() => ({ logged_in: false }));
+  await fetch(BASE + "/server/repair").then((r) => r.json()).then((r) => { if (r.mode && r.mode !== "local") $("repair-btn").hidden = false; }).catch(() => {});
   if (s.setup) { startWizard(); return; }
   if (s.logged_in) {
     await boot();
+    if (new URLSearchParams(location.search).get("repair") === "1") {      // «Обновить и починить сервер» из трея
+      history.replaceState(null, "", location.pathname); openRepair();
+    }
     if (new URLSearchParams(location.search).get("diag") === "1") {        // «Диагностика» из трея
       history.replaceState(null, "", location.pathname);
       input.value = "/diag"; autosize(); send();
