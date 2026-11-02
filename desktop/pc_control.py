@@ -164,8 +164,29 @@ def start_apps() -> dict:
     return apps
 
 
+_DRIVE_RU = {"д": "D", "ц": "C", "с": "C", "е": "E", "ф": "F", "г": "G", "а": "A", "б": "B", "и": "I"}
+
+
+def open_explorer(name: str):
+    """«Проводник», «проводник на диске D», «открой диск Д» — всегда Проводник Windows (не Internet Explorer)."""
+    m = re.search(r"\bдиск\w*\s+([a-zа-я])\b|\b([a-z]):\\?", norm(name))
+    letter = (m.group(1) or m.group(2)) if m else ""
+    letter = _DRIVE_RU.get(letter, letter).upper()
+    if letter and os.path.exists(f"{letter}:\\"):
+        subprocess.Popen(["explorer.exe", f"{letter}:\\"], creationflags=NO_WINDOW)
+        return True, f"открыл Проводник на диске {letter}"
+    subprocess.Popen(["explorer.exe"], creationflags=NO_WINDOW)
+    return True, "открыл Проводник" + (f" (диска {letter} нет)" if letter else "")
+
+
 def open_app(name: str):
     q = canon(name)
+    if q == "explorer" or re.search(r"\bпроводник|\bexplorer\b(?<!internet explorer)|^диск\w*\s+[a-zа-я]\b", norm(name)) \
+            and "internet" not in norm(name):
+        try:
+            return open_explorer(name)
+        except OSError as e:
+            return False, f"не смог открыть Проводник: {e}"
     apps = start_apps()
     hit = best_match(q, apps) or best_match(norm(name), apps)   # и по словарю, и как сказали («Калькулятор»)
     try:
