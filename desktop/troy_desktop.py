@@ -147,6 +147,32 @@ class Remote:
 WIZARD = {"w": None, "restart": None}      # мастер первой настройки, пока он идёт
 
 
+def port_check(base: str) -> str:
+    """Почему не достучались до сервера: порт закрыт (Трой там не запущен) или ответа нет вовсе (файрвол, сервер выключен)."""
+    import socket
+    host, _, port = base.split("://", 1)[-1].rstrip("/").partition(":")
+    port = int(port or 443)
+    try:
+        socket.create_connection((host, 22), timeout=6).close()
+        server_up = True
+    except OSError:
+        server_up = False
+    try:
+        socket.create_connection((host, port), timeout=8).close()
+        return " Порт отвечает — похоже, связь только что восстановилась; повтори /diag."
+    except ConnectionRefusedError:
+        return (f"\n   Сервер на связи, но на порту {port} никто не отвечает — служба Троя там не запущена или упала. "
+                "Зайди на сервер и посмотри: systemctl status sometroy и journalctl -u sometroy -n 50 "
+                "(или пришли это разработчикам: /bug).")
+    except OSError:
+        if server_up:
+            return (f"\n   Сервер на связи (SSH отвечает), а порт {port} молчит — скорее всего, его закрывает файрвол "
+                    f"хостинга. Открой в панели управления сервером входящий порт {port} (TCP). "
+                    "Telegram при этом работает и без него.")
+        return ("\n   Сервер не отвечает совсем: выключен, неверный адрес или нет интернета на этом компьютере. "
+                "Проверь сервер в панели хостинга.")
+
+
 def app_diagnostics(remote: "Remote") -> str:
     """/diag в программе: сначала проверки этого компьютера, потом — отчёт самого Троя."""
     cfg = load_config()
@@ -172,8 +198,8 @@ def app_diagnostics(remote: "Remote") -> str:
             why = json.loads(body).get("error", "")
         except ValueError:
             why = ""
-        lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}. Проверь интернет; если Трой на сервере — "
-                     "что сервер включён и порт открыт.")
+        lines.append(f"❌ Связи с Троем нет: {why or 'код ' + str(code)}." + (port_check(remote.base) if mode != "local"
+                     else " Перезапусти программу."))
     lines.append(("✅" if find_browser() else "⚠️") + " Окно: " + ("Edge/Chrome найден" if find_browser()
                  else "Edge и Chrome не найдены — окно откроется в браузере по умолчанию"))
     hk = load_settings().get("hotkey")
