@@ -1,7 +1,7 @@
 ﻿; Установщик программы «Трой» (Inno Setup 6). Собирается из build.bat.
 
 #define AppName "Трой"
-#define AppVersion "0.1.0"
+#define AppVersion "0.3.0"
 #define AppExe "SomeTroy.exe"
 
 [Setup]
@@ -101,9 +101,11 @@ end;
 Source: "dist\SomeTroy\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "troy-cert.pem"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\tools\fix-connection.bat"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#AppName} — починить связь с сервером"; Filename: "{app}\tools\fix-connection.bat"; WorkingDir: "{app}\tools"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--tray"; WorkingDir: "{app}"; Tasks: autostart
 

@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -172,8 +172,8 @@ def cert_check(base: str) -> str:
     except Exception:
         issuer = ""
     if issuer.strip() == "Troy":
-        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти tools\\fix-connection.bat "
-                "из папки SomeTroy — он заберёт свежий сертификат с сервера.")
+        return ("\n   На сервере другой сертификат Троя (его создали заново при переустановке). Запусти «Трой — починить связь с сервером» "
+                "из меню Пуск — он заберёт свежий сертификат с сервера.")
     return (f"\n   Вместо сертификата сервера приходит чужой: «{issuer or 'неизвестный'}». Так делает антивирус или прокси, "
             "который проверяет защищённые соединения. Добавь в нём исключение для программы SomeTroy.exe или для адреса "
             f"{host} (в Касперском: Настройки → Сетевые параметры → Проверка защищённых соединений → Исключения).")
