@@ -136,7 +136,8 @@ def settings_text(template: str, values: dict) -> str:
 SERVER_FILES = ["bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt", "install.sh", "uninstall.sh"]
 
 
-def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path, say: Callable[[str], None]) -> dict:
+def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path, say: Callable[[str], None],
+                ssh_port: int = 22) -> dict:
     """Ставит Троя на сервер. Возвращает {"ok", "port", "cert", "error", "log"}."""
     import paramiko
     out_lines: List[str] = []
@@ -152,10 +153,10 @@ def install_vps(ip: str, user: str, password: str, settings: str, src_dir: Path,
         return o.channel.recv_exit_status(), text
 
     try:
-        cli.connect(ip, username=user, password=password, timeout=20, look_for_keys=False, allow_agent=False,
+        cli.connect(ip, port=ssh_port, username=user, password=password, timeout=20, look_for_keys=False, allow_agent=False,
                     banner_timeout=20, auth_timeout=20)
     except paramiko.AuthenticationException:
-        return {"ok": False, "error": "Сервер не принял логин или пароль."}
+        return {"ok": False, "error": f"Сервер не принял пароль пользователя {user}."}
     except (socket.error, paramiko.SSHException) as e:
         return {"ok": False, "error": f"Не подключился к серверу {ip}: {e}"}
     try:
@@ -229,6 +230,7 @@ def server_reachable(ip: str, port: int, cert_path: Path) -> bool:
 
 # ───────────────────────── сценарий ─────────────────────────
 
+CHANGE_IP = "Изменить IP или пользователя"
 SKIP_TG = "Пропустить — пока только в программе"
 SKIP_LATER = "Пропустить — подключу потом"
 DONE_LATER = "Готово, остальное потом"
@@ -458,8 +460,12 @@ class Wizard:
     def _after_extras(self, prefix: str = ""):
         if self.mode == "local":
             return self._finish_local(prefix)
+        return [self._ask_ip(prefix + "Теперь сервер — нужны только его IP-адрес и пароль.\n\n")]
+
+    def _ask_ip(self, prefix: str = ""):
         self.state = "vps_ip"
-        return [msg(prefix + "Теперь данные сервера. IP-адрес (например 203.0.113.10):", placeholder="IP-адрес")]
+        return msg(prefix + "IP-адрес сервера (например 203.0.113.10). Он есть в письме или панели хостинга.",
+                   placeholder="IP-адрес")
 
     def _later_text(self) -> str:
         """Что можно подключить потом — чтобы человек знал, где это искать."""
@@ -496,23 +502,28 @@ class Wizard:
                     "тогда я всегда на связи, пока компьютер включён.", done=True)]
 
     def s_vps_ip(self, t: str):
-        if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", t):
+        # обычно просто IP; кому нужно — «имя@IP» или «IP:порт» (как в письме хостинга: ssh root@1.2.3.4 -p 2222)
+        t = re.sub(r"^ssh\s+", "", t.strip(), flags=re.I)
+        m = re.fullmatch(r"(?:([\w.-]+)@)?(\d{1,3}(?:\.\d{1,3}){3})(?:(?::|\s+-p\s*)(\d{1,5}))?", t)
+        if not m or any(int(x) > 255 for x in m.group(2).split(".")):
             return [msg("Нужен IP-адрес из четырёх чисел через точку, например 203.0.113.10.", placeholder="IP-адрес")]
-        self.vps["ip"] = t
-        self.state = "vps_user"
-        return [msg("Пользователь на сервере — обычно root.", ["root"], placeholder="Пользователь")]
+        self.vps.update(ip=m.group(2), user=m.group(1) or "root", ssh_port=int(m.group(3) or 22))
+        return [self._ask_vps_pass()]
 
-    def s_vps_user(self, t: str):
-        self.vps["user"] = t or "root"
+    def _ask_vps_pass(self, prefix: str = ""):
         self.state = "vps_pass"
-        return [msg("Пароль сервера. Он нужен только сейчас, чтобы меня установить, "
-                    "и нигде не сохраняется.", secret=True, placeholder="Пароль сервера")]
+        who = "" if self.vps["user"] == "root" else f" (пользователь {self.vps['user']})"
+        return msg(prefix + f"Пароль сервера{who}. Он нужен только сейчас, чтобы меня установить, и нигде не сохраняется.",
+                   [CHANGE_IP], secret=True, placeholder="Пароль сервера")
 
     def s_vps_pass(self, t: str):
+        if t == CHANGE_IP:
+            return [self._ask_ip("Хорошо. Если хостинг выдал не root, а другое имя — напиши так: имя@IP.\n\n")]
         progress: List[str] = []
         password_holder["pw"] = self.password
         try:
-            res = install_vps(self.vps["ip"], self.vps["user"], t, self._settings(), self.src_dir, progress.append)
+            res = install_vps(self.vps["ip"], self.vps["user"], t, self._settings(), self.src_dir, progress.append,
+                              self.vps.get("ssh_port", 22))
         finally:
             password_holder["pw"] = ""
         out = [msg(p) for p in progress]
@@ -521,7 +532,10 @@ class Wizard:
             tail = f"\n\nПоследние строки установки:\n{res['log']}" if res.get("log") else ""
             again = ("Попробуй пароль ещё раз." if self.state == "vps_pass"
                      else "Напиши IP-адрес ещё раз, когда исправишь.")
-            return out + [msg(f"⚠️ {res['error']}{tail}\n\n{again}", secret=self.state == "vps_pass")]
+            if self.state == "vps_pass":
+                return out + [self._ask_vps_pass(f"⚠️ {res['error']}{tail}\n\nПопробуй пароль ещё раз. Если вход "
+                                                 "не под root — нажми «Изменить IP или пользователя».\n\n")]
+            return out + [msg(f"⚠️ {res['error']}{tail}\n\n{again}")]
         self.vps.update(port=res["port"], cert=res["cert"])
         self.finish_vps({"ip": self.vps["ip"], "port": res["port"], "cert": res["cert"], "password": self.password})
         cert_path = self.data_dir / "troy-cert.pem"
@@ -702,13 +716,14 @@ IP-адрес — четыре числа через точку, наприме�
 Где найти: в данных для доступа к серверу или в панели управления сервером (поле IP, IPv4 или «Адрес»).
 
 Нужен сервер на **Ubuntu** (22.04 или 24.04) или **Debian**.
-"""),
-    "vps_user": ("Пользователь сервера", """
-Почти всегда это **root** — просто нажми кнопку. Другое имя нужно, только если хостинг выдал
-пользователя с правами администратора под другим именем.
+
+Обычно хватает одного IP — пользователь root и порт 22 подставятся сами. Если хостинг выдал другое:
+- другое имя пользователя — напиши **имя@IP**, например admin@203.0.113.10;
+- другой порт SSH — **IP:порт**, например 203.0.113.10:2222.
+Можно вставить и строку из письма хостинга целиком, вида ssh root@203.0.113.10 -p 2222.
 """),
     "vps_pass": ("Пароль сервера", """
-Пароль пользователя root — тот, с которым ты входишь на сервер.
+Пароль от сервера — тот, что прислал хостинг (обычно для пользователя root).
 
 Что произойдёт дальше (1–3 минуты):
 - Трой подключится к серверу, установит себя в папку /opt/sometroy и запустит как службу;
