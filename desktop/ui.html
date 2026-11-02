@@ -387,6 +387,13 @@ textarea::placeholder { color: var(--muted); }
   .empty { margin-top: 6vh; }
   .empty h2 { font-size: 20px; }
 }
+@media (max-width: 640px) {
+  header { gap: 4px; padding-left: 10px; padding-right: 10px; }
+  .icon-btn { width: 30px; }
+  .win-btn { width: 34px; }
+  .win-ctl { margin-left: 2px; padding-left: 4px; }
+}
+@media (max-width: 560px) { .status #status-text { display: none; } }
 @media (max-width: 420px) {
   .status #status-text { display: none; }
   .chip { font-size: 12.5px; padding: 6px 10px; }
@@ -1602,7 +1609,7 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
     if (e.button === 0) { e.preventDefault(); win("drag", { edge: g.dataset.edge }); }
   }));
   addEventListener("resize", () => setTimeout(state, 150));
-  state(); setTimeout(state, 1500); setTimeout(state, 4000);
+  state(); setTimeout(state, 1500); setInterval(state, 4000);
 })();
 </script>
 </body>

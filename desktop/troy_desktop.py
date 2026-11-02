@@ -550,7 +550,7 @@ def make_handler(remote: Remote, key: str):
             elif path == "/win":                         # окно без системной полосы: развёрнуто ли
                 import window_frame
                 hwnd = find_window() if os.name == "nt" else None
-                self.send(200, jbytes({"frameless": bool(hwnd) and window_frame.STATE["enabled"],
+                self.send(200, jbytes({"frameless": window_frame.STATE["enabled"] and window_frame.frameless(hwnd),
                                        "max": window_frame.is_max(hwnd)}))
             elif path == "/tabs":                        # вкладки сайтов в шапке
                 import site_tabs
@@ -937,7 +937,8 @@ def find_window():
         return True
 
     user32.EnumWindows(cb, 0)
-    return found[0] if found else None
+    visible = [h for h in found if user32.IsWindowVisible(h)]     # служебные окна Edge с тем же заголовком — мимо
+    return (visible or found or [None])[0]
 
 
 def window_open() -> bool:
