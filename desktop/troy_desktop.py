@@ -597,6 +597,23 @@ def make_handler(remote: Remote, key: str):
                 msgs = w.start() if data.get("action") == "start" else w.handle(str(data.get("text") or ""))
                 self.send(200, jbytes({"messages": msgs}))
                 return
+            if path == "/micsettings":                      # «Открыть настройки микрофона» (Windows)
+                try:
+                    os.startfile("ms-settings:privacy-microphone")
+                except Exception as e:
+                    log.warning("Настройки микрофона: %s", e)
+                self.send(200, b"{}")
+                return
+            if path == "/micinfo":                          # почему не дали микрофон — в журнал (для разбора)
+                try:
+                    info = json.loads(body or b"{}")
+                except ValueError:
+                    info = {}
+                sh = _shell()
+                log.warning("Микрофон не дали: %s %s (окно: %s, Windows %s)", info.get("name"), info.get("message"),
+                            "WebView2" if sh and sh.started() else "Edge", getattr(sys, "getwindowsversion", lambda: "?")())
+                self.send(200, b"{}")
+                return
             if path == "/savefile":                         # файл от Троя (например, переписка) → «Загрузки\\Трой»
                 import base64
                 import pc_control
@@ -787,7 +804,8 @@ WHATS_NEW = [
    "Кнопка «Повторить» у сообщений: у твоего — отправить его ещё раз, у ответа Троя — ещё раз задать вопрос, на который он отвечал."
   ],
   "fixed": [
-   "Шапка аккуратно помещается в узком окне."
+   "Шапка аккуратно помещается в узком окне.",
+   "Нет доступа к микрофону — Трой пишет, в чём дело, и даёт кнопку «Открыть настройки микрофона» Windows."
   ]
  },
  {

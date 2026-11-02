@@ -286,6 +286,7 @@ def _ui_ready(sender, args) -> None:
 
     def perm(_s, e):                                         # своей странице — микрофон и буфер обмена без вопросов
         e.State = _NET["Perm"].Allow
+        log.info("Окно: разрешаю %s (%s)", e.PermissionKind, e.Uri)
     core.PermissionRequested += _safe(perm)
 
     def new_window(_s, e):                                   # ссылки «в новом окне» из чата — в обычном браузере

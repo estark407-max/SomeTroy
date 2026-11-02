@@ -95,6 +95,8 @@ header h1 { font-size: 15px; font-weight: 600; margin: 0; }
 .status.on .dot { background: #22a35a; }
 .status.off .dot { background: var(--danger); }
 .spacer { flex: 1; }
+.box .mic-set { margin-top: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+.box .mic-set:hover { border-color: var(--accent); }
 /* окно без белой полосы Windows: кнопки окна в шапке, тянуть за шапку, растягивать за края */
 .win-ctl { display: none; align-items: center; gap: 2px; margin-left: 6px; padding-left: 8px; border-left: 1px solid var(--line); }
 body.frameless .win-ctl { display: flex; }
@@ -950,10 +952,23 @@ function tip(text) {
   document.querySelectorAll(".mic-tip").forEach((o) => o !== t && o.remove());
   setTimeout(() => t.remove(), 1800);
 }
+function micError(e) {                                  // почему нет микрофона — и кнопка в настройки Windows
+  const name = (e && e.name) || "";
+  fetch(BASE + "/micinfo", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, message: String((e && e.message) || "") }) }).catch(() => {});
+  const text = name === "NotFoundError" ? "Не вижу микрофон: он не подключён или выключен в Windows."
+    : "Windows не даёт Трою микрофон. Открой настройки микрофона и включи «Разрешить приложениям доступ к микрофону» "
+      + "и ниже — «Разрешить классическим приложениям доступ к микрофону». Потом нажми 🎤 ещё раз.";
+  $("empty")?.remove();
+  const el = document.createElement("div"); el.className = "msg error";
+  el.innerHTML = `<div class="box">${esc(text)} <small>(${esc(name || "ошибка")})</small><br><button class="mic-set">🎤 Открыть настройки микрофона</button></div>`;
+  el.querySelector("button").onclick = () => fetch(BASE + "/micsettings", { method: "POST" }).catch(() => {});
+  feed.appendChild(el); toBottom();
+}
 async function startRecording(mode) {
   if (rec || busy) return false;
   try { recStream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch { flash("Нет доступа к микрофону. Нажми 🎤 и выбери «Разрешить» в запросе вверху окна. Если запроса нет — проверь Параметры Windows → Конфиденциальность → Микрофон."); return false; }
+  catch (e) { micError(e); return false; }
   recChunks = []; rec = new MediaRecorder(recStream, { mimeType: "audio/webm" });
   rec.ondataavailable = (e) => e.data.size && recChunks.push(e.data);
   rec.onstop = async () => {
