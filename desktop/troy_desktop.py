@@ -323,6 +323,28 @@ def make_handler(remote: Remote, key: str):
                 msgs = w.start() if data.get("action") == "start" else w.handle(str(data.get("text") or ""))
                 self.send(200, jbytes({"messages": msgs}))
                 return
+            if path == "/savefile":                         # файл от Троя (например, переписка) → «Загрузки\\Трой»
+                import base64
+                import pc_control
+                try:
+                    data = json.loads(body or b"{}")
+                    name = "".join(c for c in str(data.get("name") or "Трой.txt") if c not in '\\/:*?"<>|')[:120]
+                    folder = pc_control._downloads() / "Трой"
+                    folder.mkdir(parents=True, exist_ok=True)
+                    target, n = folder / name, 1
+                    while target.exists():
+                        target = folder / f"{Path(name).stem} ({n}){Path(name).suffix}"
+                        n += 1
+                    target.write_bytes(base64.b64decode(data.get("b64") or ""))
+                    try:
+                        subprocess.Popen(["explorer.exe", "/select,", str(target)], creationflags=0x08000000)
+                    except OSError:
+                        pass
+                    self.send(200, jbytes({"path": str(target)}))
+                except Exception as e:
+                    log.error("savefile: %s", e)
+                    self.send(500, jbytes({"error": str(e)}))
+                return
             if path == "/login":
                 try:
                     password = json.loads(body or b"{}").get("password", "")

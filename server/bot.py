@@ -294,6 +294,14 @@ CREATE TABLE IF NOT EXISTS history (
     text    TEXT NOT NULL,
     ts      INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS message_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    role    TEXT NOT NULL,
+    text    TEXT NOT NULL,
+    ts      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS message_log_chat_ts ON message_log(chat_id, ts);
 """
 
 
@@ -306,6 +314,9 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     with closing(db()) as con, con:
         con.executescript(SCHEMA)
+        # журнал появился позже истории — при первом запуске переносим то, что уже есть
+        con.execute("INSERT INTO message_log(chat_id, role, text, ts) SELECT chat_id, role, text, ts FROM history "
+                    "WHERE NOT EXISTS (SELECT 1 FROM message_log) ORDER BY id")
         # старые обмены «открой X» → «Выбери компьютер.» учили модель отвечать без вызова функции — убираем их
         con.execute("DELETE FROM history WHERE id IN (SELECT h.id + 0 FROM history h WHERE h.role = 'assistant' AND "
                     "(h.text LIKE 'Выбери компьютер%' OR h.text LIKE 'Есть: %') UNION "
@@ -313,10 +324,17 @@ def init_db() -> None:
                     "(h.text LIKE 'Выбери компьютер%' OR h.text LIKE 'Есть: %'))")
 
 
+LOG_KEEP_DAYS = 365
+
+
 def add_history(chat_id: str, role: str, text: str) -> None:
     with closing(db()) as con, con:
         con.execute("INSERT INTO history(chat_id, role, text, ts) VALUES (?,?,?,?)",
                     (chat_id, role, text, int(time.time())))
+        con.execute("INSERT INTO message_log(chat_id, role, text, ts) VALUES (?,?,?,?)",
+                    (chat_id, role, text, int(time.time())))
+        if random.random() < 0.01:                      # журнал храним год
+            con.execute("DELETE FROM message_log WHERE ts < ?", (int(time.time()) - LOG_KEEP_DAYS * 86400,))
         con.execute("DELETE FROM history WHERE chat_id=? AND id NOT IN "
                     "(SELECT id FROM history WHERE chat_id=? ORDER BY id DESC LIMIT 200)", (chat_id, chat_id))
 
@@ -343,6 +361,68 @@ def get_history(chat_id: str) -> list:
         else:
             out.append({"role": role, "content": cut(text)})
     return out
+
+
+# «Сохрани переписку за неделю» — журнал сообщений файлом (в Telegram — документом, в программе — в «Загрузки\\Трой»)
+LOG_RE = re.compile(r"^(?:(?:трой|эй)[\s,!.:—-]+)?(?:сохрани|выгрузи|экспортируй|скачай|скинь|пришли|отправь|дай|сделай|"
+                    r"запиши в файл)\s+(?:мне\s+)?(?:(?:весь|всю|полный|полную)\s+)?(?:лог\w*|переписк\w*|чат|диалог|"
+                    r"истори\w*\s+(?:сообщений|переписки|чата|разговора))\b(.*)$", re.I)
+_LOG_NUM = {"один": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "десять": 10}
+
+
+def log_period(rest: str) -> tuple:
+    """(с какого времени, подпись) по словам «за сегодня», «за неделю», «за 3 дня», «за месяц»…"""
+    r = (rest or "").lower()
+    today = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+    if "сегодн" in r:
+        return today.timestamp(), "за сегодня", None
+    if "вчера" in r:
+        return (today - timedelta(days=1)).timestamp(), "за вчера", today.timestamp()
+    m = re.search(r"(\d+|" + "|".join(_LOG_NUM) + r")?\s*(час|д(?:ень|ня|ней)|сутк|недел|месяц|год)", r)
+    if m:
+        n = int(m.group(1)) if (m.group(1) or "").isdigit() else _LOG_NUM.get(m.group(1) or "", 1)
+        unit = m.group(2)
+        sec = {"час": 3600, "сутк": 86400, "недел": 7 * 86400, "месяц": 30 * 86400, "год": 365 * 86400}.get(
+            unit, 86400) * n
+        word = {"час": "ч", "сутк": "сут", "недел": "нед", "месяц": "мес", "год": "г"}.get(unit, "дн")
+        return time.time() - sec, f"за {n} {word}." if n > 1 else {"час": "за час", "сутк": "за сутки",
+               "недел": "за неделю", "месяц": "за месяц", "год": "за год"}.get(unit, "за день"), None
+    return 0, "вся сохранённая", None
+
+
+def export_log(chat_id: str, rest: str = "") -> Optional[tuple]:
+    """(имя файла, текст, сколько сообщений) или None, если за период пусто."""
+    since, label, until = log_period(rest)
+    with closing(db()) as con:
+        rows = con.execute("SELECT role, text, ts FROM message_log WHERE chat_id=? AND ts>=? AND ts<? ORDER BY id",
+                           (chat_id, int(since), int(until or time.time() + 60))).fetchall()
+    if not rows:
+        return None
+    me = USER_NAME or "Ты"
+    out = [f"Переписка — {BOT_NAME}, {label}", f"Сохранено: {now_local():%d.%m.%Y %H:%M}, сообщений: {len(rows)}", ""]
+    day = ""
+    for r in rows:
+        dt = datetime.fromtimestamp(r["ts"], TZ)
+        if f"{dt:%d.%m.%Y}" != day:
+            day = f"{dt:%d.%m.%Y}"
+            out += ["", f"── {day} ──"]
+        who = {"user": me, "pc_user": me, "assistant": BOT_NAME, "pc_reply": BOT_NAME}.get(r["role"])
+        out.append(f"{dt:%H:%M} {who}: {r['text']}" if who else f"{dt:%H:%M} 🖥 {r['text']}")
+    name = f"Трой — переписка {now_local():%Y-%m-%d %H-%M}.txt"
+    return name, "\n".join(out) + "\n", len(rows)
+
+
+def log_request(assistant, chat_id: str, text: str) -> Optional[str]:
+    """Просьба сохранить журнал — без нейросети. Файл кладём в assistant.export, канал его доставит."""
+    m = LOG_RE.match(re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I))
+    if not m:
+        return None
+    got = export_log(chat_id, m.group(1))
+    if not got:
+        return "За этот период сообщений нет."
+    name, body, n = got
+    assistant.export = (name, body.encode("utf-8"))
+    return f"🗂 Сохранил переписку: {n} сообщ. ({log_period(m.group(1))[1]})."
 
 
 def clear_history(chat_id: str) -> None:
@@ -1245,6 +1325,9 @@ class Assistant:
             self.user_text = content if isinstance(content, str) else " ".join(
                 p.get("text", "") for p in content if p.get("type") == "text")
             if isinstance(content, str):
+                saved = log_request(self, chat_id, self.user_text)
+                if saved:
+                    return saved
                 hello = mcclure(self.user_text)
                 if hello:
                     return hello
@@ -1370,6 +1453,7 @@ HELP = """Я {name}, твой помощник. Пиши текстом, гол�
 /reminders — мои напоминания
 /ideas — проекты с идеями, /ideas имя — идеи проекта
 /new — начать разговор с чистого листа
+/log — сохранить переписку файлом: /log, /log сегодня, /log неделя
 /password новый_пароль — пароль для программы на компьютере
 /devices — где открыта программа; /devices выйти — выйти везде
 /status — какие модели сейчас работают, какие на перерыве
@@ -1389,6 +1473,12 @@ class Bot:
         cmd = cmd.split("@")[0].lower()
         if cmd in ("/start", "/help"):
             self.tg.send(chat_id, HELP.format(name=BOT_NAME))
+        elif cmd == "/log":
+            self.tg.send(chat_id, log_request(self.assistant, chat_id, "сохрани переписку " + arg))
+            export = getattr(self.assistant, "export", None)
+            if export:
+                self.assistant.export = None
+                self.send_file(chat_id, *export)
         elif cmd == "/new":
             clear_history(chat_id)
             self.tg.send(chat_id, "Начали с чистого листа. Напоминания и идеи на месте.")
@@ -1575,11 +1665,22 @@ class Bot:
         add_history(chat_id, "pc_user" if pc else "user", note)
         add_history(chat_id, "pc_reply" if pc else "assistant", answer)
         self.tg.send(chat_id, answer)
+        export = getattr(self.assistant, "export", None)
+        if export:
+            self.assistant.export = None
+            self.send_file(chat_id, *export)
         choice = self.assistant.pc_choice
         if choice:
             self.tg.send(chat_id, f"Где выполнить «{choice['label']}»?", buttons=[
                 [{"text": f"🖥 {d}", "callback_data": f"pc:{choice['id']}:{i}"}] for i, d in enumerate(choice["devices"])])
             self.assistant.pc_choice = None
+
+    def send_file(self, chat_id: str, name: str, data: bytes) -> None:
+        try:
+            self.tg.call("sendDocument", data={"chat_id": chat_id}, files={"document": (name, data, "text/plain")})
+        except Exception as e:
+            log.warning("Не отправил файл: %s", e)
+            self.tg.send(chat_id, f"Не смог отправить файл: {human_error(e) if isinstance(e, requests.RequestException) else e}")
 
     def handle_callback(self, cb: dict) -> None:
         uid = str((cb.get("from") or {}).get("id", ""))
@@ -1794,6 +1895,11 @@ def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
             return "Напиши так: /apps яндекс — покажу, какие программы с этим словом видит Трой на компьютере."
         text, choice = pc_create("find_app", arg.strip(), "", "desktop", ALLOWED_USER_ID)
         return {"reply": "Выбери компьютер.", "choice": choice} if choice else "Ищу… ответ придёт отдельным сообщением."
+    if cmd == "/log":
+        reply = log_request(assistant, ALLOWED_USER_ID, "сохрани переписку " + arg)
+        export, assistant.export = getattr(assistant, "export", None), None
+        return {"reply": reply, "download": {"name": export[0], "b64": base64.b64encode(export[1]).decode()}} \
+            if export else reply
     if cmd == "/reminders":
         return list_reminders(ALLOWED_USER_ID)
     if cmd == "/new":
@@ -1867,16 +1973,19 @@ def desktop_message(assistant: "Assistant", text: str, files: Optional[list]) ->
         content = [{"type": "text", "text": joined or "Что на картинках?"}] + [
             {"type": "image_url", "image_url": {"url": f"data:{m};base64,{base64.b64encode(r).decode()}"}}
             for m, r in images]
-    choice = None
+    choice = export = None
     try:
         answer = assistant.run(chat_id, content, channel="desktop")
         choice, assistant.pc_choice = assistant.pc_choice, None
+        export, assistant.export = getattr(assistant, "export", None), None
     except LLMError as e:
         answer = (f"Бесплатные лимиты моделей сейчас исчерпаны ({e.text}). Попробуй чуть позже." if e.status == 429
                   else f"Ошибка модели: {e}")
     pc = getattr(assistant, "pc_used", False)
     add_history(chat_id, "pc_user" if pc else "user", " ".join(note))
     add_history(chat_id, "pc_reply" if pc else "assistant", answer)
+    if export:
+        return {"reply": answer, "download": {"name": export[0], "b64": base64.b64encode(export[1]).decode()}}
     return {"reply": answer, "choice": choice} if choice else answer
 
 
@@ -2781,6 +2890,7 @@ def telegram_session(assistant: "Assistant") -> None:
         {"command": "reminders", "description": "Мои напоминания"},
         {"command": "ideas", "description": "Проекты с идеями"},
         {"command": "new", "description": "Начать разговор заново"},
+        {"command": "log", "description": "Сохранить переписку файлом (/log неделя)"},
         {"command": "status", "description": "Модели: кто отвечает, кто на перерыве"},
         {"command": "connect", "description": "Подключить ещё один компьютер"},
         {"command": "diag", "description": "Диагностика: что работает и что нет"},

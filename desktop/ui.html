@@ -753,6 +753,13 @@ async function api(path, body) {
   return data;
 }
 
+async function saveDownload(d) {
+  try {
+    const r = await fetch(BASE + "/savefile", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(d) }).then((x) => x.json());
+    addBox("info", r.path ? "📁 Файл сохранён: " + r.path : "⚠️ Не получилось сохранить: " + (r.error || "ошибка"));
+  } catch (e) { flash("Не получилось сохранить файл: " + e.message); }
+}
 async function send(voice) {
   if (busy) return;
   if (wizard) { if (!voice) wizardSend(input.value.trim()); return; }
@@ -768,6 +775,7 @@ async function send(voice) {
     showTyping(false); addTroy(res.reply || "…", Date.now() / 1000); play("received");
     if (res.hist) lastHist = Math.max(lastHist, res.hist);
     if (res.choice) addPcChoice(res.choice);
+    if (res.download) saveDownload(res.download);
     if (res.copy) copyText(res.copy);
   } catch (e) {
     showTyping(false); flash("Не получилось: " + e.message);
