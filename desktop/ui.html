@@ -95,6 +95,25 @@ header h1 { font-size: 15px; font-weight: 600; margin: 0; }
 .status.on .dot { background: #22a35a; }
 .status.off .dot { background: var(--danger); }
 .spacer { flex: 1; }
+/* окно без белой полосы Windows: кнопки окна в шапке, тянуть за шапку, растягивать за края */
+.win-ctl { display: none; align-items: center; gap: 2px; margin-left: 6px; padding-left: 8px; border-left: 1px solid var(--line); }
+body.frameless .win-ctl { display: flex; }
+body.frameless header { padding-top: 6px; padding-bottom: 6px; padding-right: 8px; cursor: default; user-select: none; }
+.win-btn { border: 0; background: transparent; width: 40px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+  cursor: pointer; color: var(--muted); }
+.win-btn:hover { background: var(--accent-soft); color: var(--text); }
+.win-btn.close:hover { background: var(--danger); color: #fff; }
+.win-btn svg { width: 14px; height: 14px; }
+.grip { position: fixed; z-index: 9999; display: none; }
+body.frameless:not(.maxed) .grip { display: block; }
+.grip.n { top: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.grip.s { bottom: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.grip.w { left: 0; top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.grip.e { right: 0; top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.grip.nw, .grip.ne, .grip.sw, .grip.se { width: 10px; height: 10px; }
+.grip.nw { top: 0; left: 0; cursor: nwse-resize; } .grip.se { bottom: 0; right: 0; cursor: nwse-resize; }
+.grip.ne { top: 0; right: 0; cursor: nesw-resize; } .grip.sw { bottom: 0; left: 0; cursor: nesw-resize; }
+body.frameless:not(.maxed) { border: 1px solid var(--line); }
 .icon-btn {
   border: 0; background: transparent; width: 34px; height: 34px; border-radius: 9px;
   display: grid; place-items: center; cursor: pointer; color: var(--muted);
@@ -533,7 +552,14 @@ THEME_DARK.addEventListener("change", applyTheme);
   <button class="icon-btn" id="to-bottom" title="К последним сообщениям">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
   </button>
+  <div class="win-ctl">
+    <button class="win-btn" data-win="min" title="Свернуть"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 7h10"/></svg></button>
+    <button class="win-btn" data-win="max" id="win-max" title="Развернуть"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="9" height="9" rx="1"/></svg></button>
+    <button class="win-btn close" data-win="close" title="Закрыть окно (Трой останется в трее)"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 3l8 8M11 3l-8 8"/></svg></button>
+  </div>
 </header>
+<div class="grip n" data-edge="n"></div><div class="grip s" data-edge="s"></div><div class="grip w" data-edge="w"></div><div class="grip e" data-edge="e"></div>
+<div class="grip nw" data-edge="nw"></div><div class="grip ne" data-edge="ne"></div><div class="grip sw" data-edge="sw"></div><div class="grip se" data-edge="se"></div>
 <nav class="tabs" id="tabs" hidden></nav>
 
 <main id="scroller">
@@ -1541,6 +1567,43 @@ document.addEventListener("click", (e) => {
   if (!e.target.closest("#theme-pop") && !e.target.closest("#theme-btn")) $("theme-pop").classList.remove("show");
 }, true);
 THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.contains("show")) drawTheme(); });
+</script>
+<script>
+/* окно без белой полосы Windows */
+(() => {
+  const ICON_MAX = '<rect x="2.5" y="2.5" width="9" height="9" rx="1"/>';
+  const ICON_RESTORE = '<rect x="2.5" y="4.5" width="7" height="7" rx="1"/><path d="M4.5 4.5V3.5a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-1"/>';
+  const win = (action, extra) => fetch(BASE + "/win", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...(extra || {}) }) }).then(r => r.json()).then(paint).catch(() => {});
+  function paint(st) {
+    if (!st) return;
+    if ("frameless" in st) document.body.classList.toggle("frameless", !!st.frameless);
+    document.body.classList.toggle("maxed", !!st.max);
+    const b = document.getElementById("win-max");
+    b.title = st.max ? "Вернуть обычный размер" : "Развернуть";
+    b.querySelector("svg").innerHTML = st.max ? ICON_RESTORE : ICON_MAX;
+    if (typeof tabsTop === "function" && !document.getElementById("tabs").hidden)   // шапка стала ниже — сайт подвинуть
+      fetch(BASE + "/tabs/layout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ top: tabsTop() }) }).catch(() => {});
+  }
+  const state = () => fetch(BASE + "/win").then(r => r.json()).then(paint).catch(() => {});
+  document.querySelectorAll(".win-btn").forEach(b => b.addEventListener("click", () => win(b.dataset.win)));
+  const passive = "button, a, input, textarea, select, label, [contenteditable], .snd-menu, .status, .tab";
+  for (const zone of [document.querySelector("header"), document.getElementById("tabs")]) {
+    zone.addEventListener("mousedown", e => {
+      if (e.button !== 0 || e.detail > 1 || !document.body.classList.contains("frameless") || e.target.closest(passive)) return;
+      win("drag");
+    });
+    zone.addEventListener("dblclick", e => {
+      if (!document.body.classList.contains("frameless") || e.target.closest(passive)) return;
+      win("max");
+    });
+  }
+  document.querySelectorAll(".grip").forEach(g => g.addEventListener("mousedown", e => {
+    if (e.button === 0) { e.preventDefault(); win("drag", { edge: g.dataset.edge }); }
+  }));
+  addEventListener("resize", () => setTimeout(state, 150));
+  state(); setTimeout(state, 1500); setTimeout(state, 4000);
+})();
 </script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 
 #define AppName "Troy"
 #ifndef AppVersion
-#define AppVersion "0.5.2"
+#define AppVersion "0.5.3"
 #endif
 #define AppExe "SomeTroy.exe"
 

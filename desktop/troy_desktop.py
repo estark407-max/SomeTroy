@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -547,6 +547,11 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes(check_update()))
             elif path == "/update/status":
                 self.send(200, jbytes(UPD))
+            elif path == "/win":                         # окно без системной полосы: развёрнуто ли
+                import window_frame
+                hwnd = find_window() if os.name == "nt" else None
+                self.send(200, jbytes({"frameless": bool(hwnd) and window_frame.STATE["enabled"],
+                                       "max": window_frame.is_max(hwnd)}))
             elif path == "/tabs":                        # вкладки сайтов в шапке
                 import site_tabs
                 self.send(200, jbytes({"tabs": site_tabs.listing()}))
@@ -636,6 +641,25 @@ def make_handler(remote: Remote, key: str):
                 if UPD["state"] not in ("download", "install"):
                     threading.Thread(target=install_update, daemon=True).start()
                 self.send(200, b"{}")
+                return
+            if path == "/win":                           # кнопки окна в шапке Троя: свернуть, развернуть, закрыть, тянуть
+                import window_frame
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                hwnd = find_window() if os.name == "nt" else None
+                act = str(data.get("action") or "")
+                if hwnd:
+                    if act == "min":
+                        window_frame.minimize(hwnd)
+                    elif act == "max":
+                        window_frame.toggle_max(hwnd)
+                    elif act == "drag":
+                        window_frame.drag(hwnd, str(data.get("edge") or ""))
+                    elif act == "close":
+                        threading.Thread(target=close_window, daemon=True).start()
+                self.send(200, jbytes({"max": window_frame.is_max(hwnd)}))
                 return
             if path in ("/tabs/show", "/tabs/close", "/tabs/layout"):
                 import site_tabs
@@ -737,6 +761,13 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 
 WHATS_NEW = [
+ {
+  "version": "0.5.3",
+  "added": [
+   "Окно в едином дизайне: белой полосы Windows сверху больше нет. Кнопки «свернуть / развернуть / закрыть» — справа в шапке Троя. Окно перетаскивается за шапку, разворачивается двойным щелчком по ней и растягивается за края."
+  ],
+  "fixed": []
+ },
  {
   "version": "0.5.2",
   "added": [
@@ -849,7 +880,8 @@ def remember_window() -> None:
             hwnd = find_window() if window_open() else None
             if hwnd and not user32.IsIconic(hwnd):
                 old = load_settings().get("window") or {}
-                if user32.IsZoomed(hwnd):
+                import window_frame
+                if user32.IsZoomed(hwnd) or window_frame.is_max(hwnd):
                     new = {**old, "max": True}
                 else:
                     r = wintypes.RECT()
@@ -1510,6 +1542,9 @@ def main():
         threading.Thread(target=pc_worker, args=(remote,), daemon=True).start()
         threading.Thread(target=server_check_loop, args=(remote, icon), daemon=True).start()
         threading.Thread(target=remember_window, daemon=True).start()
+        if os.name == "nt":                     # окно без белой полосы Windows — кнопки окна в шапке Троя
+            import window_frame
+            window_frame.keep(find_window)
         hk = load_settings().get("hotkey")
         if hk and not apply_hotkey(hk)[0]:
             icon.notify(f"Горячая клавиша {hk.get('label', '')} занята другой программой — назначь другую.", WINDOW_TITLE)
