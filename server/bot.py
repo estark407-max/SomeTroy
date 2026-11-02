@@ -42,7 +42,7 @@ import desktop_api
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
 # указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
-SERVER_VERSION = "0.4.1"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
+SERVER_VERSION = "0.5.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
 BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
 load_dotenv(BASE / "settings.env", override=True)
 LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
@@ -1361,6 +1361,22 @@ class Assistant:
         if getattr(self, "channel", "") != "desktop" and SITE_HINT_RE.search(self.user_text or "") and re.match(
                 r"^(?:\[голосовое\]\s*)?(?:трой[,\s]+)?(?:открой|зайди|перейди)\b", (self.user_text or "").strip(), re.I):
             return "🌐 Сайты я открываю в программе Трой на компьютере — попроси там, и я открою окно браузера."
+        m = re.match(r"^(?:\[голосовое\]\s*)?(?:трой[,\s]+)?(?:открой|зайди на|перейди на)\s+(?:сайт\s+)?"
+                     r"((?:https?://)?[\w.-]+\.(?:ru|com|org|net|io|me|su|рф|info|tv|online|site|to)(?:/\S*)?)"
+                     r"(?:\s+(напрямую|через сервер))?\s*[.!]*$", (self.user_text or "").strip(), re.I)
+        if m and getattr(self, "channel", "") == "desktop":       # «открой ya.ru» — адрес уже есть, нейросеть не нужна
+            self.pc_used = True
+            text = self.open_site(chat_id, m.group(1), "server" if (m.group(2) or "").lower() == "через сервер"
+                                  else "direct" if m.group(2) else "")
+            if text.startswith("НЕ ОТКРЫТО"):
+                host = re.sub(r"^https?://", "", m.group(1)).split("/")[0]
+                return f"Как открыть {host}: напрямую с компьютера или через сервер (как VPN — сайт увидит адрес сервера)?"
+            host = re.sub(r"^https?://", "", m.group(1)).split("/")[0]
+            if self.pc_choice:
+                return "Выбери компьютер."
+            if "отправлена" not in text:
+                return text
+            return f"Открываю {host} — {'через сервер' if 'через сервер' in text else 'напрямую'}."
         pend = getattr(self, "pending_site", {}).get(chat_id)
         if pend and time.time() - pend[1] < 600:     # ответ на «напрямую или через сервер?»
             mode = "server" if SITE_SERVER_RE.match(self.user_text.strip()) else \
@@ -2733,6 +2749,8 @@ def pc_result(device: str, cmd_id: int, ok: bool, text: str, late: bool = False)
     if row["action"] == "file_send" and ok:                # источник отдал файл — ждём получателя, без лишних сообщений
         add_history(row["chat_id"], "pc_result", f"{device}: {text}")
         return
+    if not ok and row["action"] == "open_app" and "не нашёл программу" in text and row["channel"] == "desktop":
+        text += f". Если это сайт — скажи «открой сайт {row['arg']}»"
     pc_notify(row["channel"], row["chat_id"], f"{'✅' if ok else '⚠️'} {device}: {text}")
     add_history(row["chat_id"], "pc_result", f"{device}: {'выполнено' if ok else 'не получилось'} — {text}")
     if ok and row["action"] in ("shutdown", "restart", "sleep"):

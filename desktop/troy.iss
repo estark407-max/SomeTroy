@@ -2,7 +2,7 @@
 
 #define AppName "Трой"
 #ifndef AppVersion
-#define AppVersion "0.4.1"
+#define AppVersion "0.5.0"
 #endif
 #define AppExe "SomeTroy.exe"
 
@@ -24,7 +24,7 @@ SetupIconFile=troy.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName} — личный ассистент
 WizardStyle=modern
-VersionInfoVersion=0.1.0
+VersionInfoVersion={#AppVersion}
 VersionInfoCompany=Claude и Egor Zhidetskiy
 VersionInfoCopyright=© 2026 Claude и Egor Zhidetskiy
 VersionInfoDescription=Установщик Троя
@@ -113,6 +113,8 @@ Name: "{userstartup}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "--tr
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Открыть Троя"; Flags: nowait postinstall skipifsilent
+; обновление из самой программы ставится тихо — после него Трой запускается сам
+Filename: "{app}\{#AppExe}"; Flags: nowait skipifnotsilent
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"

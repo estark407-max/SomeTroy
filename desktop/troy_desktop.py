@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -314,31 +314,178 @@ def scrub(text: str) -> str:
     return text
 
 
+# ── обновления: новая версия на GitHub (Releases) → скачать и поставить прямо из программы ──
+RELEASES_API = "https://api.github.com/repos/estark407-max/SomeTroy/releases/latest"
+UPD = {"state": "", "done": 0, "total": 0, "error": "", "version": ""}
+
+
+def check_update() -> dict:
+    """Есть ли на GitHub версия новее этой программы. Без ключей и входа — публичная страница релизов."""
+    try:
+        r = requests.get(RELEASES_API, timeout=15, headers={"Accept": "application/vnd.github+json",
+                                                              "User-Agent": f"SomeTroy/{APP_VERSION}"})
+    except requests.RequestException as e:
+        return {"current": APP_VERSION, "error": f"нет связи с GitHub: {e.__class__.__name__}"}
+    if r.status_code == 404:
+        return {"current": APP_VERSION, "newer": False, "latest": APP_VERSION}       # релизов ещё нет
+    if r.status_code != 200:
+        return {"current": APP_VERSION, "error": f"GitHub ответил {r.status_code}"}
+    rel = r.json()
+    latest = str(rel.get("tag_name") or "").lstrip("vV")
+    asset = next((a for a in rel.get("assets", []) if re.match(r"SomeTroySetup.*\.exe$", a.get("name", ""), re.I)), None)
+    return {"current": APP_VERSION, "latest": latest, "newer": bool(asset) and _vnum(latest) > _vnum(APP_VERSION),
+            "notes": (rel.get("body") or "")[:4000], "url": asset["browser_download_url"] if asset else "",
+            "size": asset.get("size", 0) if asset else 0, "name": asset["name"] if asset else ""}
+
+
+def install_update() -> None:
+    """Скачать установщик новой версии и поставить его тихо; после установки Трой запустится сам."""
+    import tempfile
+    info = check_update()
+    if not info.get("newer"):
+        UPD.update(state="error", error=info.get("error") or "новой версии нет")
+        return
+    UPD.update(state="download", done=0, total=info["size"], error="", version=info["latest"])
+    target = Path(tempfile.gettempdir()) / info["name"]
+    try:
+        with requests.get(info["url"], stream=True, timeout=60, headers={"User-Agent": f"SomeTroy/{APP_VERSION}"}) as r:
+            r.raise_for_status()
+            with open(target, "wb") as f:
+                for chunk in r.iter_content(256 * 1024):
+                    f.write(chunk)
+                    UPD["done"] += len(chunk)
+        if info["size"] and target.stat().st_size != info["size"]:
+            raise OSError("файл скачался не полностью")
+    except (requests.RequestException, OSError) as e:
+        UPD.update(state="error", error=f"не скачалось: {e}")
+        return
+    UPD["state"] = "install"
+    log.info("Ставлю обновление %s", info["latest"])
+    subprocess.Popen([str(target), "/SP-", "/SILENT", "/NOCANCEL", "/SUPPRESSMSGBOXES"],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # установщик сам закроет Троя
+
+
+BUG = {"shot": b""}                  # скриншот к отчёту (PNG), пока окно отчёта открыто
+
+
+def _with_timeout(fn, seconds: float, fallback):
+    """Медленную проверку не ждём бесконечно: отчёт должен собираться за секунды, а не минуты."""
+    box = {}
+    t = threading.Thread(target=lambda: box.setdefault("v", fn()), daemon=True)
+    t.start()
+    t.join(seconds)
+    return box.get("v", fallback)
+
+
+def bug_details(remote: "Remote") -> str:
+    """Подробности для разработчика: версии, система, режим, журнал программы и диагностика Троя."""
+    import platform
+    cfg = load_config()
+    mode = cfg.get("mode") or ("сервер" if cfg.get("server") else "не настроена")
+    lines = [f"Программа: SomeTroy {APP_VERSION} (код сервера в программе: {bundled_server_version() or '?'})",
+             f"Windows: {platform.release()} {platform.version()} ({platform.machine()}), "
+             f"Python {platform.python_version()}, {'собранная программа' if getattr(sys, 'frozen', False) else 'из исходников'}",
+             f"Режим: {'на этом компьютере' if mode == 'local' else 'сервер ' + str(remote.base)}",
+             f"Браузер для окна: {'Edge/Chrome найден' if find_browser() else 'не найден'}; "
+             f"тема: {load_settings().get('theme', 'по умолчанию')}"]
+    code, body = _with_timeout(lambda: remote._send("GET", "/api/ping"), 8, (0, b""))
+    try:
+        ping = json.loads(body) if code == 200 else {}
+    except ValueError:
+        ping = {}
+    lines.append(f"Связь с Троем: {'есть' if code == 200 else 'нет (код ' + str(code) + ')'}"
+                 + (f", Трой на сервере {ping.get('version') or 'старой версии'}" if code == 200 and mode != "local" else ""))
+    try:                                            # хвост журнала программы — самое полезное при разборе
+        tail = LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+    except OSError:
+        tail = []
+    if tail:
+        lines += ["", "Журнал программы (последние строки):"] + tail
+    if code == 200:
+        c2, b2 = _with_timeout(lambda: remote.forward("POST", "/api/message", jbytes({"text": "/diag"})), 20, (0, b""))
+        try:
+            reply = json.loads(b2).get("reply") if c2 == 200 else ""
+        except ValueError:
+            reply = ""
+        lines += ["", reply or f"(диагностика Троя не пришла за 20 с, код {c2})"]
+    return scrub("\n".join(lines))
+
+
 def bug_report(remote: "Remote", text: str) -> dict:
     """Текст для GitHub Issues + ссылка «новая задача» с ним. Ссылка не длиннее ~7500 символов:
-    если диагностика не влезает — обрезаем её, а полный отчёт программа кладёт в буфер обмена."""
+    если подробности не влезают — обрезаем, а полный отчёт программа сохраняет в файл."""
     from urllib.parse import quote
     text = (text or "").strip()
     first = re.sub(r"\s+", " ", text.splitlines()[0] if text else "")[:80]
     title = "Ошибка: " + (first or "без описания")
     try:
-        diag = scrub(app_diagnostics(remote))
+        diag = bug_details(remote)
     except Exception as e:
-        diag = f"(диагностика не собралась: {e})"
-    import platform
-    head = (f"**Что случилось**\n{text or '(не описано)'}\n\n"
-            f"**Версия:** SomeTroy {APP_VERSION}, Windows {platform.release()} ({platform.version()})\n\n")
+        diag = f"(подробности не собрались: {e})"
+    head = (f"**Что случилось**\n{text or '(не описано)'}\n\n**Версия:** SomeTroy {APP_VERSION}\n\n"
+            + ("**Скриншот:** вставьте сюда — он уже в буфере обмена (Ctrl+V)\n\n" if BUG["shot"] else ""))
 
     def body_with(d: str) -> str:
-        return head + "<details><summary>Диагностика</summary>\n\n```\n" + d + "\n```\n</details>\n"
+        return head + "<details><summary>Подробности для разработчика</summary>\n\n```\n" + d + "\n```\n</details>\n"
 
     full = body_with(diag)
     url = lambda b: f"{BUG_REPO}/issues/new?labels=bug&title={quote(title)}&body={quote(b)}"
     d, trimmed = diag, False
     while len(url(body_with(d))) > 7500 and len(d) > 200:
         d, trimmed = d[: int(len(d) * 0.8)], True
-    body = body_with(d + ("\n… (обрезано — полный отчёт в буфере обмена, вставь сюда Ctrl+V)" if trimmed else ""))
+    body = body_with(d + ("\n… (обрезано — полный отчёт сохранён в файл, приложите его к задаче)" if trimmed else ""))
     return {"url": url(body), "full": full, "trimmed": trimmed, "title": title}
+
+
+def bug_shot_window() -> bytes:
+    """Снимок окна Троя (PNG). Окно отчёта при этом видно — это нормально, главное, что видно и чат."""
+    import ctypes
+    import io
+    from ctypes import wintypes
+    from PIL import ImageGrab
+    hwnd = find_window()
+    if not hwnd:
+        raise RuntimeError("окно Троя не найдено")
+    r = wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom), all_screens=True)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def image_to_clipboard(png: bytes) -> bool:
+    """Скриншот — в буфер обмена: на странице GitHub его вставляют в задачу через Ctrl+V."""
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(png)
+        ps = ("Add-Type -AssemblyName System.Windows.Forms, System.Drawing; "
+              f"$i = [System.Drawing.Image]::FromFile('{f.name}'); [System.Windows.Forms.Clipboard]::SetImage($i); $i.Dispose()")
+        subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps], timeout=20,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except Exception as e:
+        log.warning("Скриншот в буфер: %s", e)
+        return False
+
+
+def bug_save(rep_: dict) -> str:
+    """Отчёт файлом (без GitHub): архив с описанием, скриншотом и журналом — в «Загрузки\\Трой»."""
+    import zipfile
+    import pc_control
+    folder = pc_control._downloads() / "Трой"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"SomeTroy — отчёт об ошибке {time.strftime('%Y-%m-%d %H-%M')}.zip"
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("отчёт.md", rep_["full"])
+        if BUG["shot"]:
+            z.writestr("скриншот.png", BUG["shot"])
+    try:
+        subprocess.Popen(["explorer.exe", "/select,", str(target)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        pass
+    return str(target)
 
 
 def make_handler(remote: Remote, key: str):
@@ -389,6 +536,10 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes({"n": HOTKEY_HITS["n"], "down": HOTKEY_HITS["down"]}))
             elif path == "/settings":
                 self.send(200, jbytes(load_settings()))
+            elif path == "/update/check":
+                self.send(200, jbytes(check_update()))
+            elif path == "/update/status":
+                self.send(200, jbytes(UPD))
             elif path == "/whatsnew":
                 self.send(200, jbytes(whats_new()))
             elif path == "/version":
@@ -461,6 +612,11 @@ def make_handler(remote: Remote, key: str):
                 remote.logout()
                 self.send(200, b"{}")
                 return
+            if path == "/update/install":
+                if UPD["state"] not in ("download", "install"):
+                    threading.Thread(target=install_update, daemon=True).start()
+                self.send(200, b"{}")
+                return
             if path == "/whatsnew/seen":
                 save_settings(seen_version=APP_VERSION)
                 self.send(200, b"{}")
@@ -473,14 +629,35 @@ def make_handler(remote: Remote, key: str):
                 ok, err = set_hotkey(data.get("hotkey"))
                 self.send(200 if ok else 400, jbytes({"ok": ok, "error": err, **load_settings()}))
                 return
-            if path == "/bugreport":                       # окно «Сообщить об ошибке»
+            if path in ("/bugreport", "/bugshot"):           # окно «Сообщить об ошибке»
                 try:
                     data = json.loads(body or b"{}")
                 except ValueError:
                     data = {}
+                if path == "/bugshot":                  # скриншот: снимок окна Троя, свой файл или убрать
+                    import base64
+                    try:
+                        if data.get("clear"):
+                            BUG["shot"] = b""
+                        elif data.get("b64"):
+                            BUG["shot"] = base64.b64decode(data["b64"])[:15 * 1024 * 1024]
+                        else:
+                            BUG["shot"] = bug_shot_window()
+                        self.send(200, jbytes({"ok": True, "size": len(BUG["shot"]),
+                                               "preview": base64.b64encode(BUG["shot"]).decode() if BUG["shot"] else ""}))
+                    except Exception as e:
+                        self.send(200, jbytes({"ok": False, "error": str(e)}))
+                    return
                 rep_ = bug_report(remote, str(data.get("text") or ""))
-                if data.get("open"):
+                action = data.get("action") or ("open" if data.get("open") else "")
+                if action == "open":
+                    if BUG["shot"]:
+                        rep_["shot_in_clipboard"] = image_to_clipboard(BUG["shot"])
+                    if rep_["trimmed"] or BUG["shot"]:
+                        rep_["saved"] = bug_save(rep_)
                     webbrowser.open(rep_["url"])
+                elif action == "save":
+                    rep_["saved"] = bug_save(rep_)
                 self.send(200, jbytes(rep_))
                 return
             if path in ("/api/pc/choose", "/api/connections", "/api/connections/remove"):
@@ -525,6 +702,19 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 
 WHATS_NEW = [
+ {
+  "version": "0.5.0",
+  "added": [
+   "«Проверить обновления» в «О программе»: как только выходит новая версия, Трой предложит поставить её прямо из программы — без поиска установщика.",
+   "Отчёт об ошибке со скриншотом: «Снимок окна Троя» или своя картинка. На GitHub скриншот вставляется через Ctrl+V.",
+   "«Сохранить в файл» — отчёт архивом, если нет аккаунта GitHub: его можно просто переслать разработчику.",
+   "«Открой ya.ru» — сайт с адресом открывается сразу, без раздумий нейросети."
+  ],
+  "fixed": [
+   "Отчёт об ошибке больше не зависает: собирается за секунды и подробнее — с журналом программы и версией Троя на сервере.",
+   "Если Трой не нашёл программу с таким названием, он подскажет: «если это сайт — скажи „открой сайт …“»."
+  ]
+ },
  {
   "version": "0.4.1",
   "added": [

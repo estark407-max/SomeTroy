@@ -303,6 +303,13 @@ textarea::placeholder { color: var(--muted); }
 .about-epi { font-style: italic; font-size: 12.5px; line-height: 1.5; color: var(--text); border-left: 3px solid var(--accent);
   padding: 6px 0 6px 10px; margin: 4px 0 12px; }
 .about-copy { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.about-pop .bug-btn + .bug-btn { margin-top: 8px; }
+.wn-card .wn-notes { font-size: 14px; line-height: 1.5; }
+.wn-card .wn-row { display: flex; gap: 8px; margin-top: 18px; }
+.wn-card .wn-row button { margin-top: 0; }
+.wn-card .wn-row button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+.wn-card .wn-progress { height: 6px; border-radius: 3px; background: var(--chip); overflow: hidden; margin-top: 14px; }
+.wn-card .wn-progress div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .about-pop .bug-btn { display: block; width: 100%; margin-top: 12px; text-align: center; border: 1px solid var(--line);
   border-radius: 9px; padding: 7px; background: var(--surface); color: var(--text); font-size: 13.5px; cursor: pointer; }
 .about-pop .bug-btn::before { content: none; }
@@ -316,6 +323,10 @@ textarea::placeholder { color: var(--muted); }
   padding: 7px 12px; cursor: pointer; font-size: 13.5px; }
 .bug-form button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .bug-form button:disabled { opacity: .5; cursor: default; }
+.bug-shot { position: relative; display: inline-block; max-width: 220px; }
+.bug-shot[hidden] { display: none; }
+.bug-shot img { max-width: 220px; max-height: 140px; border-radius: 8px; border: 1px solid var(--line); display: block; }
+.bug-shot button { position: absolute; top: 4px; right: 4px; border-radius: 50%; width: 24px; height: 24px; padding: 0; line-height: 1; }
 .hk-title { font-weight: 600; margin-bottom: 4px; }
 .hk-desc { color: var(--muted); font-size: 12.5px; margin-bottom: 12px; line-height: 1.45; }
 .hk-cur { font-family: ui-monospace, Consolas, monospace; background: var(--chip); border-radius: 8px; padding: 8px 10px;
@@ -497,6 +508,7 @@ THEME_DARK.addEventListener("change", applyTheme);
     <div class="about-epi">«Сей модуль является симбиозом дружеского взаимодействия лысого бородатого человека и сверхумной, но очень приятной машины»</div>
     <div class="about-authors">Авторы: <b>Claude</b> и <b>Egor Zhidetskiy</b></div>
     <div class="about-copy">© 2026 Claude и Egor Zhidetskiy</div>
+    <button class="bug-btn" id="upd-btn">🔄 Проверить обновления</button>
     <button class="bug-btn" id="bug-btn">🐞 Сообщить об ошибке</button>
   </div>
   </div>
@@ -1007,6 +1019,37 @@ async function showWhatsNew() {
   m.onclick = (e) => { if (e.target === m) close(); };
   document.body.appendChild(m);
 }
+// ── обновления с GitHub ──
+async function checkUpdate(quiet) {
+  $("about-pop")?.classList.remove("show");
+  let u;
+  try { u = await fetch(BASE + "/update/check").then((r) => r.json()); } catch (e) { if (!quiet) flash("Не удалось проверить: " + e.message); return; }
+  try { localStorage.setItem("troy-upd-check", String(Date.now())); } catch (e) {}
+  if (u.error) { if (!quiet) flash("Не удалось проверить обновления: " + u.error); return; }
+  if (!u.newer) { if (!quiet) addBox("info", `✅ У тебя последняя версия Троя — ${u.current}.`); return; }
+  if ($("upd-modal")) return;
+  const m = document.createElement("div"); m.id = "upd-modal"; m.className = "wn-modal show";
+  m.innerHTML = `<div class="wn-card" role="dialog">
+    <div class="wn-head"><img src="favicon.png" alt=""><div><h3>Вышла версия ${esc(u.latest)}</h3>
+      <div class="wn-sub">Сейчас у тебя ${esc(u.current)} · ${Math.max(1, Math.round((u.size || 0) / 1048576))} МБ</div></div></div>
+    ${u.notes ? `<div class="wn-notes">${render(u.notes)}</div>` : ""}
+    <div class="wn-progress" hidden><div></div></div><div class="wn-sub" data-a="st"></div>
+    <div class="wn-row"><button type="button" data-a="go">Обновить сейчас</button><button type="button" class="ghost" data-a="later">Позже</button></div></div>`;
+  document.body.appendChild(m);
+  m.querySelector('[data-a="later"]').onclick = () => m.remove();
+  m.querySelector('[data-a="go"]').onclick = async (e) => {
+    e.target.disabled = true; m.querySelector('[data-a="later"]').disabled = true;
+    const bar = m.querySelector(".wn-progress"), st = m.querySelector('[data-a="st"]'); bar.hidden = false;
+    await fetch(BASE + "/update/install", { method: "POST" });
+    const t = setInterval(async () => {
+      let p; try { p = await fetch(BASE + "/update/status").then((r) => r.json()); } catch (e) { return; }   // программа уже закрылась — ставится
+      if (p.state === "download") { const pc = p.total ? Math.round(p.done * 100 / p.total) : 0;
+        bar.firstChild.style.width = pc + "%"; st.textContent = `Скачиваю… ${pc}%`; }
+      else if (p.state === "install") { bar.firstChild.style.width = "100%"; st.textContent = "Ставлю обновление — Трой перезапустится сам через минуту."; clearInterval(t); }
+      else if (p.state === "error") { st.textContent = "⚠️ " + p.error; e.target.disabled = false; m.querySelector('[data-a="later"]').disabled = false; clearInterval(t); }
+    }, 700);
+  };
+}
 async function boot() {
   try {
     const ping = await api("/ping"); botName = ping.name || botName;
@@ -1025,6 +1068,8 @@ async function boot() {
   }
   clearInterval(pollTimer); pollTimer = setInterval(poll, 4000);
   showWhatsNew();
+  let last = 0; try { last = +localStorage.getItem("troy-upd-check") || 0; } catch (e) {}
+  if (Date.now() - last > 6 * 3600 * 1000) setTimeout(() => checkUpdate(true), 4000);   // не чаще раза в 6 часов
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
 }
 let polling = false;
@@ -1182,35 +1227,68 @@ function openBugReport() {
     m.innerHTML = `<div class="help-card" role="dialog"><h3><span>Сообщить об ошибке</span><button title="Закрыть">×</button></h3>
       <form class="bug-form">
         <textarea name="text" placeholder="Что случилось? Например: «попросил открыть музыку — Трой открыл браузер»"></textarea>
-        <div class="muted">Трой соберёт отчёт: версию, диагностику и последние ошибки. Ключи, пароли, адреса серверов и почта
-          в отчёт не попадают. Откроется страница GitHub — проверь текст и нажми <b>Submit new issue</b>
-          (нужен бесплатный аккаунт GitHub). Без аккаунта — нажми «Скопировать отчёт» и отправь его, как удобно.</div>
+        <div class="row"><button type="button" data-a="shot">📷 Снимок окна Троя</button>
+          <button type="button" data-a="pick">🖼 Выбрать картинку</button>
+          <input type="file" accept="image/*" hidden></div>
+        <div class="bug-shot" hidden><img alt=""><button type="button" data-a="unshot" title="Убрать скриншот">×</button></div>
+        <div class="muted">Трой соберёт отчёт: версии, систему, журнал программы и диагностику — без ключей, паролей,
+          адресов серверов и почты. <b>Открыть на GitHub</b> — нужен бесплатный аккаунт; скриншот будет в буфере обмена,
+          вставьте его в задачу через Ctrl+V. Без аккаунта — <b>Сохранить в файл</b> и пришлите архив разработчику.</div>
         <div class="row"><button type="submit" class="primary">Открыть на GitHub</button>
-          <button type="button" data-a="copy">Скопировать отчёт</button></div>
+          <button type="button" data-a="save">Сохранить в файл</button>
+          <button type="button" data-a="copy">Скопировать текст</button></div>
         <div class="muted" data-a="status"></div>
       </form></div>`;
     m.onclick = (e) => { if (e.target === m || e.target.closest("h3 button")) m.classList.remove("show"); };
     document.body.appendChild(m);
     const form = m.querySelector("form"), status = form.querySelector('[data-a="status"]');
-    const go = async (open) => {
-      form.querySelectorAll("button").forEach((b) => (b.disabled = true)); status.textContent = "Собираю отчёт…";
-      try {
-        const r = await fetch(BASE + "/bugreport", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: form.text.value.trim(), open }) }).then((x) => x.json());
-        if (!open || r.trimmed) copyText(r.full);
-        status.textContent = open
-          ? "✅ Открыл GitHub." + (r.trimmed ? " Отчёт длинный — полный текст в буфере обмена, вставь его в задачу (Ctrl+V)." : "")
-          : "✅ Отчёт скопирован — вставь его в письмо или сообщение (Ctrl+V).";
-      } catch (e) { status.textContent = "⚠️ Не получилось: " + e.message; }
-      finally { form.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
+    const shotBox = form.querySelector(".bug-shot"), file = form.querySelector('input[type="file"]');
+    const post = (path, body) => fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) }).then((x) => x.json());
+    const showShot = (r) => {
+      shotBox.hidden = !r.preview; shotBox.querySelector("img").src = r.preview ? "data:image/png;base64," + r.preview : "";
+      if (r.error) status.textContent = "⚠️ Скриншот не получился: " + r.error;
     };
-    form.onsubmit = (e) => { e.preventDefault(); go(true); };
-    form.querySelector('[data-a="copy"]').onclick = () => go(false);
+    form.querySelector('[data-a="shot"]').onclick = async () => {
+      status.textContent = "Делаю снимок…"; m.classList.remove("show");          // окно отчёта не должно закрыть чат
+      await new Promise((r) => setTimeout(r, 350));
+      status.textContent = "";
+      try { showShot(await post("/bugshot", {})); } catch (e) { status.textContent = "⚠️ " + e.message; }
+      m.classList.add("show");
+    };
+    form.querySelector('[data-a="pick"]').onclick = () => file.click();
+    file.onchange = () => {
+      const f = file.files[0]; if (!f) return;
+      const rd = new FileReader();
+      rd.onload = async () => showShot(await post("/bugshot", { b64: String(rd.result).split(",")[1] }));
+      rd.readAsDataURL(f); file.value = "";
+    };
+    form.querySelector('[data-a="unshot"]').onclick = async () => showShot(await post("/bugshot", { clear: true }));
+    let tick = null;
+    const go = async (action) => {
+      form.querySelectorAll("button").forEach((b) => (b.disabled = true));
+      let sec = 0; status.textContent = "Собираю отчёт…";
+      tick = setInterval(() => { sec++; status.textContent = `Собираю отчёт… ${sec} с (проверяю связь и диагностику, до 30 секунд)`; }, 1000);
+      try {
+        const r = await post("/bugreport", { text: form.text.value.trim(), action });
+        if (action === "copy") copyText(r.full);
+        status.textContent = action === "open"
+          ? "✅ Открыл GitHub — проверьте текст и нажмите «Submit new issue»." + (r.shot_in_clipboard ? " Скриншот в буфере обмена: вставьте его в задачу (Ctrl+V)." : "")
+            + (r.saved ? " Полный отчёт сохранён: " + r.saved : "")
+          : action === "save" ? "✅ Отчёт сохранён: " + r.saved + " — пришлите этот файл разработчику."
+          : "✅ Текст отчёта скопирован (Ctrl+V).";
+      } catch (e) { status.textContent = "⚠️ Не получилось: " + e.message; }
+      finally { clearInterval(tick); form.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
+    };
+    form.onsubmit = (e) => { e.preventDefault(); go("open"); };
+    form.querySelector('[data-a="save"]').onclick = () => go("save");
+    form.querySelector('[data-a="copy"]').onclick = () => go("copy");
   }
   m.querySelector('[data-a="status"]').textContent = "";
   m.classList.add("show"); m.querySelector("textarea").focus();
 }
 $("bug-btn").onclick = (e) => { e.stopPropagation(); openBugReport(); };
+$("upd-btn").onclick = (e) => { e.stopPropagation(); checkUpdate(false); };
 $("about-pop").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("help-modal")?.classList.contains("show")) $("conn-modal")?.classList.remove("show"); });
 
