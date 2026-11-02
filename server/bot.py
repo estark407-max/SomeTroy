@@ -1350,6 +1350,10 @@ class Assistant:
             return (f"НЕ ОТКРЫТО: спроси пользователя одной фразой — открыть {host} напрямую с компьютера или через сервер "
                     "(как VPN: сайт увидит адрес сервера, помогает, если сайт не открывается)? Ответ запомню для этого сайта.")
         device = getattr(self, "caller_device", "")      # тот компьютер, с которого попросили
+        have = PC_VERSION.get(device, "") if device else ""
+        if have and tuple(int(x) for x in have.split(".") if x.isdigit()) < (0, 4, 0):
+            return (f"НЕ ОТКРЫТО: программа Troy на компьютере {device} старой версии ({have}) и не умеет открывать сайты. "
+                    "Скажи пользователю обновить программу (версия 0.4.0 или новее).")
         text, choice = pc_create("open_site", json.dumps({"url": url, "mode": mode}, ensure_ascii=False), device,
                                  self.channel, chat_id)
         if choice:
@@ -1368,6 +1372,9 @@ class Assistant:
             self.pc_used = True
             text = self.open_site(chat_id, m.group(1), "server" if (m.group(2) or "").lower() == "через сервер"
                                   else "direct" if m.group(2) else "")
+            if text.startswith("НЕ ОТКРЫТО: программа"):
+                return ("⚠️ " + text[len("НЕ ОТКРЫТО: "):].split(" Скажи пользователю")[0]
+                        + " Обнови её — тогда сайты откроются вкладкой в окне Троя.")
             if text.startswith("НЕ ОТКРЫТО"):
                 host = re.sub(r"^https?://", "", m.group(1)).split("/")[0]
                 return f"Как открыть {host}: напрямую с компьютера или через сервер (как VPN — сайт увидит адрес сервера)?"
@@ -1385,6 +1392,9 @@ class Assistant:
                 self.pending_site.pop(chat_id, None)
                 self.pc_used = True
                 text = self.open_site(chat_id, pend[0], mode, _from_answer=True)
+                if text.startswith("НЕ ОТКРЫТО: программа"):
+                    return ("⚠️ " + text[len("НЕ ОТКРЫТО: "):].split(" Скажи пользователю")[0]
+                            + " Обнови её — тогда сайты откроются вкладкой в окне Троя. Выбор режима я запомнил.")
                 host = re.sub(r"^https?://", "", pend[0]).split("/")[0]
                 return ("Выбери компьютер." if self.pc_choice else
                         f"Открываю {host} {'через сервер' if mode == 'server' else 'напрямую'}. Запомнил — "
