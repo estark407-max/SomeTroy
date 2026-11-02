@@ -132,6 +132,14 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
 .wn-card button { margin-top: 18px; width: 100%; border: 0; border-radius: 11px; padding: 10px; background: var(--accent); color: #fff;
   font: inherit; font-weight: 600; cursor: pointer; }
 .wn-card button:hover { background: var(--accent-hover); }
+.tabs { display: flex; gap: 4px; padding: 6px 12px 0; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.tabs[hidden] { display: none; }
+.tabs button { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; border: 1px solid var(--line); border-bottom: 0;
+  border-radius: 10px 10px 0 0; padding: 6px 10px; background: var(--chip); color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; }
+.tabs button.on { background: var(--surface); color: var(--text); box-shadow: inset 0 2px 0 var(--accent); }
+.tabs button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tabs button i { font-style: normal; opacity: .6; padding: 0 2px; border-radius: 4px; }
+.tabs button i:hover { opacity: 1; background: var(--accent-soft); }
 .msg.user .bubble {
   background: var(--user); color: var(--user-text);
   padding: 9px 15px; border-radius: 18px 18px 6px 18px;
@@ -526,6 +534,7 @@ THEME_DARK.addEventListener("change", applyTheme);
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
   </button>
 </header>
+<nav class="tabs" id="tabs" hidden></nav>
 
 <main id="scroller">
   <div class="feed" id="feed"></div>
@@ -669,6 +678,36 @@ function addDay(ts) {
   const lbl = dayLabel(ts);
   if (lbl !== lastDay) { lastDay = lbl; feed.insertAdjacentHTML("beforeend", `<div class="day">${lbl}</div>`); }
 }
+// ── вкладки сайтов: окно сайта встаёт под этой полоской, «💬 Чат» — обратно к переписке ──
+let tabsSig = "";
+function tabsTop() {                                    // где кончается полоска вкладок — в настоящих пикселях
+  const t = $("tabs"); return Math.round(t.getBoundingClientRect().bottom * (window.devicePixelRatio || 1));
+}
+function drawTabs(list) {
+  const t = $("tabs"); const sig = JSON.stringify(list);
+  if (sig === tabsSig) return; tabsSig = sig;
+  t.hidden = !list.length;
+  const any = list.some((x) => x.active);
+  t.innerHTML = `<button data-id="" class="${any ? "" : "on"}">💬 <span>Чат</span></button>` + list.map((x) =>
+    `<button data-id="${x.id}" class="${x.active ? "on" : ""}" title="${esc(x.title)}">${x.mode === "server" ? "🛡" : "🌐"} <span>${esc(x.title || x.host)}</span><i data-close="${x.id}" title="Закрыть">×</i></button>`).join("");
+  t.querySelectorAll("button").forEach((b) => (b.onclick = async (e) => {
+    const close = e.target.closest("[data-close]");
+    const r = await fetch(BASE + (close ? "/tabs/close" : "/tabs/show"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: close ? +close.dataset.close : (b.dataset.id ? +b.dataset.id : null), top: tabsTop() }) }).then((x) => x.json()).catch(() => null);
+    if (r) drawTabs(r.tabs || []);
+  }));
+}
+async function pollTabs() {
+  const r = await fetch(BASE + "/tabs").then((x) => x.json()).catch(() => null);
+  if (!r) return;
+  const had = !$("tabs").hidden; drawTabs(r.tabs || []);
+  if (!had && !$("tabs").hidden || (r.tabs || []).length) {   // полоска только что появилась или сменилась — сообщаем высоту
+    fetch(BASE + "/tabs/layout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ top: tabsTop() }) }).catch(() => {});
+  }
+}
+setInterval(pollTabs, 1200);
+window.addEventListener("resize", () => { if (!$("tabs").hidden) pollTabs(); });
+
 // ── ответ на конкретное сообщение Троя ──
 let replyTo = "";
 function setReply(text) {

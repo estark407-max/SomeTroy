@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -546,6 +546,9 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes(check_update()))
             elif path == "/update/status":
                 self.send(200, jbytes(UPD))
+            elif path == "/tabs":                        # вкладки сайтов в шапке
+                import site_tabs
+                self.send(200, jbytes({"tabs": site_tabs.listing()}))
             elif path == "/whatsnew":
                 self.send(200, jbytes(whats_new()))
             elif path == "/version":
@@ -633,6 +636,21 @@ def make_handler(remote: Remote, key: str):
                     threading.Thread(target=install_update, daemon=True).start()
                 self.send(200, b"{}")
                 return
+            if path in ("/tabs/show", "/tabs/close", "/tabs/layout"):
+                import site_tabs
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                if "top" in data:                       # высота шапки с вкладками — в настоящих пикселях
+                    site_tabs.STATE["top"] = float(data.get("top") or 0)
+                site_tabs.STATE["find_troy"] = find_window
+                if path == "/tabs/show":
+                    site_tabs.show(data.get("id"))
+                elif path == "/tabs/close":
+                    site_tabs.close(data.get("id"))
+                self.send(200, jbytes({"tabs": site_tabs.listing()}))
+                return
             if path == "/whatsnew/seen":
                 save_settings(seen_version=APP_VERSION)
                 self.send(200, b"{}")
@@ -718,6 +736,13 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 
 WHATS_NEW = [
+ {
+  "version": "0.5.2",
+  "added": [
+   "Сайты открываются вкладками прямо в окне Троя: «💬 Чат | 🌐 сайт ×» под шапкой. Переключайтесь между чатом и сайтами, закрывайте крестиком. 🛡 — сайт открыт через сервер."
+  ],
+  "fixed": []
+ },
  {
   "version": "0.5.1",
   "added": [
@@ -1003,11 +1028,25 @@ def open_site(remote: "Remote", arg: str):
         return True, f"открыл {host} в браузере по умолчанию"
     args = [browser, f"--user-data-dir={DATA_DIR / ('browser-server' if mode == 'server' else 'browser')}",
             "--no-first-run", "--no-default-browser-check"]
+    tabbed = sys.platform == "win32"
     if mode == "server":
         if not str(remote.base).startswith("https://"):
             return False, "через сервер можно, только когда Трой живёт на сервере (VPS)"
         port = start_proxy(remote)
         args += [f"--proxy-server=http://127.0.0.1:{port}", "--proxy-bypass-list=<-loopback>"]
+    if tabbed:                                   # вкладкой внутри окна Троя (окно сайта без рамки, под шапкой Троя)
+        import site_tabs
+        site_tabs.STATE["find_troy"] = find_window
+        if not window_open():                    # окно Троя закрыто в трей — открываем, вкладке нужно куда встать
+            open_window(APP_URL)
+            for _ in range(40):
+                if find_window():
+                    break
+                time.sleep(0.25)
+        try:
+            return site_tabs.open_tab(args + [f"--app={url}"], url, host, mode)
+        except Exception as e:
+            log.warning("Вкладка сайта: %s", e)
     subprocess.Popen(args + ["--new-window", url], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return True, f"открыл {host} {'через сервер' if mode == 'server' else 'напрямую'}"
 
