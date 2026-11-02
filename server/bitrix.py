@@ -30,15 +30,46 @@ class BitrixError(RuntimeError):
     pass
 
 
+DATE_RE = re.compile(r"^\s*(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?)"
+                     r"(?:[ T]+(\d{1,2})[:.](\d{2})(?::\d{2})?)?")
+
+
+def parse_when(text: str, tz=None, default_time: str = "") -> Optional[datetime]:
+    """«2026-11-03 18:00», «2026-11-03», «03.11.2026 18:00», «03.11» → дата-время (в часовом поясе Троя)."""
+    m = DATE_RE.match(text or "")
+    if not m:
+        return None
+    now = datetime.now(tz)
+    if m.group(1):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        d, mo = int(m.group(4)), int(m.group(5))
+        y = int(m.group(6)) if m.group(6) else now.year
+        y += 2000 if y < 100 else 0
+    hh, mm = (int(m.group(7)), int(m.group(8))) if m.group(7) else (
+        tuple(int(x) for x in default_time.split(":")) if default_time else (0, 0))
+    try:
+        return datetime(y, mo, d, hh, mm, tzinfo=tz)
+    except ValueError:
+        return None
+
+
+def norm_date(text: str) -> str:
+    """Дата для фильтров аналитики → ГГГГ-ММ-ДД (пусто — если не понял)."""
+    dt = parse_when(text)
+    return dt.strftime("%Y-%m-%d") if dt else ""
+
+
 class Bitrix:
-    def __init__(self, webhook: str, proxy: str = ""):
+    def __init__(self, webhook: str, proxy: str = "", tz=None):
         self.base = webhook.rstrip("/") + "/"
+        self.tz = tz
         self.s = requests.Session()
         if proxy:
             self.s.proxies = {"http": proxy, "https": proxy}
         self._me: Optional[dict] = None
         self._users: dict = {}
-        self._statuses: Optional[dict] = None
+        self._statuses: Optional[list] = None
 
     # ── транспорт ──
     def call(self, method: str, params: Optional[dict] = None) -> dict:
@@ -92,15 +123,36 @@ class Bitrix:
         return [{"id": u["ID"], "name": f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip(),
                  "position": u.get("WORK_POSITION") or ""} for u in res[:10]]
 
-    def status_names(self) -> dict:
+    def status_names(self, kind: str = "deal") -> dict:
+        """Названия стадий. У сделок, лидов и источников коды совпадают («NEW»), поэтому — отдельно для каждого."""
         if self._statuses is None:
-            self._statuses = {s["STATUS_ID"]: s["NAME"] for s in self.list_all("crm.status.list", {})}
-        return self._statuses
+            self._statuses = self.list_all("crm.status.list", {})
+        want = {"deal": lambda e: e.startswith("DEAL_STAGE"), "lead": lambda e: e == "STATUS",
+                "source": lambda e: e == "SOURCE"}.get(kind, lambda e: True)
+        return {s["STATUS_ID"]: s["NAME"] for s in self._statuses if want(str(s.get("ENTITY_ID") or ""))}
+
+    def resolve_user(self, who: str) -> tuple:
+        """Исполнитель: ID или имя/фамилия → (ID, имя). Несколько похожих — просим уточнить."""
+        who = str(who or "").strip()
+        if not who:
+            me = self.me()
+            return str(me["ID"]), f"{me.get('NAME', '')} {me.get('LAST_NAME', '')}".strip() or "я"
+        if who.isdigit():
+            return who, self.user_name(who)
+        found = self.find_users(who)
+        if not found and " " in who:
+            found = self.find_users(who.split()[-1]) or self.find_users(who.split()[0])
+        if len(found) == 1:
+            return str(found[0]["id"]), found[0]["name"]
+        if not found:
+            raise BitrixError(f"не нашёл сотрудника «{who}» в Битриксе")
+        names = "; ".join(f"{u['name']} (ID {u['id']}{', ' + u['position'] if u['position'] else ''})" for u in found)
+        raise BitrixError(f"под «{who}» подходят несколько сотрудников: {names}. Уточни, кого именно")
 
     # ── задачи ──
     def tasks(self, scope: str = "my", query: str = "", limit: int = 20) -> str:
         me = self.me()["ID"]
-        flt = {"!STATUS": [5, 7]}
+        flt: dict = {"<REAL_STATUS": 5}                      # 1–4: новые, ждут, в работе, ждут контроля
         if scope == "my":
             flt["RESPONSIBLE_ID"] = me
         elif scope == "created_by_me":
@@ -112,7 +164,7 @@ class Bitrix:
             flt["RESPONSIBLE_ID"] = me
             flt["<=DEADLINE"] = datetime.now().strftime("%Y-%m-%dT23:59:59")
         elif scope == "done":
-            flt = {"RESPONSIBLE_ID": me, "STATUS": 5}
+            flt = {"RESPONSIBLE_ID": me, "REAL_STATUS": 5}
         if query:
             flt["%TITLE"] = query
         items = self.list_all("tasks.task.list", {
@@ -128,13 +180,33 @@ class Bitrix:
                          f"исполнитель {who}")
         return "\n".join(lines)
 
-    def task_create(self, title: str, description: str = "", deadline: str = "", responsible: str = "") -> str:
-        fields = {"TITLE": title, "DESCRIPTION": description, "RESPONSIBLE_ID": responsible or self.me()["ID"]}
+    def task_fields(self, title: str, description: str = "", deadline: str = "", responsible: str = "") -> tuple:
+        """Поля задачи и её описание словами (для подтверждения). Ошибки — сразу, до «Делаю?»."""
+        if not (title or "").strip():
+            raise BitrixError("у задачи нет названия")
+        uid, uname = self.resolve_user(responsible)
+        fields = {"TITLE": title.strip(), "RESPONSIBLE_ID": uid}
+        if description:
+            fields["DESCRIPTION"] = description
+        when = ""
         if deadline:
-            fields["DEADLINE"] = deadline.replace(" ", "T")
+            dt = parse_when(deadline, self.tz, "18:00")
+            if not dt:
+                raise BitrixError(f"не понял срок «{deadline}» — нужен вид ГГГГ-ММ-ДД ЧЧ:ММ")
+            fields["DEADLINE"] = dt.isoformat(timespec="seconds")
+            when = dt.strftime("%d.%m.%Y %H:%M")
+        text = f"«{fields['TITLE']}», исполнитель {uname}" + (f", срок {when}" if when else ", без срока")
+        if description:
+            text += f", описание: {description[:200]}"
+        return fields, text
+
+    def task_create(self, title: str, description: str = "", deadline: str = "", responsible: str = "") -> str:
+        fields, text = self.task_fields(title, description, deadline, responsible)
         res = self.call("tasks.task.add", {"fields": fields})["result"]
-        tid = res.get("task", {}).get("id")
-        return f"Задача #{tid} создана: {title}"
+        tid = (res.get("task") or {}).get("id") if isinstance(res, dict) else None
+        if not tid:
+            raise BitrixError("Битрикс не вернул номер задачи — задача, скорее всего, не создана")
+        return f"✅ Задача #{tid} создана: {text}."
 
     def task_complete(self, task_id: int) -> str:
         self.call("tasks.task.complete", {"taskId": task_id})
@@ -194,7 +266,7 @@ class Bitrix:
             items = self.list_all("crm.contact.list", {"filter": {"%NAME": query}, "select": select}, limit=limit)
         if not items:
             return "Ничего не найдено."
-        st = self.status_names()
+        st = self.status_names(entity)
         lines = []
         for i in items:
             name = i.get("TITLE") or f"{i.get('NAME', '')} {i.get('LAST_NAME', '')}".strip()
@@ -225,68 +297,107 @@ class Bitrix:
         return f"Обновлено: {entity} #{item_id}."
 
     # ── аналитика ──
-    def stats(self, entity: str, date_from: str = "", date_to: str = "", group_by: str = "stage") -> str:
-        """Сводка по сделкам, лидам или задачам за период: количество и суммы с разбивкой."""
+    def stats(self, entity: str, date_from: str = "", date_to: str = "", group_by: str = "stage",
+              period_by: str = "created") -> str:
+        """Сводка по сделкам, лидам или задачам за период: количество и суммы с разбивкой.
+        period_by: created — по дате создания; closed — по дате закрытия (продажи, выручка, выполненные задачи)."""
+        d1, d2 = norm_date(date_from), norm_date(date_to)
+        if (date_from and not d1) or (date_to and not d2):
+            return "Ошибка: даты нужны в виде ГГГГ-ММ-ДД."
+        limit = 5000
+        period = (f"с {d1} " if d1 else "") + (f"по {d2}" if d2 else "") or "за всё время"
+        closed = period_by == "closed"
+
         if entity == "task":
-            flt: dict = {}
-            if date_from:
-                flt[">=CREATED_DATE"] = date_from
-            if date_to:
-                flt["<=CREATED_DATE"] = date_to + " 23:59:59"
+            f = "CLOSED_DATE" if closed else "CREATED_DATE"
+            flt: dict = {"REAL_STATUS": 5} if closed else {}
+            if d1:
+                flt[f">={f}"] = d1 + "T00:00:00"
+            if d2:
+                flt[f"<={f}"] = d2 + "T23:59:59"
             items = self.list_all("tasks.task.list", {"filter": flt, "select": [
-                "ID", "STATUS", "RESPONSIBLE_ID", "DEADLINE", "CLOSED_DATE"]}, "tasks", 5000)
-            now = datetime.now().isoformat()
+                "ID", "STATUS", "RESPONSIBLE_ID", "DEADLINE", "CLOSED_DATE"]}, "tasks", limit)
+            now = datetime.now(self.tz).isoformat() if self.tz else datetime.now().isoformat()
             by_status, by_user, overdue = defaultdict(int), defaultdict(int), 0
             for t in items:
-                by_status[TASK_STATUS.get(str(t.get("status")), "?")] += 1
+                st = str(t.get("status"))
+                by_status[TASK_STATUS.get(st, st)] += 1
                 by_user[self.user_name(t.get("responsibleId"))] += 1
-                if t.get("deadline") and t["deadline"] < now and str(t.get("status")) not in ("5", "7"):
+                if t.get("deadline") and t["deadline"] < now and st not in ("5", "7"):
                     overdue += 1
-            return (f"Задач: {len(items)}, просрочено: {overdue}\n"
-                    f"По статусам: {dict(by_status)}\nПо исполнителям: {dict(by_user)}")
+            head = f"Задачи {'закрытые' if closed else 'созданные'} {period}: {len(items)}"
+            if not closed:
+                head += f", из них просрочено сейчас: {overdue}"
+            lines = [head, "По статусам: " + ", ".join(f"{k} — {v}" for k, v in sorted(by_status.items(), key=lambda x: -x[1])),
+                     "По исполнителям: " + ", ".join(f"{k} — {v}" for k, v in sorted(by_user.items(), key=lambda x: -x[1]))]
+            if len(items) >= limit:
+                lines.append(f"(посчитаны первые {limit} задач — сузь период)")
+            return "\n".join(lines)
 
         if entity not in ("deal", "lead"):
             return "Ошибка: аналитика есть для deal, lead и task."
-        flt = {}
-        if date_from:
-            flt[">=DATE_CREATE"] = date_from
-        if date_to:
-            flt["<=DATE_CREATE"] = date_to + "T23:59:59"
         stage_f = "STAGE_ID" if entity == "deal" else "STATUS_ID"
-        select = ["ID", stage_f, "OPPORTUNITY", "CURRENCY_ID", "ASSIGNED_BY_ID", "SOURCE_ID", "DATE_CREATE"]
+        sem_f = "STAGE_SEMANTIC_ID" if entity == "deal" else "STATUS_SEMANTIC_ID"
+        date_f = "CLOSEDATE" if (closed and entity == "deal") else ("DATE_CLOSED" if closed else "DATE_CREATE")
+        flt = {}
+        if closed and entity == "deal":
+            flt["CLOSED"] = "Y"
+        if d1:
+            flt[f">={date_f}"] = d1 + ("" if date_f == "CLOSEDATE" else "T00:00:00")
+        if d2:
+            flt[f"<={date_f}"] = d2 + ("" if date_f == "CLOSEDATE" else "T23:59:59")
+        select = ["ID", stage_f, sem_f, "OPPORTUNITY", "CURRENCY_ID", "ASSIGNED_BY_ID", "SOURCE_ID", "DATE_CREATE"]
         if entity == "deal":
-            select += ["CLOSED", "STAGE_SEMANTIC_ID", "CATEGORY_ID"]
-        items = self.list_all(f"crm.{entity}.list", {"filter": flt, "select": select}, limit=5000)
+            select += ["CLOSED", "CLOSEDATE", "CATEGORY_ID"]
+        items = self.list_all(f"crm.{entity}.list", {"filter": flt, "select": select}, limit=limit)
         if not items:
-            return "За период ничего нет."
-        st = self.status_names()
+            return f"{CRM_ENTITIES[entity].capitalize()} {period}: ничего нет."
+        names = self.status_names(entity)
+        sources = self.status_names("source")
         key_f = {"stage": stage_f, "manager": "ASSIGNED_BY_ID", "source": "SOURCE_ID",
-                 "month": "DATE_CREATE"}.get(group_by, stage_f)
-        groups: dict = defaultdict(lambda: [0, 0.0])
-        total = 0.0
+                 "month": date_f if closed else "DATE_CREATE"}.get(group_by, stage_f)
+        groups: dict = defaultdict(lambda: [0, defaultdict(float)])
+        totals: dict = defaultdict(float)
+        won_sum: dict = defaultdict(float)
         won = lost = 0
         for i in items:
             k = i.get(key_f) or "—"
             if key_f == "ASSIGNED_BY_ID":
                 k = self.user_name(k)
-            elif key_f == "DATE_CREATE":
-                k = k[:7]
+            elif key_f in ("DATE_CREATE", "CLOSEDATE", "DATE_CLOSED"):
+                k = str(k)[:7]
+            elif key_f == "SOURCE_ID":
+                k = sources.get(k, k)
             else:
-                k = st.get(k, k)
+                k = names.get(k, k)
+            cur = i.get("CURRENCY_ID") or ""
             amount = float(i.get("OPPORTUNITY") or 0)
             groups[k][0] += 1
-            groups[k][1] += amount
-            total += amount
-            sem = i.get("STAGE_SEMANTIC_ID")
-            won += sem == "S"
-            lost += sem == "F"
-        lines = [f"{CRM_ENTITIES[entity].capitalize()}: {len(items)}, сумма {money(total)}"]
+            groups[k][1][cur] += amount
+            totals[cur] += amount
+            sem = i.get(sem_f)
+            if sem == "S":
+                won += 1
+                won_sum[cur] += amount
+            elif sem == "F":
+                lost += 1
+
+        def sums(d: dict) -> str:
+            return " + ".join(f"{money(v)} {c}".strip() for c, v in d.items() if v) or "0"
+
+        what = CRM_ENTITIES[entity].capitalize()
+        lines = [f"{what} {'закрытые' if closed else 'созданные'} {period}: {len(items)}, сумма {sums(totals)}"]
+        done = won + lost
         if entity == "deal":
-            closed = won + lost
-            conv = f", конверсия в успех {won / closed:.0%}" if closed else ""
-            lines.append(f"Выиграно {won}, проиграно {lost}, в работе {len(items) - closed}{conv}")
-        for k, (n, s) in sorted(groups.items(), key=lambda x: -x[1][0]):
-            lines.append(f"- {k}: {n} шт., {money(s)}")
+            lines.append(f"Успешных {won} на {sums(won_sum)}, провальных {lost}, в работе {len(items) - done}"
+                         + (f"; конверсия в успех {won / done:.0%} от закрытых" if done else ""))
+        else:
+            lines.append(f"Сконвертировано {won}, в брак {lost}, в работе {len(items) - done}"
+                         + (f"; конверсия {won / len(items):.0%}" if items else ""))
+        for k, (n, s_) in sorted(groups.items(), key=lambda x: -x[1][0]):
+            lines.append(f"- {k}: {n} шт., {sums(s_)}")
+        if len(items) >= limit:
+            lines.append(f"(посчитаны первые {limit} записей — сузь период)")
         return "\n".join(lines)
 
     def read_any(self, method: str, params: dict) -> str:
@@ -303,11 +414,12 @@ TOOLS = [
                      "overdue, created_by_me (поставленные мной), done (завершённые).",
      {"scope": {"type": "string", "enum": ["my", "today", "overdue", "created_by_me", "done"]},
       "query": {"type": "string", "description": "Слово из названия, необязательно"}}, []),
-    ("bitrix_task_create", "Битрикс24: создать задачу. Если исполнитель не я — сначала найди его через "
-                           "bitrix_find_user. ТОЛЬКО после подтверждения пользователя.",
+    ("bitrix_task_create", "Битрикс24: поставить задачу. Вызывай сразу, как понял задачу: Трой сам покажет "
+                           "пользователю, что получится, и спросит «Делаю?».",
      {"title": {"type": "string"}, "description": {"type": "string"},
       "deadline": {"type": "string", "description": "ГГГГ-ММ-ДД ЧЧ:ММ, необязательно"},
-      "responsible_id": {"type": "string", "description": "ID исполнителя, пусто — я сам"}}, ["title"]),
+      "responsible_id": {"type": "string", "description": "ID или имя и фамилия исполнителя; пусто — я сам"}},
+     ["title"]),
     ("bitrix_task_complete", "Битрикс24: завершить задачу. ТОЛЬКО после подтверждения пользователя.",
      {"task_id": {"type": "integer"}}, ["task_id"]),
     ("bitrix_task_comment", "Битрикс24: комментарий к задаче. ТОЛЬКО после подтверждения пользователя.",
@@ -337,11 +449,13 @@ TOOLS = [
      {"entity": {"type": "string", "enum": ["deal", "lead", "contact", "company"]},
       "id": {"type": "integer"}, "fields": {"type": "object"}}, ["entity", "id", "fields"]),
     ("bitrix_stats", "Битрикс24: аналитика за период — количество и суммы сделок или лидов, конверсия, "
-                     "либо сводка по задачам. group_by: stage, manager, source, month.",
+                     "либо сводка по задачам. group_by: stage, manager, source, month. period_by: created — по дате "
+                     "создания (сколько пришло); closed — по дате закрытия (продажи, выручка, сколько закрыто/выполнено).",
      {"entity": {"type": "string", "enum": ["deal", "lead", "task"]},
       "date_from": {"type": "string", "description": "ГГГГ-ММ-ДД"},
       "date_to": {"type": "string", "description": "ГГГГ-ММ-ДД"},
-      "group_by": {"type": "string", "enum": ["stage", "manager", "source", "month"]}}, ["entity"]),
+      "group_by": {"type": "string", "enum": ["stage", "manager", "source", "month"]},
+      "period_by": {"type": "string", "enum": ["created", "closed"]}}, ["entity"]),
     ("bitrix_read", "Битрикс24: произвольный метод REST API только для чтения (*.list, *.get, *.fields) — "
                     "для нестандартных вопросов и аналитики, которых нет в других функциях.",
      {"method": {"type": "string", "description": "например crm.deal.list, crm.activity.list, crm.status.list"},
@@ -374,7 +488,29 @@ def execute(bx: Bitrix, name: str, a: dict) -> str:
     if name == "bitrix_crm_update":
         return bx.crm_update(a["entity"], int(a["id"]), dict(a.get("fields") or {}))
     if name == "bitrix_stats":
-        return bx.stats(a["entity"], a.get("date_from") or "", a.get("date_to") or "", a.get("group_by") or "stage")
+        return bx.stats(a["entity"], a.get("date_from") or "", a.get("date_to") or "", a.get("group_by") or "stage",
+                        a.get("period_by") or "created")
     if name == "bitrix_read":
         return bx.read_any(a["method"], dict(a.get("params") or {}))
     return f"Ошибка: неизвестная функция {name}"
+
+
+def describe(bx: Bitrix, name: str, a: dict) -> str:
+    """Что именно сделает функция-изменение — словами, чтобы пользователь подтвердил (ошибки — сразу)."""
+    if name == "bitrix_task_create":
+        _, text = bx.task_fields(a.get("title") or "", a.get("description") or "", a.get("deadline") or "",
+                                 str(a.get("responsible_id") or ""))
+        return "Поставить задачу " + text
+    if name == "bitrix_task_complete":
+        return f"Завершить задачу #{a.get('task_id')}"
+    if name == "bitrix_task_comment":
+        return f"Комментарий к задаче #{a.get('task_id')}: «{a.get('text', '')}»"
+    if name == "bitrix_send_message":
+        to = str(a.get("dialog_id") or "")
+        who = bx.user_name(to) if to.isdigit() else to
+        return f"Сообщение в Битрикс (кому: {who}): «{a.get('text', '')}»"
+    if name == "bitrix_crm_create":
+        return f"Создать в CRM ({CRM_ENTITIES.get(a.get('entity'), a.get('entity'))}): {json.dumps(a.get('fields') or {}, ensure_ascii=False)}"
+    if name == "bitrix_crm_update":
+        return f"Изменить {a.get('entity')} #{a.get('id')}: {json.dumps(a.get('fields') or {}, ensure_ascii=False)}"
+    return name

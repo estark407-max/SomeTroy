@@ -42,7 +42,7 @@ import desktop_api
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
 # указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
-SERVER_VERSION = "0.5.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
+SERVER_VERSION = "0.6.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
 BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
 load_dotenv(BASE / "settings.env", override=True)
 LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
@@ -74,6 +74,14 @@ VISION_MODELS = {m.strip() for m in env("VISION_MODELS", "qwen/qwen3.8-27b,mistr
 # Запасной провайдер — Mistral (бесплатный режим без карты). Пусто — не используется
 MISTRAL_API_KEY = env("MISTRAL_API_KEY")
 MISTRAL_MODEL = env("MISTRAL_MODEL", "mistral-small-latest")
+# Своя (обычно платная) модель — любой сервис с API как у OpenAI: OpenAI, Anthropic (Claude), Google Gemini,
+# OpenRouter, DeepSeek и другие. Если указана — Трой отвечает ею, а бесплатные модели остаются запасными.
+LLM_API_URL = env("LLM_API_URL")        # например https://api.openai.com/v1/
+LLM_API_KEY = env("LLM_API_KEY")
+LLM_MODEL = env("LLM_MODEL")            # название модели — как в кабинете сервиса
+LLM_NAME = env("LLM_NAME")              # как называть в ответах «кто отвечает» (необязательно)
+LLM_PROXY = env("LLM_PROXY")            # прокси, если сервис не открывается с сервера (необязательно)
+LLM_VISION = env("LLM_VISION", "1")     # 1 — модель понимает картинки
 
 GITHUB_TOKEN = env("GITHUB_TOKEN")
 GITHUB_REPO = env("GITHUB_REPO")          # владелец/репозиторий
@@ -761,6 +769,57 @@ class Mistral(Groq):
         return out
 
 
+LLM_PRESETS = {                          # адрес → имя и особенности сервиса
+    "api.openai.com": ("OpenAI", "max_completion_tokens"),
+    "api.anthropic.com": ("Claude", "max_tokens"),
+    "generativelanguage.googleapis.com": ("Gemini", "max_tokens"),
+    "openrouter.ai": ("OpenRouter", "max_tokens"),
+    "api.deepseek.com": ("DeepSeek", "max_tokens"),
+    "api.mistral.ai": ("Mistral", "max_tokens"),
+}
+
+
+class CustomLLM(Groq):
+    """Своя модель через API в формате OpenAI (chat/completions)."""
+
+    def __init__(self, url: str, key: str, name: str = ""):
+        super().__init__(key, LLM_PROXY or GROQ_PROXY)
+        self.API = url.rstrip("/") + "/"
+        host = re.sub(r"^https?://", "", self.API).split("/")[0]
+        preset = next((v for k, v in LLM_PRESETS.items() if host.endswith(k)), (host, "max_tokens"))
+        self.NAME = name or preset[0]
+        self.MAX_TOKENS_FIELD = preset[1]
+        self.no_temperature = False
+
+    def chat(self, model: str, messages: list, tools: Optional[list] = None, **extra) -> dict:
+        body = {"model": model, "messages": self.prepare(messages), self.MAX_TOKENS_FIELD: 2048, **extra}
+        if not self.no_temperature:
+            body["temperature"] = 0.4
+        if tools:
+            body["tools"] = tools
+        for attempt in range(3):
+            r = self.s.post(self.API + "chat/completions", json=body, timeout=180)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]
+            if r.status_code == 400 and "temperature" in r.text and "temperature" in body:
+                self.no_temperature = True          # некоторые модели принимают только температуру по умолчанию
+                body.pop("temperature")
+                continue
+            if r.status_code in (500, 502, 503, 529) and attempt == 0:
+                time.sleep(3)
+                continue
+            self._raise(r)
+        raise LLMError(503, "сервис недоступен", self.NAME)
+
+
+def make_custom_llm() -> Optional["CustomLLM"]:
+    if not (LLM_API_URL and LLM_API_KEY and LLM_MODEL):
+        return None
+    if LLM_VISION == "1" and "deepseek" not in LLM_API_URL:
+        VISION_MODELS.add(LLM_MODEL)
+    return CustomLLM(LLM_API_URL, LLM_API_KEY, LLM_NAME)
+
+
 RETRY_RE = re.compile(r"try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", re.I)
 
 
@@ -770,12 +829,14 @@ class Router:
     def __init__(self, groq: Groq):
         self.groq = groq
         self.mistral = Mistral() if MISTRAL_API_KEY else None
+        self.custom = make_custom_llm()      # своя (платная) модель — первой, бесплатные — запасные
         self.cool: dict = {}        # модель -> до какого времени не трогать
         self.last: Optional[tuple] = None   # (провайдер, модель, время) — кто отвечал последним
         self.errors: dict = {}              # модель -> (время, код, текст) последней ошибки
 
     def chain(self) -> list:
-        items = [(self.groq, m) for m in GROQ_MODELS]
+        items = [(self.custom, LLM_MODEL)] if self.custom else []
+        items += [(self.groq, m) for m in GROQ_MODELS]
         if self.mistral:
             items.append((self.mistral, MISTRAL_MODEL))
         return items
@@ -800,6 +861,8 @@ class Router:
                 lines.append(f"    последняя ошибка {datetime.fromtimestamp(t, TZ):%H:%M}: {code} {text}")
         if not self.mistral:
             lines.append("- Mistral: не подключён (нет MISTRAL_API_KEY)")
+        if not self.custom:
+            lines.append("- Своя модель: не подключена (LLM_API_URL, LLM_API_KEY, LLM_MODEL)")
         last = (f"Последним отвечал: {self.last[0]} {self.last[1]} в "
                 f"{datetime.fromtimestamp(self.last[2], TZ):%H:%M}") if self.last else "С запуска ещё никто не отвечал."
         return "Модели Троя (по порядку):\n" + "\n".join(lines) + "\n\n" + last + "\n\n" + pcs_status()
@@ -828,6 +891,9 @@ class Router:
             log.warning("%s на перерыве %d с: %s", model, sec, (e.text or "")[:120])
         elif e.status in (500, 502, 503):
             self.cool[model] = time.time() + 30
+        elif e.status in (401, 402, 403):     # ключ не подошёл или кончились деньги — пока отвечают запасные
+            self.cool[model] = time.time() + 1800
+            log.warning("%s недоступна (%s) — 30 мин отвечают запасные модели", model, e.status)
 
 
 THINK_RE = re.compile(r"<think>.*?</think>", re.S)
@@ -1120,9 +1186,15 @@ PASSWORD_RE = re.compile(r"^\s*(?:\S+[,!]\s*)?(?:(?:новый|смени|пом
                          r"(?:\s*[:=—–-]\s*|\s+(?:на\s+|это\s+)?)(\S+)\s*$", re.I)
 BITRIX_WRITE = {"bitrix_task_create", "bitrix_task_complete", "bitrix_task_comment", "bitrix_send_message",
                 "bitrix_crm_create", "bitrix_crm_update"}
-YES_RE = re.compile(r"^(\[голосовое\]\s*)?(да|ага|угу|ок|окей|ok|yes|давай|отправляй|отправь|отправить|подтверждаю|"
-                    r"верно|делай|создавай|создай|закрывай|согласен|го|поехали|выполняй|всё верно|все верно)\b",
-                    re.I)
+YES_WORDS = (r"да|ага|угу|ок|окей|ok|yes|давай|отправляй|отправь|отправить|подтверждаю|верно|делай|создавай|"
+             r"создай|закрывай|согласен|го|поехали|выполняй|конечно|всё верно|все верно|\+")
+YES_RE = re.compile(rf"^(\[голосовое\]\s*)?({YES_WORDS})(?=$|[\s,.!])", re.I)
+# ответ — только «да» (без поправок): тогда подтверждённое действие выполняем сами, без нейросети
+YES_ONLY_RE = re.compile(rf"^(?:\[голосовое\]\s*)?(?:(?:{YES_WORDS}|трой)[\s,.!]*)+$", re.I)
+NO_RE = re.compile(r"^(?:\[голосовое\]\s*)?(?:нет|не надо|не нужно|не делай|отмена|отмени|стоп)\b[\s,.!]*$", re.I)
+
+
+BX_PENDING: dict = {}       # chat_id -> действие в Битриксе, которое ждёт «да» (name, args, ts, what)
 
 
 def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = False, boiler_on: bool = False) -> str:
@@ -1174,11 +1246,13 @@ PC_RULES = """
 
 BITRIX_RULES = """
 - Битрикс24 (портал пользователя, ты действуешь от его имени): задачи, чаты, CRM, аналитика — функции bitrix_*.
-  Чтение (списки, поиск, аналитика) делай сразу. Любое изменение — создать или закрыть задачу, комментарий,
-  отправить сообщение, создать или изменить запись CRM — сначала покажи, что именно сделаешь (получатель и точный
-  текст, поля), спроси «Делаю?» и вызывай функцию только после ответа «да».
-  Для сотрудника сначала найди его ID через bitrix_find_user. Для нестандартной аналитики используй bitrix_read
-  (например crm.deal.list с filter/select) и сам посчитай итоги. Суммы показывай с разделителями тысяч."""
+  Чтение (списки, поиск, аналитика) делай сразу. Изменение (поставить или закрыть задачу, комментарий, сообщение,
+  запись CRM) — тоже вызывай функцию сразу, как понял, что нужно: она сама не выполнится, а вернёт, что именно будет
+  сделано, — покажи это пользователю дословно и спроси «Делаю?». После «да» Трой выполнит сам.
+  НИКОГДА не пиши, что задача поставлена, сообщение отправлено или запись создана, если функция не вернула «✅».
+  Исполнителя можно передать именем и фамилией — Трой найдёт его сам. Продажи и выручку за период считай с
+  period_by=closed, а «сколько пришло» — с period_by=created. Для нестандартной аналитики используй bitrix_read
+  и сам посчитай итоги. Суммы показывай с разделителями тысяч."""
 
 
 class Assistant:
@@ -1186,7 +1260,7 @@ class Assistant:
         self.llm = Groq()
         self.router = Router(self.llm)
         self.ideas = Ideas()
-        self.bx = bitrix.Bitrix(BITRIX_WEBHOOK) if BITRIX_WEBHOOK else None
+        self.bx = bitrix.Bitrix(BITRIX_WEBHOOK, tz=TZ) if BITRIX_WEBHOOK else None
         self.lock = threading.Lock()     # Telegram и программа на компьютере — по очереди
         self.pc_used = False
         self.user_text = ""
@@ -1259,10 +1333,19 @@ class Assistant:
             if name.startswith("bitrix_"):
                 if not self.bx:
                     return "Ошибка: Битрикс24 не подключён (нет BITRIX_WEBHOOK в настройках)."
-                if name in BITRIX_WRITE and not YES_RE.match(self.user_text.strip()):
-                    return ("НЕ ВЫПОЛНЕНО: сначала покажи пользователю, что именно будет сделано "
-                            "(получатель, точный текст, поля), и спроси подтверждение. "
-                            "Вызови функцию снова только после его ответа «да».")
+                if name in BITRIX_WRITE:
+                    # изменение — только после отдельного «да» на точное описание (не «создай задачу…» и не «да, но…»)
+                    pend = BX_PENDING.get(chat_id)
+                    if pend and pend["name"] == name and YES_ONLY_RE.match(self.user_text.strip()):
+                        BX_PENDING.pop(chat_id, None)        # выполняем ровно то, что пользователь подтвердил
+                        return bitrix.execute(self.bx, name, pend["args"])
+                    try:
+                        what = bitrix.describe(self.bx, name, args)
+                    except bitrix.BitrixError as e:
+                        return f"НЕ ВЫПОЛНЕНО: {e}. Скажи это пользователю и спроси, как быть."
+                    BX_PENDING[chat_id] = {"name": name, "args": dict(args), "ts": time.time(), "what": what}
+                    return ("НЕ ВЫПОЛНЕНО — нужно подтверждение. Покажи пользователю дословно и спроси «Делаю?»:\n"
+                            + what)
                 return bitrix.execute(self.bx, name, args)
             return f"Ошибка: неизвестная функция {name}"
         except Exception as e:
@@ -1359,6 +1442,27 @@ class Assistant:
         if choice:
             self.pc_choice = choice
         return text + (" Режим: через сервер." if mode == "server" else " Режим: напрямую.")
+
+    def bx_confirm(self, chat_id: str) -> Optional[str]:
+        """«Да» на «Делаю?» по Битриксу — выполняем подтверждённое действие сами (нейросеть могла бы его «забыть»)."""
+        pend = BX_PENDING.get(chat_id)
+        if not pend or not self.bx:
+            return None
+        if time.time() - pend["ts"] > 1800:
+            BX_PENDING.pop(chat_id, None)
+            return None
+        text = (self.user_text or "").strip()
+        if NO_RE.match(text):
+            BX_PENDING.pop(chat_id, None)
+            return "Хорошо, не делаю."
+        if not YES_ONLY_RE.match(text):
+            return None                                     # поправки («да, но срок пятница») — разберётся нейросеть
+        BX_PENDING.pop(chat_id, None)
+        try:
+            return bitrix.execute(self.bx, pend["name"], pend["args"])
+        except Exception as e:
+            log.exception("Битрикс: %s", pend["name"])
+            return f"⚠️ Не получилось: {e}"
 
     def fast_pc(self, chat_id: str) -> Optional[str]:
         """Простые команды компьютеру — без модели."""
@@ -1462,7 +1566,7 @@ class Assistant:
                 hello = mcclure(self.user_text)
                 if hello:
                     return hello
-                fast = self.fast_pc(chat_id)
+                fast = self.bx_confirm(chat_id) or self.fast_pc(chat_id)
                 if fast:
                     return fast
             return self._run(chat_id, content)
@@ -1542,7 +1646,8 @@ class Assistant:
                 msg = provider.chat(model, send, tools)
                 self.router.last = (getattr(provider, "NAME", ""), model, time.time())
             except LLMError as e:
-                if e.status in (400, 404, 413, 422, 429, 500, 502, 503):
+                if e.status in (400, 404, 413, 422, 429, 500, 502, 503, 529) or (
+                        e.status in (401, 402, 403) and provider is self.router.custom):
                     self.router.penalize(model, e)
                     skip.add(model)          # в этом сообщении к ней больше не возвращаемся
                     last_err = e
@@ -2289,6 +2394,53 @@ def _mistral_connect(assistant: "Assistant", v: dict) -> tuple:
     return None, ""
 
 
+def _llm_connect(assistant: "Assistant", v: dict) -> tuple:
+    url, key, model = v.get("url", "").strip(), v.get("key", "").strip(), v.get("model", "").strip()
+    proxy = v.get("proxy", "").strip()
+    if not re.match(r"https?://\S+", url):
+        return "Выбери сервис или впиши адрес API (начинается с https://).", ""
+    if not key or not model:
+        return "Нужны ключ и название модели.", ""
+    global LLM_PROXY
+    old_proxy, LLM_PROXY = LLM_PROXY, proxy
+    try:
+        test = CustomLLM(url, key)
+        reply = clean_answer(test.chat(model, [{"role": "user", "content": "Ответь одним словом: работаю"}]).get("content"))
+    except LLMError as e:
+        LLM_PROXY = old_proxy
+        if e.status in (401, 403):
+            return f"{test.NAME} не принял ключ ({e.status}). Скопируй ключ заново из кабинета сервиса.", ""
+        if e.status == 402:
+            return f"{test.NAME}: на счёте нет денег (402). Пополни баланс в кабинете сервиса.", ""
+        if e.status in (400, 404):
+            return f"{test.NAME} не знает модель «{model}». Скопируй её название из кабинета сервиса. ({(e.text or '')[:150]})", ""
+        return f"{test.NAME} ответил ошибкой {e.status}: {(e.text or '')[:150]}", ""
+    except requests.RequestException as e:
+        LLM_PROXY = old_proxy
+        return f"Не достучался до {url}: {human_error(e)}. Если сервис закрыт для твоей страны — укажи прокси.", ""
+    save_setting("LLM_API_URL", url)
+    save_setting("LLM_API_KEY", key)
+    save_setting("LLM_MODEL", model)
+    save_setting("LLM_PROXY", proxy)
+    assistant.router.custom = make_custom_llm()
+    log.info("Своя модель подключена: %s %s (ответ: %s)", test.NAME, model, reply[:30])
+    return None, ""
+
+
+def _llm_disconnect(assistant: "Assistant") -> None:
+    for k in ("LLM_API_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_PROXY"):
+        save_setting(k, "")
+    assistant.router.custom = None
+
+
+def _llm_state() -> tuple:
+    if not (LLM_API_URL and LLM_API_KEY and LLM_MODEL):
+        return False, "", ""
+    host = re.sub(r"^https?://", "", LLM_API_URL).split("/")[0]
+    name = next((v[0] for k, v in LLM_PRESETS.items() if host.endswith(k)), host)
+    return True, f"{name}: {LLM_MODEL}", ""
+
+
 def _mistral_disconnect(assistant: "Assistant") -> None:
     save_setting("MISTRAL_API_KEY", "")
     assistant.router.mistral = None
@@ -2307,7 +2459,7 @@ def _bitrix_connect(assistant: "Assistant", v: dict) -> tuple:
     if not ok:
         return "Битрикс24 не принял вебхук. Проверь адрес и права (task, im, crm, user).", ""
     save_setting("BITRIX_WEBHOOK", url)
-    assistant.bx = bitrix.Bitrix(url)
+    assistant.bx = bitrix.Bitrix(url, tz=TZ)
     return None, ""
 
 
@@ -2432,6 +2584,42 @@ def register_modules(assistant: "Assistant") -> None:
 
 Бесплатный Mistral может использовать переписку для улучшения своих моделей. Если это важно —
 отключи в настройках Mistral (Admin → Privacy).
+"""},
+        "llm": {
+            "title": "Своя модель (платная)",
+            "about": "Подключи любую модель по API — ChatGPT, Claude, Gemini, DeepSeek или через OpenRouter. "
+                     "Трой будет отвечать ею, а бесплатные модели останутся запасными.",
+            "fields": [{"name": "url", "label": "Сервис", "placeholder": "https://…/v1/",
+                        "choices": [["https://api.openai.com/v1/", "OpenAI (ChatGPT)"],
+                                    ["https://api.anthropic.com/v1/", "Anthropic (Claude)"],
+                                    ["https://generativelanguage.googleapis.com/v1beta/openai/", "Google Gemini"],
+                                    ["https://openrouter.ai/api/v1/", "OpenRouter — много моделей по одному ключу"],
+                                    ["https://api.deepseek.com/v1/", "DeepSeek"]]},
+                       {"name": "key", "label": "Ключ API", "secret": True},
+                       {"name": "model", "label": "Название модели", "placeholder": "как в кабинете сервиса"},
+                       {"name": "proxy", "label": "Прокси (только если сервис недоступен из твоей страны)",
+                        "placeholder": "socks5://адрес:порт", "optional": True}],
+            "state": _llm_state,
+            "connect": lambda v: _llm_connect(assistant, v),
+            "disconnect": lambda: _llm_disconnect(assistant),
+            "help": """
+Это для тех, кто хочет, чтобы Трой отвечал более сильной моделью. Модели платные: деньги списываются
+в кабинете выбранного сервиса за каждое сообщение (обычно копейки за ответ). Бесплатные модели Троя
+никуда не деваются — если у платной кончатся деньги или она недоступна, ответит бесплатная.
+
+1. Выбери сервис и зарегистрируйся у него:
+   - OpenAI (ChatGPT): https://platform.openai.com/api-keys
+   - Anthropic (Claude): https://console.anthropic.com/settings/keys
+   - Google Gemini: https://aistudio.google.com/apikey
+   - OpenRouter: https://openrouter.ai/keys — один ключ для моделей многих компаний
+   - DeepSeek: https://platform.deepseek.com/api_keys
+2. Пополни баланс (у Gemini есть и бесплатный лимит).
+3. Создай ключ, скопируй и вставь сюда.
+4. Название модели возьми в кабинете сервиса (раздел Models / Модели) — скопируй точно, как там написано.
+5. Нажми «Проверить и подключить» — Трой отправит модели одно короткое сообщение и скажет, получилось ли.
+
+Другой сервис с API «как у OpenAI» тоже подойдёт — выбери «Другой адрес…» и впиши адрес API.
+Отключить можно в любой момент — Трой вернётся на бесплатные модели.
 """},
         "github": {
             "title": "Идеи в GitHub",
