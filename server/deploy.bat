@@ -34,7 +34,7 @@ echo.
 echo Копирую файлы, устанавливаю и запускаю.
 echo Раскладка английская; пароль сервера спросят один раз (при вводе не виден).
 echo.
-tar -cf - -C "%SRC%" bot.py bitrix.py connectors.py desktop_api.py requirements.txt install.sh uninstall.sh settings.env | ssh -o StrictHostKeyChecking=accept-new %USR%@%IP% "mkdir -p '%DST%' && tar -xf - -C '%DST%' && bash '%DST%/install.sh' %IP% 1>&2 && cat '%DST%/tls/cert.pem'" > "%DESK%\troy-cert.pem"
+tar -cf - -C "%SRC%" bot.py bitrix.py connectors.py desktop_api.py backup.py requirements.txt install.sh uninstall.sh settings.env | ssh -o StrictHostKeyChecking=accept-new %USR%@%IP% "mkdir -p '%DST%' && tar -xf - -C '%DST%' && bash '%DST%/install.sh' %IP% 1>&2 && cat '%DST%/tls/cert.pem'" > "%DESK%\troy-cert.pem"
 if errorlevel 1 (
     echo.
     echo Установка завершилась с ошибкой - пришлите текст из этого окна.

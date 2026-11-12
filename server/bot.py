@@ -36,6 +36,7 @@ except ImportError:                      # Python 3.8 (Ubuntu 20.04): та же 
 import requests
 from dotenv import load_dotenv
 
+import backup
 import bitrix
 import connectors
 import desktop_api
@@ -2761,6 +2762,18 @@ class AppAuth:
                         (salt.hex() + ":" + cls._hash(password, salt),))
             return con.execute("DELETE FROM app_sessions").rowcount
 
+    @classmethod
+    def check_password(cls, password: str) -> bool:
+        with closing(db()) as con:
+            row = con.execute("SELECT value FROM kv WHERE key='app_password'").fetchone()
+        if not row or not password:
+            return False
+        salt_hex, stored = row["value"].split(":", 1)
+        ok = hmac.compare_digest(cls._hash(password, bytes.fromhex(salt_hex)), stored)
+        if not ok:
+            time.sleep(1)
+        return ok
+
     @staticmethod
     def has_password() -> bool:
         with closing(db()) as con:
@@ -3132,7 +3145,39 @@ def power_watch_loop() -> None:
         time.sleep(5)
 
 
+BACKUP_LOCK = threading.Lock()
+
+
+def backup_export(password: str) -> tuple:
+    """Копия памяти Троя файлом под паролем программы. (данные, ошибка)"""
+    if not AppAuth.check_password(password):
+        return None, "Неверный пароль программы."
+    with BACKUP_LOCK:
+        data = backup.make(db, ALLOWED_USER_ID, LOCAL_IDEAS_DIR, bool(GITHUB_TOKEN and GITHUB_REPO), BOT_NAME,
+                           globals().get("SERVER_VERSION", ""))
+        blob = backup.pack(data, password)
+    log.info("Сделана копия памяти: %s", backup.summary(data))
+    return blob, ""
+
+
+def backup_import(password: str, blob: bytes) -> tuple:
+    """Загрузить копию в этого Троя: нужен пароль программы того Троя, с которого её сняли. (получилось, текст)"""
+    try:
+        data = backup.unpack(blob, password)
+        with BACKUP_LOCK:
+            text = backup.restore(db, data, ALLOWED_USER_ID, LOCAL_IDEAS_DIR)
+    except backup.BackupError as e:
+        time.sleep(1)                           # перебор паролей к файлу через Троя — медленно
+        return False, str(e)
+    log.info("Загружена копия памяти: %s", backup.summary(data))
+    extra = (" Идеи прежнего Троя лежали в GitHub — подключи тот же репозиторий в «Подключениях»."
+             if data.get("ideas_in_github") and not (GITHUB_TOKEN and GITHUB_REPO) else "")
+    return True, text + " Ключи моделей, Telegram и Битрикс24 в копию не входят — они настраиваются отдельно." + extra
+
+
 class PcHooks:
+    backup_export = staticmethod(backup_export)
+    backup_import = staticmethod(backup_import)
     poll = staticmethod(pc_poll)
     result = staticmethod(pc_result)
     choose = staticmethod(pc_choose)

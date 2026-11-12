@@ -1333,7 +1333,21 @@ function drawConnList() {
     ${mods.length ? `<h4 class="conn-group">Трой</h4><div class="conn-list">${mods.map(item).join("")}</div>` : ""}
     ${mods.length ? `<h4 class="conn-group">Сервисы</h4>` : ""}
     <p class="conn-hint">Спрашивай: «что у меня завтра», «есть новые письма?», «выключи свет в зале».</p>
-    <div class="conn-list">${svcs.map(item).join("")}</div>`;
+    <div class="conn-list">${svcs.map(item).join("")}</div>
+    <h4 class="conn-group">Сервер и копия памяти</h4>
+    <div class="conn-list">
+      <div class="conn-item"><div class="row"><b>Копия памяти Троя</b></div>
+        <div class="about">Переписка, напоминания, подключения, сохранённые места и идеи — одним файлом, зашифрованным паролем программы.
+          Файл можно загрузить в другого Троя: он спросит пароль, который был у этого.</div>
+        <div class="conn-actions"><button data-sys="save">💾 Сохранить копию</button><button data-sys="load">📂 Загрузить копию</button></div></div>
+      <div class="conn-item"><div class="row"><b>Сервер</b><span class="conn-badge off" id="sys-server">…</span></div>
+        <div class="about">Перейти на другой сервер, где Трой уже установлен. Память со старого сервера переносится копией.</div>
+        <div class="conn-actions"><button data-sys="server">🔁 Сменить сервер</button></div></div>
+    </div>`;
+  fetch(BASE + "/server/info").then((r) => r.json()).then((i) => {
+    const el = $("sys-server"); if (el) el.textContent = i.local ? "на этом компьютере" : i.server;
+  }).catch(() => {});
+  body.querySelectorAll("[data-sys]").forEach((b) => (b.onclick = () => drawSysForm(b.dataset.sys)));
   body.querySelectorAll(".conn-item").forEach((el) => el.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
     const c = conns.find((x) => x.id === el.dataset.id);
     if (b.dataset.a === "help") return showHelp({ title: c.title, text: c.help });
@@ -1342,6 +1356,56 @@ function drawConnList() {
     try { conns = (await api("/connections/remove", { id: c.id })).connections; drawConnList(); }
     catch (e) { b.disabled = false; flash("Не получилось отключить: " + e.message); }
   })));
+}
+// ── копия памяти и смена сервера ──
+function drawSysForm(kind) {
+  const body = connModal().querySelector(".body");
+  const F = {
+    save: { title: "Сохранить копию памяти", btn: "Сохранить копию",
+      about: "Трой соберёт переписку, напоминания, подключения, места и идеи в один файл и зашифрует его паролем программы. Файл появится в папке «Загрузки\\Трой». Ключи моделей, Telegram и Битрикс24 в копию не входят.",
+      fields: `<label>Пароль программы (им ты входишь в Троя)<input name="password" type="password" autocomplete="off"></label>` },
+    load: { title: "Загрузить копию памяти", btn: "Загрузить в этого Троя",
+      about: "Память этого Троя — переписка, напоминания, подключения, места — будет ЗАМЕНЕНА содержимым копии. Пароль программы и входы на компьютерах не изменятся.",
+      fields: `<label>Файл копии (.troybak)<input name="file" type="file" accept=".troybak"></label>
+        <label>Пароль программы того Троя, с которого сделана копия<input name="password" type="password" autocomplete="off"></label>` },
+    server: { title: "Сменить сервер", btn: "Проверить и перейти",
+      about: "Укажи адрес сервера, где Трой уже установлен, и пароль программы на нём. Программа проверит связь и пароль и только потом переключится. Память переносится отдельно: здесь «Сохранить копию», там «Загрузить копию».",
+      fields: `<label>Адрес сервера<input name="address" type="text" placeholder="203.0.113.10 или 203.0.113.10:8443" autocomplete="off"></label>
+        <label>Пароль программы Троя на том сервере<input name="password" type="password" autocomplete="off"></label>` },
+  }[kind];
+  body.innerHTML = `<p><b>${F.title}</b><br>${esc(F.about)}</p>
+    <form class="conn-form">${F.fields}<div class="err"></div><div class="ok"></div>
+      <div class="conn-actions"><button type="submit" class="primary">${F.btn}</button>
+      <button type="button" data-a="back">Назад</button></div></form>`;
+  body.querySelector('[data-a="back"]').onclick = drawConnList;
+  const form = body.querySelector("form"), err = form.querySelector(".err"), ok = form.querySelector(".ok");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const pw = form.password.value, btn = form.querySelector('button[type="submit"]');
+    err.textContent = ok.textContent = "";
+    let req;
+    if (kind === "load") {
+      const file = form.file.files[0];
+      if (!file) { err.textContent = "⚠️ Выбери файл копии."; return; }
+      if (file.size > 64 * 1024 * 1024) { err.textContent = "⚠️ Файл слишком большой для копии Троя."; return; }
+      req = { method: "POST", headers: { "X-Troy-Password": encodeURIComponent(pw) }, body: await file.arrayBuffer() };
+    } else {
+      req = { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(kind === "save" ? { password: pw } : { password: pw, address: form.address.value.trim() }) };
+    }
+    btn.disabled = true; btn.textContent = "Минутку…";
+    try {
+      const r = await fetch(BASE + { save: "/backup/save", load: "/backup/load", server: "/server/switch" }[kind], req);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { err.textContent = "⚠️ " + (d.error || "не получилось"); return; }
+      form.password.value = "";
+      if (kind === "save") { ok.textContent = "✅ Копия сохранена: " + d.path; addBox("info", "💾 Копия памяти сохранена: " + d.path + "\nХрани её как пароль: в ней вся переписка. Открыть её можно только паролем программы."); }
+      if (kind === "load") { connModal().classList.remove("show"); addBox("info", "📂 " + d.text + "\nСейчас окно обновится."); setTimeout(() => location.reload(), 2500); }
+      if (kind === "server") { connModal().classList.remove("show"); addBox("info", "🔁 Программа подключена к серверу " + d.server.replace("https://", "") + ".\nОтпечаток сертификата: " + d.fingerprint + "\nСейчас окно обновится."); setTimeout(() => location.reload(), 2500); }
+    } catch (ex) { err.textContent = "⚠️ " + ex.message; }
+    finally { btn.disabled = false; btn.textContent = F.btn; }
+  };
+  form.querySelector("input")?.focus();
 }
 function drawConnForm(c) {
   const body = connModal().querySelector(".body");

@@ -133,7 +133,7 @@ def settings_text(template: str, values: dict) -> str:
 
 # ───────────────────────── сервер (VPS) по SSH ─────────────────────────
 
-SERVER_FILES = ["bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt", "install.sh", "uninstall.sh"]
+SERVER_FILES = ["bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "backup.py", "requirements.txt", "install.sh", "uninstall.sh"]
 
 
 def parse_vps_address(text: str) -> Optional[tuple]:

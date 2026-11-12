@@ -121,8 +121,8 @@ class Remote:
             self._save("")
         return code, resp
 
-    def _send(self, method: str, path: str, body: bytes = b"", auth: bool = True):
-        headers = {"Content-Type": "application/json"}
+    def _send(self, method: str, path: str, body: bytes = b"", auth: bool = True, headers: dict = None):
+        headers = {"Content-Type": "application/json", **(headers or {})}
         if auth and self.session:
             headers["Authorization"] = f"Bearer {self.session}"
         try:
@@ -495,6 +495,20 @@ def bug_save(rep_: dict) -> str:
     return str(target)
 
 
+def switch_server(remote, address: str, password: str) -> dict:
+    """Сменить сервер из программы (окно «Подключения»)."""
+    global CONFIG, CERT
+    import server_tools
+    was_local = not str(remote.base).startswith("https://")
+    res = server_tools.switch_server(remote, address, password, DATA_DIR, mode_key=True)
+    if res.get("ok"):
+        CONFIG, CERT = DATA_DIR / "config.json", DATA_DIR / "troy-cert.pem"
+        restart = globals().get("APP_HOOKS", {}).get("restart")
+        if was_local and restart:               # Трой жил на этом компьютере — перезапускаемся уже без него
+            threading.Timer(2, restart).start()
+    return res
+
+
 def make_handler(remote: Remote, key: str):
     prefix = f"/{key}"
     files = {"/": ("ui.html", "text/html; charset=utf-8"), "/favicon.png": ("favicon.png", "image/png")}
@@ -553,6 +567,9 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes(check_update()))
             elif path == "/update/status":
                 self.send(200, jbytes(UPD))
+            elif path == "/server/info":                 # к какому серверу подключена программа
+                base = str(remote.base)
+                self.send(200, jbytes({"server": base.split("://", 1)[-1], "local": not base.startswith("https://")}))
             elif path == "/win":                         # окно без системной полосы: развёрнуто ли
                 import window_frame
                 hwnd = find_window() if os.name == "nt" else None
@@ -620,6 +637,28 @@ def make_handler(remote: Remote, key: str):
                 log.warning("Микрофон не дали: %s %s (окно: %s, Windows %s)", info.get("name"), info.get("message"),
                             "WebView2" if sh and sh.started() else "Edge", getattr(sys, "getwindowsversion", lambda: "?")())
                 self.send(200, b"{}")
+                return
+            if path in ("/backup/save", "/backup/load", "/server/switch"):   # копия памяти и смена сервера
+                import pc_control
+                import server_tools
+                from urllib.parse import unquote
+                try:
+                    if path == "/backup/load":           # тело — сам файл копии, пароль — в заголовке
+                        res = server_tools.backup_load(remote, unquote(self.headers.get("X-Troy-Password") or ""), body)
+                    else:
+                        data = json.loads(body or b"{}")
+                        pw = str(data.get("password") or "")
+                        res = (server_tools.backup_save(remote, pw, pc_control._downloads() / "Трой")
+                               if path == "/backup/save" else switch_server(remote, str(data.get("address") or ""), pw))
+                    if res.get("path"):
+                        try:
+                            subprocess.Popen(["explorer.exe", "/select,", res["path"]], creationflags=0x08000000)
+                        except OSError:
+                            pass
+                except Exception as e:
+                    log.exception("%s", path)
+                    res = {"error": f"не получилось: {e}"}
+                self.send(400 if res.get("error") else 200, jbytes(res))
                 return
             if path == "/savefile":                         # файл от Троя (например, переписка) → «Загрузки\\Трой»
                 import base64
@@ -805,7 +844,10 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 WHATS_NEW = [
  {
   "version": "0.6.1",
-  "added": [],
+  "added": [
+   "Копия памяти («Подключения» → внизу): переписка, напоминания, подключения, места и идеи сохраняются на компьютер одним файлом, зашифрованным паролем программы. Файл можно загрузить в другого Троя — он спросит пароль прежнего.",
+   "Смена сервера из программы («Подключения» → «Сервер»): укажи адрес сервера, где Трой уже установлен, и пароль — программа проверит и переключится."
+  ],
   "fixed": [
    "Меню, «Подключения» и окна Троя больше не прячутся под открытым сайтом — Трой сам переключается на чат.",
    "Окно: при открытом сайте его можно тянуть за края; щелчок по шапке развёрнутого окна его не сворачивает; окно не откроется за пределами экрана, если отключили монитор; развёрнутое окно открывается развёрнутым.",
@@ -1501,7 +1543,7 @@ def repair_server(remote: "Remote", address: str, password: str) -> None:
         try:
             cli.exec_command("rm -rf /tmp/troyfix && mkdir -p /tmp/troyfix")[1].channel.recv_exit_status()
             sftp = cli.open_sftp()
-            for name in ("bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "requirements.txt"):
+            for name in ("bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "backup.py", "requirements.txt"):
                 with sftp.open(f"/tmp/troyfix/{name}", "wb") as f:
                     f.write((SERVER_SRC / name).read_bytes().replace(b"\r\n", b"\n"))
             with sftp.open("/tmp/troyfix/fix.sh", "wb") as f:

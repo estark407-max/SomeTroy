@@ -207,6 +207,31 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 self.reply(200 if not err else 400, {"ok": not err, "error": err or "", "note": getattr(conns, "note", ""),
                                                      "connections": conns.listing()})
                 return
+            if path in ("/api/backup/export", "/api/backup/import") and hasattr(pc, "backup_export"):
+                from urllib.parse import unquote
+                password = unquote(self.headers.get("X-Troy-Password") or "")
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > 64 * 1024 * 1024:
+                    self.reply(413, {"error": "файл копии слишком большой"})
+                    return
+                raw = self.rfile.read(length)
+                if path.endswith("/export"):                 # копия памяти — зашифрованным файлом
+                    blob, err = pc.backup_export(password)
+                    if blob is None:
+                        self.reply(403, {"error": err})
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(blob)))
+                    self.end_headers()
+                    self.wfile.write(blob)
+                    return
+                ok, text = pc.backup_import(password, raw)
+                self.reply(200 if ok else 400, {"ok": ok, "text": text} if ok else {"error": text})
+                return
             if path == "/api/pc/choose":
                 data = self.body()
                 if data is None:
