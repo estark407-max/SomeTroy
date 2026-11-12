@@ -1350,7 +1350,7 @@ function drawConnList() {
     const el = $("sys-server"); if (el) el.textContent = i.local ? "на этом компьютере" : i.server;
   }).catch(() => {});
   body.querySelectorAll("[data-sys]").forEach((b) => (b.onclick = () => drawSysForm(b.dataset.sys)));
-  body.querySelectorAll(".conn-item").forEach((el) => el.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
+  body.querySelectorAll(".conn-item[data-id]").forEach((el) => el.querySelectorAll("button").forEach((b) => (b.onclick = async () => {
     const c = conns.find((x) => x.id === el.dataset.id);
     if (b.dataset.a === "help") return showHelp({ title: c.title, text: c.help });
     if (b.dataset.a === "edit") return drawConnForm(c);
