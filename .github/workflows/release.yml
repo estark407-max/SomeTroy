@@ -1,0 +1,84 @@
+# Сборка установщика Troy и публикация выпуска.
+# Запускается, когда в репозиторий приходит метка версии (v0.6.1), или вручную со страницы Actions.
+# Версия берётся из APP_VERSION в desktop/troy_desktop.py; метка должна с ней совпадать.
+name: Выпуск Troy
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Библиотеки
+        run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q "requests[socks]" pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf pywebview pythonnet
+
+      - name: Версия
+        id: ver
+        run: |
+          $ver = (python set_version.py).Trim()
+          if (-not $ver) { throw "не удалось определить версию" }
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$ver") {
+            throw "метка $env:GITHUB_REF_NAME не совпадает с версией программы $ver"
+          }
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Версия: $ver"
+
+      - name: Программа (PyInstaller)
+        run: |
+          $wv = python -c "import webview,os;print(os.path.join(os.path.dirname(webview.__file__),'lib'))"
+          if (-not (Test-Path $wv)) { throw "нет файлов WebView2 в пакете pywebview" }
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name SomeTroy `
+            --version-file version.txt --icon troy.ico --hidden-import pystray._win32 `
+            --add-data "ui.html;." --add-data "favicon.png;." `
+            --add-data "$wv;webview\lib" --hidden-import clr --hidden-import shell_window --hidden-import server_tools `
+            --collect-all pythonnet --collect-all clr_loader `
+            --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import connectors `
+            --hidden-import desktop_api --hidden-import backup `
+            --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata `
+            --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" `
+            --add-data "..\server\connectors.py;server_src" --add-data "..\server\desktop_api.py;server_src" `
+            --add-data "..\server\backup.py;server_src" --add-data "..\server\requirements.txt;server_src" `
+            --add-data "..\server\install.sh;server_src" --add-data "..\server\uninstall.sh;server_src" `
+            --add-data "..\server\settings.env.example;server_src" troy_desktop.py
+          if (-not (Test-Path "dist\SomeTroy\SomeTroy.exe")) { throw "SomeTroy.exe не собрался" }
+
+      - name: Установщик (Inno Setup)
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { choco install innosetup -y --no-progress; $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc /Q "/DAppVersion=${{ steps.ver.outputs.ver }}" troy.iss
+          if (-not (Test-Path "SomeTroySetup-${{ steps.ver.outputs.ver }}.exe")) { throw "установщик не собрался" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SomeTroySetup-${{ steps.ver.outputs.ver }}
+          path: desktop/SomeTroySetup-${{ steps.ver.outputs.ver }}.exe
+
+      - name: Выпуск на GitHub
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = "${{ steps.ver.outputs.ver }}"
+          $notes = python -c "import ast,sys;sys.stdout.reconfigure(encoding='utf-8');t=ast.parse(open('troy_desktop.py',encoding='utf-8').read());w=[ast.literal_eval(n.value) for n in t.body if isinstance(n,ast.Assign) and getattr(n.targets[0],'id','')=='WHATS_NEW'][0][0];print('\n'.join((['## Новое']+['- '+x for x in w['added']] if w['added'] else [])+(['','## Исправлено']+['- '+x for x in w['fixed']] if w['fixed'] else [])) if w['version']=='$ver' else '')"
+          $notes = ($notes -join "`n") + "`n`n---`nЕсли Windows пишет «Ошибка 4551» — установку блокирует «Интеллектуальное управление приложениями» (Безопасность Windows → Управление приложениями и браузером): у программы нет цифровой подписи."
+          $notes | Out-File -Encoding utf8 notes.md
+          gh release create "v$ver" "SomeTroySetup-$ver.exe" --title "Troy $ver" --notes-file notes.md
