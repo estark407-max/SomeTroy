@@ -41,7 +41,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -346,6 +346,9 @@ def install_update() -> None:
     if not info.get("newer"):
         UPD.update(state="error", error=info.get("error") or "новой версии нет")
         return
+    if not info["url"].startswith("https://github.com/"):          # установщик — только со страницы релизов GitHub
+        UPD.update(state="error", error="ссылка на обновление ведёт не на GitHub")
+        return
     UPD.update(state="download", done=0, total=info["size"], error="", version=info["latest"])
     target = Path(tempfile.gettempdir()) / info["name"]
     try:
@@ -362,8 +365,11 @@ def install_update() -> None:
         return
     UPD["state"] = "install"
     log.info("Ставлю обновление %s", info["latest"])
-    subprocess.Popen([str(target), "/SP-", "/SILENT", "/NOCANCEL", "/SUPPRESSMSGBOXES"],
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # установщик сам закроет Троя
+    try:
+        subprocess.Popen([str(target), "/SP-", "/SILENT", "/NOCANCEL", "/SUPPRESSMSGBOXES"],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # установщик сам закроет Троя
+    except OSError as e:                          # антивирус удалил файл, Windows запретила запуск…
+        UPD.update(state="error", error=f"установщик не запустился: {e}")
 
 
 BUG = {"shot": b""}                  # скриншот к отчёту (PNG), пока окно отчёта открыто
@@ -550,8 +556,9 @@ def make_handler(remote: Remote, key: str):
             elif path == "/win":                         # окно без системной полосы: развёрнуто ли
                 import window_frame
                 hwnd = find_window() if os.name == "nt" else None
+                sh = _shell()
                 self.send(200, jbytes({"frameless": window_frame.STATE["enabled"] and window_frame.frameless(hwnd),
-                                       "max": window_frame.is_max(hwnd)}))
+                                       "shell": bool(sh and sh.started()), "max": window_frame.is_max(hwnd)}))
             elif path == "/tabs":                        # вкладки сайтов в шапке
                 sh = _shell()
                 if sh and sh.started():
@@ -796,6 +803,21 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 
 WHATS_NEW = [
+ {
+  "version": "0.6.1",
+  "added": [],
+  "fixed": [
+   "Меню, «Подключения» и окна Троя больше не прячутся под открытым сайтом — Трой сам переключается на чат.",
+   "Окно: при открытом сайте его можно тянуть за края; щелчок по шапке развёрнутого окна его не сворачивает; окно не откроется за пределами экрана, если отключили монитор; развёрнутое окно открывается развёрнутым.",
+   "«Повторить» не трогает набранный текст и вложения.",
+   "Битрикс24: «да» выполняет все показанные действия (например, две задачи), а старое «Делаю?» не срабатывает на «да» по другому поводу.",
+   "Трой не принимает за пароль обычные вопросы про пароли и не путает «логин» и «логотип» с просьбой сохранить переписку.",
+   "Если до платной модели не достучаться, отвечает запасная. Напоминание «каждый месяц 31-го» не сползает на 28-е.",
+   "После перезапуска сервера напоминания и ответы компьютеров снова приходят в открытое окно программы.",
+   "Защита: ключи и адреса с ключами не попадают в журнал и в тексты ошибок; закрыты две лазейки в серверной части.",
+   "Обновление из программы: если установщик не запустился, Трой скажет об этом, а не будет «ставить» бесконечно."
+  ]
+ },
  {
   "version": "0.6.0",
   "added": [
@@ -1191,7 +1213,7 @@ def pc_worker(remote: Remote) -> None:
                 code, body = remote.forward("GET", f"/api/pc/poll?v={APP_VERSION}")
                 if code == 200:
                     for cmd in json.loads(body).get("commands", []):
-                        log.info("Команда: %s %s", cmd["action"], cmd.get("arg", ""))
+                        log.info("Команда: %s", cmd["action"])       # без подробностей: адреса и имена файлов в журнал не пишем
                         try:
                             def late(ok2, text2, cid=cmd["id"]):      # например, «выключение отменили на компьютере»
                                 remote.forward("POST", "/api/pc/result",
@@ -1430,6 +1452,8 @@ def move_to_vps(values: dict) -> tuple:
     if not res.get("ok"):
         tail = f"\nПоследние строки установки:\n{res['log']}" if res.get("log") else ""
         return res.get("error", "не получилось") + tail, ""
+    global CERT                                   # сертификат сервера — в папку данных: папку программы затирает установщик
+    CERT = DATA_DIR / "troy-cert.pem"
     CERT.write_text(res["cert"], encoding="utf-8")
     (DATA_DIR / "config.json").write_text(json.dumps({"mode": "vps", "server": f"https://{ip}:{res['port']}"}),
                                           encoding="utf-8")

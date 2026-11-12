@@ -732,10 +732,18 @@ function drawTabs(list) {
     if (r) drawTabs(r.tabs || []);
   }));
 }
+let siteActive = false;
+function toChat() {                                     // окно сайта закрывает собой страницу Троя: меню и окна — только в чате
+  if (!siteActive) return;
+  siteActive = false;
+  fetch(BASE + "/tabs/show", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: null }) })
+    .then(pollTabs).catch(() => {});
+}
 async function pollTabs() {
   const r = await fetch(BASE + "/tabs").then((x) => x.json()).catch(() => null);
   if (!r) return;
   const had = !$("tabs").hidden; drawTabs(r.tabs || []);
+  siteActive = (r.tabs || []).some((t) => t.active);
   if (!had && !$("tabs").hidden || (r.tabs || []).length) {   // полоска только что появилась или сменилась — сообщаем высоту
     fetch(BASE + "/tabs/layout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ top: tabsTop() }) }).catch(() => {});
   }
@@ -754,9 +762,13 @@ function setReply(text) {
 }
 document.addEventListener("click", (e) => { if (e.target.closest("#reply-bar button")) setReply(""); });
 let lastAsk = null;                                      // последний вопрос — для «Повторить» у ответа Троя
+let askQuote = "";                                       // полная цитата последнего отправленного (для «Повторить»)
 function resend(ask) {                                  // «Повторить»: отправить тот же текст ещё раз
-  if (!ask || !ask.text || busy) return;
-  input.value = ask.text; autosize(); setReply(ask.quote || ""); send();
+  if (!ask || !ask.text || busy || (typeof wizard !== "undefined" && wizard)) return;
+  const draft = input.value, files = pending, reply = replyTo;   // черновик и вложения не трогаем
+  pending = []; input.value = ask.text; setReply(ask.quote || "");
+  send();
+  input.value = draft; pending = files; drawFiles(); autosize(); setReply(reply);
 }
 function addUser(text, ts, files = [], quote = "") {
   $("empty")?.remove(); addDay(ts);
@@ -771,8 +783,9 @@ function addUser(text, ts, files = [], quote = "") {
       ${imgs ? `<div class="thumbs">${imgs}</div>` : ""}
       ${text || others ? `<div class="bubble">${quote ? `<span class="quote">↩ ${esc(quote)}</span>` : ""}${esc(text)}${others}</div>` : ""}
       <div class="meta"><span>${fmtTime(ts)}</span></div></div>`;
-  const ask = { text: text.replace(/^🎤\s*/, "").trim(), quote };
-  if (ask.text) {
+  const ask = { text: text.replace(/^🎤\s*/, "").trim(), quote: askQuote || quote };
+  askQuote = "";
+  if (ask.text && !(typeof wizard !== "undefined" && wizard)) {
     const b = document.createElement("button"); b.textContent = "Повторить"; b.title = "Отправить это сообщение ещё раз";
     b.onclick = () => resend(ask); el.querySelector(".meta").appendChild(b);
   }
@@ -911,7 +924,7 @@ async function send(voice) {
   const text = voice ? "" : input.value.trim();
   const files = voice ? [voice] : pending;
   if (!text && !files.length) return;
-  const quote = replyTo; setReply("");
+  const quote = replyTo; setReply(""); askQuote = quote;
   addUser(text, Date.now() / 1000, voice ? [{ name: "🎤 голосовое сообщение" }] : files, quote.replace(/\s+/g, " ").slice(0, 120));
   play("sent");
   if (!voice) { input.value = ""; pending = []; drawFiles(); autosize(); }
@@ -1616,7 +1629,7 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
   function paint(st) {
     if (!st) return;
     // свои кнопки — только если над страницей правда нет полосы Windows (Edge мог её вернуть)
-    if ("frameless" in st) document.body.classList.toggle("frameless", !!st.frameless && outerHeight - innerHeight < 12);
+    if ("frameless" in st) document.body.classList.toggle("frameless", !!st.frameless && (!!st.shell || outerHeight - innerHeight < 12));
     document.body.classList.toggle("maxed", !!st.max);
     const b = document.getElementById("win-max");
     b.title = st.max ? "Вернуть обычный размер" : "Развернуть";
@@ -1642,6 +1655,12 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
   }));
   addEventListener("resize", () => setTimeout(state, 150));
   state(); setTimeout(state, 1500); setInterval(state, 4000);
+  // кнопки шапки и всплывающие окна Троя — показываем чат, иначе их не видно под открытым сайтом
+  document.querySelector("header").addEventListener("click", (e) => { if (e.target.closest("button") && !e.target.closest(".win-ctl")) toChat(); }, true);
+  for (const n of ["showLogin", "showWhatsNew", "showHelp", "openConnections", "openRepair", "checkUpdate", "micError"]) {
+    const f = window[n];
+    if (typeof f === "function") window[n] = function () { toChat(); return f.apply(this, arguments); };
+  }
 })();
 </script>
 </body>

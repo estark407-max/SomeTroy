@@ -152,17 +152,22 @@ def _follow(hwnd, edge: str) -> None:
     try:
         cx, cy = _cursor(u)
         x, y, w, h = _rect(u, hwnd)
-        if not edge and is_max(hwnd):             # тянем развёрнутое окно — сначала вернуть обычный размер под курсором
-            ox, oy, ow, oh = STATE["max"].pop(hwnd)
-            rel = (cx - x) / max(1, w)
-            x, y, w, h = int(cx - ow * rel), y, ow, oh
-            _move(u, hwnd, x, y, w, h)
-        elif edge:
+        if edge:
             STATE["max"].pop(hwnd, None)
         start = time.time()
+        moved = False
         while u.GetAsyncKeyState(VK_LBUTTON) & 0x8000 and time.time() - start < 120:
             px, py = _cursor(u)
             dx, dy = px - cx, py - cy
+            if not moved:
+                if abs(dx) + abs(dy) <= 4:        # просто щелчок (или первый из двойного) — окно не трогаем
+                    time.sleep(0.01)
+                    continue
+                moved = True
+                if not edge and is_max(hwnd):     # потянули развёрнутое окно — вернуть обычный размер под курсором
+                    ox, oy, ow, oh = STATE["max"].pop(hwnd)
+                    rel = (cx - x) / max(1, w)
+                    x, y, w, h = int(cx - ow * rel), y, ow, oh
             if not edge:
                 _move(u, hwnd, x + dx, y + dy, w, h)
             else:
@@ -179,7 +184,7 @@ def _follow(hwnd, edge: str) -> None:
                     ny = y + h - nh
                 _move(u, hwnd, nx, ny, nw, nh)
             time.sleep(0.01)
-        if not edge:                              # бросили у верхнего края экрана — развернуть
+        if not edge and moved:                    # бросили у верхнего края экрана — развернуть
             px, py = _cursor(u)
             wx, wy, _, _ = _work_area(u, hwnd)
             if py <= wy + 2:

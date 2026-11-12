@@ -81,8 +81,11 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             return False
 
         def body(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > MAX_BODY:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > MAX_BODY:      # отрицательная длина заставила бы читать без ограничения
                 self.reply(413, {"error": "файл слишком большой (до 20 МБ)"})
                 return None
             try:
@@ -135,11 +138,12 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             except (ValueError, OSError):
                 self.send_error(502, "no such host")
                 return
-            if any(a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast for a in addrs):
+            if not addrs or any(not a.is_global or a.is_multicast for a in addrs):   # только обычные адреса интернета
                 self.send_error(403, "local address")
                 return
-            try:
-                target = socket.create_connection((host.strip("[]"), port), timeout=20)
+            try:                                     # соединяемся с уже проверенным адресом (имя второй раз не спрашиваем)
+                ip = sorted(addrs, key=lambda a: a.version)[0]
+                target = socket.create_connection((str(ip), port), timeout=20)
             except OSError:
                 self.send_error(502, "cannot connect")
                 return
@@ -170,8 +174,11 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 return
             if path == "/api/files/upload" and hasattr(pc, "file_upload"):        # источник отдаёт файл
                 q = parse_qs(urlparse(self.path).query)
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > pc.FILE_MAX:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > pc.FILE_MAX:
                     self.reply(413, {"error": f"файл больше {pc.FILE_MAX // 1024 // 1024} МБ"})
                     return
                 data = self.rfile.read(length)

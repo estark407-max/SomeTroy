@@ -20,6 +20,7 @@ import imaplib
 import json
 import logging
 import re
+import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
@@ -46,6 +47,8 @@ def _err(e: BaseException) -> str:
         return "сервис долго не отвечает"
     if isinstance(e, requests.exceptions.ConnectionError):
         return "нет соединения с сервисом — проверь адрес и интернет"
+    if isinstance(e, requests.HTTPError) and e.response is not None:     # в тексте ошибки был бы адрес с ключом
+        return f"сервис ответил ошибкой {e.response.status_code}"
     return str(e)[:200]
 
 
@@ -379,7 +382,11 @@ def _imap(cfg: dict) -> imaplib.IMAP4_SSL:
     host = (cfg.get("host") or "").strip() or IMAP_HOSTS.get(cfg["email"].split("@")[-1].lower(), "")
     if not host:
         raise ValueError("не знаю сервер этой почты — впиши его в поле «Сервер IMAP» (например imap.example.com)")
-    m = imaplib.IMAP4_SSL(host, 993, timeout=25)
+    if sys.version_info >= (3, 9):
+        m = imaplib.IMAP4_SSL(host, 993, timeout=25)
+    else:                                            # в Python 3.8 у IMAP4_SSL нет timeout
+        m = imaplib.IMAP4_SSL(host, 993)
+        m.sock.settimeout(25)
     try:
         m.login(cfg["email"], cfg["password"])
     except imaplib.IMAP4.error:
@@ -1266,7 +1273,7 @@ class Connections:
         except PermissionError as e:
             return f"Ошибка доступа ({CONNECTORS[cid]['title']}): {e}. Переподключи в программе: «Подключения»."
         except Exception as e:
-            log.warning("Подключение %s: %s", cid, e)
+            log.warning("Подключение %s: %s", cid, _err(e) if isinstance(e, requests.RequestException) else e)
             return f"Ошибка ({CONNECTORS[cid]['title']}): {_err(e) if isinstance(e, requests.RequestException) else e}"
 
     def diag(self) -> List[str]:

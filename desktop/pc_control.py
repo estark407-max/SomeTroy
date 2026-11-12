@@ -416,6 +416,7 @@ def file_get(remote, arg: str):
     import json
     info = json.loads(arg or "{}")
     name, src = info.get("name") or "файл", info.get("from") or "другого компьютера"
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(str(name).replace("\\", "/")).name).strip(" .") or "файл"
     code, data = remote.forward("GET", f"/api/files/get?id={info.get('id', '')}")
     if code != 200:
         return False, f"не смог забрать «{name}» с сервера (код {code})"

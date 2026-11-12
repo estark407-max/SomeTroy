@@ -42,7 +42,7 @@ import desktop_api
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
 # указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
-SERVER_VERSION = "0.6.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
+SERVER_VERSION = "0.6.1"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
 BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
 load_dotenv(BASE / "settings.env", override=True)
 LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
@@ -105,7 +105,8 @@ log = logging.getLogger("assistant")
 STARTED = time.time()
 
 
-_SECRET_RE = re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}|(github_pat_|ghp_)[\w]{10,}")
+_SECRET_RE = re.compile(r"(bot)\d{5,12}:[\w-]{20,}|(gsk_)[\w-]{8,}|(/rest/\d+/)[\w]{6,}|(github_pat_|ghp_)[\w]{10,}|"
+                        r"\b(sk-)[\w-]{16,}|\b(y0_)[\w-]{16,}|(Bearer )[\w.-]{16,}")
 
 
 def redact(text: str) -> str:
@@ -124,6 +125,12 @@ def human_error(e: BaseException) -> str:
     if isinstance(e, requests.exceptions.ConnectionError):
         return "нет соединения — проверь интернет; возможно, сайт заблокирован (нужен VPN или прокси)"
     return redact(str(e))[:200]
+
+
+class _RedactFormatter(logging.Formatter):
+    """Журнал целиком, вместе с текстом исключений, — без токенов и ключей."""
+    def format(self, record):
+        return redact(super().format(record))
 
 
 class _RedactFilter(logging.Filter):
@@ -326,6 +333,8 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     with closing(db()) as con, con:
         con.executescript(SCHEMA)
+        if "anchor" not in [c[1] for c in con.execute("PRAGMA table_info(reminders)")]:
+            con.execute("ALTER TABLE reminders ADD COLUMN anchor INTEGER")   # исходное число месяца для повторов
         # журнал появился позже истории — при первом запуске переносим то, что уже есть
         con.execute("INSERT INTO message_log(chat_id, role, text, ts) SELECT chat_id, role, text, ts FROM history "
                     "WHERE NOT EXISTS (SELECT 1 FROM message_log) ORDER BY id")
@@ -378,7 +387,7 @@ def get_history(chat_id: str) -> list:
 # «Сохрани переписку за неделю» — журнал сообщений файлом (в Telegram — документом, в программе — в «Загрузки\\Трой»)
 LOG_RE = re.compile(r"^(?:(?:трой|эй)[\s,!.:—-]+)?(?:сохрани|выгрузи|экспортируй|скачай|скинь|пришли|отправь|дай|сделай|"
                     r"собери|сформируй|выведи|запиши в файл)\s+(?:мне\s+)?(?:(?:весь|всю|полный|полную|текстовый|"
-                    r"текстовую|нашу|наш|эту|этот)\s+){0,2}(?:лог\w*|переписк\w*|чат|диалог|"
+                    r"текстовую|нашу|наш|эту|этот)\s+){0,2}(?:лог(?:и|а|у|ов)?|переписк\w*|чат|диалог|"
                     r"истори\w*\s+(?:сообщений|переписки|чата|разговора))\b(.*)$", re.I)
 _LOG_NUM = {"один": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "десять": 10}
 
@@ -391,7 +400,7 @@ def log_period(rest: str) -> tuple:
         return today.timestamp(), "за сегодня", None
     if "вчера" in r:
         return (today - timedelta(days=1)).timestamp(), "за вчера", today.timestamp()
-    m = re.search(r"(\d+|" + "|".join(_LOG_NUM) + r")?\s*(час|д(?:ень|ня|ней)|сутк|недел|месяц|год)", r)
+    m = re.search(r"(\d+|" + "|".join(_LOG_NUM) + r")?\s*(?<![а-яё])(час|д(?:ень|ня|ней)|сутк|недел|месяц|год)", r)
     if m:
         n = int(m.group(1)) if (m.group(1) or "").isdigit() else _LOG_NUM.get(m.group(1) or "", 1)
         unit = m.group(2)
@@ -427,7 +436,8 @@ def export_log(chat_id: str, rest: str = "") -> Optional[tuple]:
 
 # Пароли, ключи и токены в чате: нейросети не отправляем, в историю не пишем
 SECRET_IN_TEXT = re.compile(
-    r"парол\w*\s*(?:[:=—-]\s*\S+|(?:\s+\S+){0,3}?\s+(?=\S*\d)(?=\S*[A-Za-z])\S{6,})|\bpassword\s*[:=]\s*\S+|"
+    r"парол\w*\s*[:=]\s*\S+|парол\w*(?:\s+(?:от|для|на|к)\s+\S+)?\s+(?=\S*\d)(?=\S*[A-Za-z])\S{6,}[\s.!]*$|"
+    r"\bpassword\s*[:=]\s*\S+|"
     r"ssh-(?:rsa|ed25519|ecdsa)\s+AAAA[\w+/=]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|"
     r"\bgsk_[\w-]{10,}|\b\d{6,12}:AA[\w-]{30,}|\bgithub_pat_\w{10,}|\bghp_\w{20,}|\bsk-[\w-]{20,}|\by0_[\w-]{20,}", re.I)
 
@@ -472,7 +482,9 @@ def parse_when(when: str) -> datetime:
     raise ValueError(f"не понял время «{when}», нужен формат ГГГГ-ММ-ДД ЧЧ:ММ")
 
 
-def next_due(dt: datetime, repeat: str) -> Optional[datetime]:
+def next_due(dt: datetime, repeat: str, anchor: int = 0) -> Optional[datetime]:
+    """anchor — исходное число месяца: «31-го» после февраля снова 31-е, а не 28-е."""
+    day = anchor or dt.day
     if repeat == "daily":
         return dt + timedelta(days=1)
     if repeat == "weekdays":
@@ -484,10 +496,10 @@ def next_due(dt: datetime, repeat: str) -> Optional[datetime]:
         return dt + timedelta(weeks=1)
     if repeat == "monthly":
         y, m = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
-        return dt.replace(year=y, month=m, day=min(dt.day, calendar.monthrange(y, m)[1]))
+        return dt.replace(year=y, month=m, day=min(day, calendar.monthrange(y, m)[1]))
     if repeat == "yearly":
         y = dt.year + 1
-        return dt.replace(year=y, day=min(dt.day, calendar.monthrange(y, dt.month)[1]))
+        return dt.replace(year=y, day=min(day, calendar.monthrange(y, dt.month)[1]))
     return None
 
 
@@ -496,11 +508,12 @@ def add_reminder(chat_id: str, when: str, text: str, repeat: str = "none") -> st
     dt = parse_when(when)
     if dt <= now_local() and repeat == "none":
         return f"Ошибка: {fmt_dt(dt)} уже прошло. Уточни время."
+    anchor = dt.day
     while dt <= now_local():
-        dt = next_due(dt, repeat)
+        dt = next_due(dt, repeat, anchor)
     with closing(db()) as con, con:
-        cur = con.execute("INSERT INTO reminders(chat_id, due, text, repeat) VALUES (?,?,?,?)",
-                          (chat_id, int(dt.timestamp()), text, repeat))
+        cur = con.execute("INSERT INTO reminders(chat_id, due, text, repeat, anchor) VALUES (?,?,?,?,?)",
+                          (chat_id, int(dt.timestamp()), text, repeat, anchor))
     rep = f" ({REPEAT_RU[repeat]})" if repeat != "none" else ""
     return f"Напоминание №{cur.lastrowid} поставлено на {fmt_dt(dt)}{rep}: {text}"
 
@@ -530,7 +543,7 @@ EVENTS_LOCK = threading.Lock()
 
 def push_event(text: str) -> None:
     with EVENTS_LOCK:
-        EVENTS.append({"id": (EVENTS[-1]["id"] + 1) if EVENTS else 1, "ts": int(time.time()), "text": text})
+        EVENTS.append({"id": (EVENTS[-1]["id"] + 1) if EVENTS else int(time.time() * 1000), "ts": int(time.time()), "text": text})
         del EVENTS[:-100]
 
 
@@ -561,9 +574,10 @@ def reminder_loop(stop: threading.Event) -> None:
                     continue
                 except TelegramError as e:
                     log.error("Не отправил напоминание №%s: %s", r["id"], e)
-                nxt = next_due(datetime.fromtimestamp(r["due"], TZ), r["repeat"])
+                anchor = r["anchor"] or 0
+                nxt = next_due(datetime.fromtimestamp(r["due"], TZ), r["repeat"], anchor)
                 while nxt and nxt.timestamp() <= now:   # пропущенные (бот был выключен) не дублируем
-                    nxt = next_due(nxt, r["repeat"])
+                    nxt = next_due(nxt, r["repeat"], anchor)
                 with closing(db()) as con, con:
                     if nxt:
                         con.execute("UPDATE reminders SET due=? WHERE id=?", (int(nxt.timestamp()), r["id"]))
@@ -1190,7 +1204,7 @@ YES_WORDS = (r"да|ага|угу|ок|окей|ok|yes|давай|отправл
              r"создай|закрывай|согласен|го|поехали|выполняй|конечно|всё верно|все верно|\+")
 YES_RE = re.compile(rf"^(\[голосовое\]\s*)?({YES_WORDS})(?=$|[\s,.!])", re.I)
 # ответ — только «да» (без поправок): тогда подтверждённое действие выполняем сами, без нейросети
-YES_ONLY_RE = re.compile(rf"^(?:\[голосовое\]\s*)?(?:(?:{YES_WORDS}|трой)[\s,.!]*)+$", re.I)
+YES_ONLY_RE = re.compile(rf"^(?:\[голосовое\]\s*)?(?:трой[\s,.!]*)?(?:(?:{YES_WORDS})(?:[\s,.!]+|$))+(?:трой[\s,.!]*)?$", re.I)
 NO_RE = re.compile(r"^(?:\[голосовое\]\s*)?(?:нет|не надо|не нужно|не делай|отмена|отмени|стоп)\b[\s,.!]*$", re.I)
 
 
@@ -1335,22 +1349,26 @@ class Assistant:
                     return "Ошибка: Битрикс24 не подключён (нет BITRIX_WEBHOOK в настройках)."
                 if name in BITRIX_WRITE:
                     # изменение — только после отдельного «да» на точное описание (не «создай задачу…» и не «да, но…»)
-                    pend = BX_PENDING.get(chat_id)
-                    if pend and pend["name"] == name and YES_ONLY_RE.match(self.user_text.strip()):
-                        BX_PENDING.pop(chat_id, None)        # выполняем ровно то, что пользователь подтвердил
-                        return bitrix.execute(self.bx, name, pend["args"])
                     try:
                         what = bitrix.describe(self.bx, name, args)
                     except bitrix.BitrixError as e:
                         return f"НЕ ВЫПОЛНЕНО: {e}. Скажи это пользователю и спроси, как быть."
-                    BX_PENDING[chat_id] = {"name": name, "args": dict(args), "ts": time.time(), "what": what}
+                    run_id = getattr(self, "run_id", 0)
+                    pend = BX_PENDING.get(chat_id)
+                    if not pend or pend.get("run") != run_id:    # новое сообщение — новый список действий
+                        pend = {"items": [], "run": run_id}
+                    item = {"name": name, "args": dict(args), "what": what}
+                    if item not in pend["items"]:                # «две задачи разом» — ждут подтверждения обе
+                        pend["items"].append(item)
+                    pend["ts"] = time.time()
+                    BX_PENDING[chat_id] = pend
                     return ("НЕ ВЫПОЛНЕНО — нужно подтверждение. Покажи пользователю дословно и спроси «Делаю?»:\n"
                             + what)
                 return bitrix.execute(self.bx, name, args)
             return f"Ошибка: неизвестная функция {name}"
         except Exception as e:
             log.exception("Функция %s упала", name)
-            return f"Ошибка: {e}"
+            return f"Ошибка: {redact(str(e))}"
 
     @property
     def places(self) -> "connectors.Places":
@@ -1444,25 +1462,30 @@ class Assistant:
         return text + (" Режим: через сервер." if mode == "server" else " Режим: напрямую.")
 
     def bx_confirm(self, chat_id: str) -> Optional[str]:
-        """«Да» на «Делаю?» по Битриксу — выполняем подтверждённое действие сами (нейросеть могла бы его «забыть»)."""
+        """«Да» на «Делаю?» по Битриксу — выполняем подтверждённое сами (нейросеть могла бы его «забыть»)."""
         pend = BX_PENDING.get(chat_id)
         if not pend or not self.bx:
             return None
-        if time.time() - pend["ts"] > 1800:
-            BX_PENDING.pop(chat_id, None)
-            return None
         text = (self.user_text or "").strip()
+        newer = max([v[1] for v in (getattr(self, "pending_power", {}).get(chat_id),
+                                    getattr(self, "pending_site", {}).get(chat_id)) if v] or [0])
+        if time.time() - pend["ts"] > 1800 or newer > pend["ts"]:
+            BX_PENDING.pop(chat_id, None)                   # устарело, или «да» относится уже к другому вопросу
+            return None
         if NO_RE.match(text):
             BX_PENDING.pop(chat_id, None)
             return "Хорошо, не делаю."
-        if not YES_ONLY_RE.match(text):
-            return None                                     # поправки («да, но срок пятница») — разберётся нейросеть
         BX_PENDING.pop(chat_id, None)
-        try:
-            return bitrix.execute(self.bx, pend["name"], pend["args"])
-        except Exception as e:
-            log.exception("Битрикс: %s", pend["name"])
-            return f"⚠️ Не получилось: {e}"
+        if not YES_ONLY_RE.match(text):
+            return None                 # другая тема или поправка («да, но срок пятница») — спросим заново, если нужно
+        out = []
+        for it in pend["items"]:
+            try:
+                out.append(bitrix.execute(self.bx, it["name"], it["args"]))
+            except Exception as e:
+                log.exception("Битрикс: %s", it["name"])
+                out.append(f"⚠️ Не получилось ({it['what'][:60]}): {redact(str(e))}")
+        return "\n".join(out)
 
     def fast_pc(self, chat_id: str) -> Optional[str]:
         """Простые команды компьютеру — без модели."""
@@ -1544,6 +1567,8 @@ class Assistant:
         self.reply_quote = getattr(threading.current_thread(), "troy_reply", "")      # ответ на конкретное сообщение
         threading.current_thread().troy_reply = ""
         fixed = connectors.fix_layout(content) if isinstance(content, str) else content
+        if isinstance(fixed, str) and fixed != content and secret_guard(fixed):
+            content = fixed              # в ответ «Понял как…» пароль не попадёт
         answer = self._run_main(chat_id, fixed, channel)
         if fixed != content and isinstance(answer, str):
             answer = f"⌨️ Понял как: «{fixed.strip()}»\n\n{answer}"
@@ -1594,6 +1619,7 @@ class Assistant:
         return any(BITRIX_HINT_RE.search(t or "") for t in recent)
 
     def _run(self, chat_id: str, content) -> str:
+        self.run_id = time.time()
         history = get_history(chat_id)
         use_bx = self.bitrix_needed(history)
         recent = ([self.user_text, getattr(self, "reply_quote", "")]
@@ -1654,6 +1680,12 @@ class Assistant:
                     log.warning("%s", e)
                     continue
                 raise
+            except requests.RequestException as e:       # до модели не достучались (прокси, DNS, тайм-аут) — следующая
+                self.router.cool[model] = time.time() + 60
+                skip.add(model)
+                last_err = LLMError(503, human_error(e), getattr(provider, "NAME", "Groq"))
+                log.warning("%s: %s", model, human_error(e))
+                continue
             calls = msg.get("tool_calls") or []
             if (not calls and not self.pc_used and not nudged
                     and (must_pc or "передал команду" in (msg.get("content") or ""))):
@@ -1986,7 +2018,7 @@ class Bot:
                 except Exception as e:
                     log.exception("Ошибка при обработке сообщения")
                     try:
-                        self.tg.send(str(msg["chat"]["id"]), f"Что-то сломалось: {e}")
+                        self.tg.send(str(msg["chat"]["id"]), f"Что-то сломалось: {redact(str(e))}")
                     except Exception:
                         pass
 
@@ -2337,7 +2369,7 @@ def link_owner(uid: str) -> None:
     old = ALLOWED_USER_ID
     if old and old != uid:
         with closing(db()) as con, con:
-            for table in ("history", "reminders", "pc_commands"):
+            for table in ("history", "reminders", "pc_commands", "message_log"):
                 con.execute(f"UPDATE {table} SET chat_id=? WHERE chat_id=?", (uid, old))
     save_setting("ALLOWED_USER_ID", uid)
     save_setting("TELEGRAM_LINK_CODE", "")
@@ -2423,6 +2455,8 @@ def _llm_connect(assistant: "Assistant", v: dict) -> tuple:
     save_setting("LLM_MODEL", model)
     save_setting("LLM_PROXY", proxy)
     assistant.router.custom = make_custom_llm()
+    assistant.router.cool.pop(model, None)        # если была «на перерыве» из-за ключа или баланса — снимаем
+    assistant.router.errors.pop(model, None)
     log.info("Своя модель подключена: %s %s (ответ: %s)", test.NAME, model, reply[:30])
     return None, ""
 
@@ -2897,10 +2931,13 @@ def pc_poll(device: str, version: str = "") -> list:
     return [{"id": r["id"], "action": r["action"], "arg": r["arg"]} for r in rows]
 
 
+STALE_LOCK = threading.Lock()
+
+
 def expire_stale() -> None:
     """Команда компьютеру висит 2 минуты — говорим владельцу, что именно не так, а не молчим."""
     now = int(time.time())
-    with closing(db()) as con, con:
+    with STALE_LOCK, closing(db()) as con, con:      # замок: два потока не сообщат об одной команде дважды
         stale = con.execute("SELECT * FROM pc_commands WHERE status IN ('pending','sent','choose') AND created < ? "
                             "AND (action NOT IN ('file_send', 'file_get') OR created < ?)",   # файл до 50 МБ — даём 10 минут
                             (now - 120, now - 600)).fetchall()
@@ -3221,6 +3258,7 @@ def main() -> None:
                         format="%(asctime)s %(levelname)s %(message)s")
     for h in logging.getLogger().handlers:      # токены и ключи в журнал не пишем
         h.addFilter(_RedactFilter())
+        h.setFormatter(_RedactFormatter("%(asctime)s %(levelname)s %(message)s"))
 
     if args.check:
         raise SystemExit(0 if self_check() else 1)

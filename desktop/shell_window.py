@@ -96,7 +96,7 @@ def _load() -> bool:
     from System import Action, Uri
     from System.Drawing import Color, Icon, Rectangle, Size
     from System.Windows.Forms import (Application, AnchorStyles, DockStyle, Form, FormBorderStyle,
-                                      FormStartPosition, UnhandledExceptionMode)
+                                      FormStartPosition, Screen, UnhandledExceptionMode)
     from Microsoft.Web.WebView2.Core import (CoreWebView2Environment, CoreWebView2PermissionState)
     from Microsoft.Web.WebView2.WinForms import CoreWebView2CreationProperties, WebView2
     loader = _pick(lib, "WebView2Loader.dll")
@@ -107,7 +107,7 @@ def _load() -> bool:
             os.environ["PATH"] = str(loader.parent) + os.pathsep + os.environ.get("PATH", "")
     _NET.update(System=System, Action=Action, Uri=Uri, Color=Color, Icon=Icon, Rectangle=Rectangle, Size=Size,
                 Application=Application, AnchorStyles=AnchorStyles, DockStyle=DockStyle, Form=Form,
-                FormBorderStyle=FormBorderStyle, FormStartPosition=FormStartPosition, UEM=UnhandledExceptionMode,
+                FormBorderStyle=FormBorderStyle, FormStartPosition=FormStartPosition, UEM=UnhandledExceptionMode, Screen=Screen,
                 Env=CoreWebView2Environment, Perm=CoreWebView2PermissionState,
                 Props=CoreWebView2CreationProperties, WebView2=WebView2)
     return True
@@ -177,6 +177,10 @@ def start(url: str, data_dir: Path, title: str, geometry: dict, visible: bool = 
     if S["form"] is not None:
         show(url)
         return
+    with _lock:
+        if S.get("starting"):
+            return
+        S["starting"] = True
     S["url"], S["data"] = url, Path(data_dir)
     from System.Threading import ApartmentState, Thread, ThreadStart
 
@@ -201,11 +205,26 @@ def start(url: str, data_dir: Path, title: str, geometry: dict, visible: bool = 
                 pass
             k = _dpi_scale()
             g = geometry or {}
-            w, h = int((g.get("w") or 1100) * k), int((g.get("h") or 780) * k)
+            w, h = int((g.get("w") or 500) * k), int((g.get("h") or 880) * k)
             x, y = g.get("x"), g.get("y")
-            if x is None or y is None or not (-200 < int(x) < 10000 and -200 < int(y) < 10000):
-                x, y = 120, 80
-            form.Bounds = N["Rectangle"](int(int(x) * k), int(int(y) * k), max(w, 420), max(h, 320))
+            rect = None
+            if x is not None and y is not None:
+                rect = N["Rectangle"](int(int(x) * k), int(int(y) * k), max(w, 420), max(h, 320))
+                # монитор отключили — окно без рамки осталось бы за экраном, и вернуть его было бы нечем
+                on_screen = False
+                for scr in N["Screen"].AllScreens:
+                    part = N["Rectangle"].Intersect(scr.WorkingArea, rect)
+                    if part.Width >= 120 and part.Height >= 80:
+                        on_screen = True
+                if not on_screen:
+                    rect = None
+            if rect is None:
+                area = N["Screen"].PrimaryScreen.WorkingArea
+                w, h = min(max(w, 420), area.Width), min(max(h, 320), area.Height)
+                rect = N["Rectangle"](area.Left + max(0, (area.Width - w) // 2),
+                                      area.Top + max(0, (area.Height - h) // 2), w, h)
+            form.Bounds = rect
+            S["start_max"] = bool(g.get("max"))
 
             ui = N["WebView2"]()
             ui.Dock = N["DockStyle"].Fill
@@ -252,13 +271,19 @@ def _taskbar_style() -> None:
         setf(hwnd, -16, style | 0x00020000 | 0x00080000)        # WS_MINIMIZEBOX | WS_SYSMENU
     except Exception:
         log.debug("taskbar style", exc_info=True)
+    if S.pop("start_max", False):                # в прошлый раз окно было развёрнуто
+        try:
+            import window_frame
+            window_frame.maximize(hwnd_of())
+        except Exception:
+            log.debug("start max", exc_info=True)
     if not S["visible"]:
         _ui(lambda: S["form"].Hide(), wait=False)
 
 
 def _fail(why: str) -> None:
     log.warning("Окно на WebView2: %s — открываю окно по-старому, через Edge", why)
-    S["failed"], S["error"] = True, why
+    S["failed"], S["error"], S["starting"] = True, why, False
     form, S["form"] = S["form"], None
     if form is not None:
         try:
@@ -299,7 +324,7 @@ def _ui_ready(sender, args) -> None:
 
 def _on_closing(_sender, e) -> None:
     """Крестик / Alt+F4 — прячем окно в трей (Трой продолжает работать)."""
-    if S.get("exiting"):
+    if S.get("exiting") or str(e.CloseReason) in ("WindowsShutDown", "TaskManagerClosing"):
         return
     e.Cancel = True
     S["visible"] = False
@@ -319,8 +344,7 @@ def show(url: str = "") -> None:
     """Показать окно (и открыть адрес, если он другой — например, «?diag=1»)."""
     def run():
         form, ui = S["form"], S["ui"]
-        if url and url != S["url"]:
-            S["url"] = url
+        if url and "?" in url:
             ui.Source = _NET["Uri"](url)
         form.Opacity = 1
         if not form.Visible:
@@ -364,8 +388,16 @@ def _layout() -> None:
         return
     top = max(0, int(S["top"]))
     cw, ch = form.ClientSize.Width, form.ClientSize.Height
-    for t in TABS.values():
-        t["view"].Bounds = _NET["Rectangle"](0, top, cw, max(50, ch - top))
+    pad = 0
+    try:
+        import window_frame
+        if not window_frame.is_max(hwnd_of()):
+            pad = max(4, int(5 * _dpi_scale()))      # полоска по краям — чтобы тянуть окно за край и при открытом сайте
+    except Exception:
+        pass
+    for t in list(TABS.values()):
+        if t["view"] is not None:
+            t["view"].Bounds = _NET["Rectangle"](pad, top, max(50, cw - 2 * pad), max(50, ch - top - pad))
 
 
 def set_top(top: float) -> None:
@@ -446,7 +478,8 @@ def show_tab(tid) -> None:
 
 def close(tid) -> None:
     def run():
-        t = TABS.pop(tid, None)
+        with _lock:
+            t = TABS.pop(tid, None)
         if S["active"] == tid:
             S["active"] = None
         if t and t["view"] is not None:
@@ -460,7 +493,7 @@ def close(tid) -> None:
 def listing() -> list:
     with _lock:
         return [{"id": i, "title": t["title"], "host": t["host"], "mode": t["mode"], "active": i == S["active"]}
-                for i, t in TABS.items()]
+                for i, t in list(TABS.items())]
 
 
 def wait_ready(timeout: float = 15) -> bool:
