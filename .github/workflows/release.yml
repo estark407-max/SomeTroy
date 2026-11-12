@@ -1,6 +1,7 @@
 # Сборка установщика Troy и публикация выпуска.
-# Запускается, когда в репозиторий приходит метка версии (v0.6.1), или вручную со страницы Actions.
-# Версия берётся из APP_VERSION в desktop/troy_desktop.py; метка должна с ней совпадать.
+# Запуск: вручную со страницы Actions (кнопка Run workflow) или меткой версии (v0.6.1).
+# Версия берётся из APP_VERSION в desktop/troy_desktop.py. Если выпуск с такой версией уже есть — новый не создаётся:
+# сначала подними версию в программе.
 name: Выпуск Troy
 
 on:
@@ -73,12 +74,14 @@ jobs:
           path: desktop/SomeTroySetup-${{ steps.ver.outputs.ver }}.exe
 
       - name: Выпуск на GitHub
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ver = "${{ steps.ver.outputs.ver }}"
+          gh release view "v$ver" *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Host "Выпуск v$ver уже есть — новый не создаю (установщик лежит в артефактах сборки)."; exit 0 }
           $notes = python -c "import ast,sys;sys.stdout.reconfigure(encoding='utf-8');t=ast.parse(open('troy_desktop.py',encoding='utf-8').read());w=[ast.literal_eval(n.value) for n in t.body if isinstance(n,ast.Assign) and getattr(n.targets[0],'id','')=='WHATS_NEW'][0][0];print('\n'.join((['## Новое']+['- '+x for x in w['added']] if w['added'] else [])+(['','## Исправлено']+['- '+x for x in w['fixed']] if w['fixed'] else [])) if w['version']=='$ver' else '')"
           $notes = ($notes -join "`n") + "`n`n---`nЕсли Windows пишет «Ошибка 4551» — установку блокирует «Интеллектуальное управление приложениями» (Безопасность Windows → Управление приложениями и браузером): у программы нет цифровой подписи."
           $notes | Out-File -Encoding utf8 notes.md
-          gh release create "v$ver" "SomeTroySetup-$ver.exe" --title "Troy $ver" --notes-file notes.md
+          gh release create "v$ver" "SomeTroySetup-$ver.exe" --title "Troy $ver" --notes-file notes.md --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "выпуск не создался" }
