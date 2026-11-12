@@ -638,6 +638,18 @@ def make_handler(remote: Remote, key: str):
                             "WebView2" if sh and sh.started() else "Edge", getattr(sys, "getwindowsversion", lambda: "?")())
                 self.send(200, b"{}")
                 return
+            if path == "/site/open":                         # кнопка «встроенный браузер» в меню шапки
+                try:
+                    data = json.loads(body or b"{}")
+                    link = str(data.get("url") or "")
+                    if not link.startswith(("http://", "https://")):
+                        raise ValueError("нужен адрес сайта")
+                    ok, text = open_site(remote, json.dumps({"url": link, "mode": "server" if data.get("mode") == "server" else "direct"}))
+                except Exception as e:
+                    log.exception("site/open")
+                    ok, text = False, str(e)
+                self.send(200, jbytes({"ok": bool(ok), "text": text}))
+                return
             if path in ("/backup/save", "/backup/load", "/server/switch"):   # копия памяти и смена сервера
                 import pc_control
                 import server_tools
@@ -846,6 +858,8 @@ WHATS_NEW = [
  {
   "version": "0.6.1",
   "added": [
+   "Шапка стала чище: кнопки (звук, подключения, оформление, выход…) всплывают панелью по щелчку на середине шапки или по «язычку».",
+   "Кнопка «Встроенный браузер» 🌐 в этой панели: впиши адрес или запрос, выбери «напрямую» или «через сервер» — сайт откроется вкладкой без команды Трою.",
    "Копия памяти («Подключения» → внизу): переписка, напоминания, подключения, места и идеи сохраняются на компьютер одним файлом, зашифрованным паролем программы. Файл можно загрузить в другого Троя — он спросит пароль прежнего; память можно заменить целиком или дополнить.",
    "Смена сервера из программы («Подключения» → «Сервер»): укажи адрес сервера, где Трой уже установлен, и пароль — программа проверит и переключится."
   ],

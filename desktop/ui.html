@@ -95,6 +95,23 @@ header h1 { font-size: 15px; font-weight: 600; margin: 0; }
 .status.on .dot { background: #22a35a; }
 .status.off .dot { background: var(--danger); }
 .spacer { flex: 1; }
+/* меню шапки: кнопки спрятаны и всплывают панелью по щелчку на середине шапки */
+header { position: relative; z-index: 25; }
+.hdr-handle { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); border: 0; background: var(--chip, transparent);
+  color: var(--muted); width: 54px; height: 20px; border-radius: 999px; display: grid; place-items: center; cursor: pointer; opacity: .75; }
+.hdr-handle:hover, .hdr-handle.on { opacity: 1; color: var(--text); background: var(--accent-soft); }
+.hdr-handle svg { width: 16px; height: 16px; transition: transform .15s; }
+.hdr-handle.on svg { transform: rotate(180deg); }
+.hdr-tools { position: absolute; top: calc(100% + 6px); left: 50%; transform: translateX(-50%); z-index: 40; display: none;
+  align-items: center; justify-content: center; flex-wrap: wrap; gap: 4px; padding: 6px 8px; width: max-content; max-width: calc(100vw - 20px);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+.hdr-tools.show { display: flex; }
+.hdr-tools .snd-wrap { position: static; }
+.hdr-tools .snd-menu { left: 0; right: 0; margin: 0 auto; top: calc(100% + 6px); max-width: calc(100vw - 20px); }
+.web-pop input { width: 100%; box-sizing: border-box; margin: 10px 0; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+  border-radius: 10px; padding: 9px 11px; font: inherit; font-size: 14px; outline: none; }
+.web-pop input:focus { border-color: var(--accent); }
+.web-pop .hk-row { margin-top: 10px; }
 .box .mic-set { margin-top: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--text); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
 .box .mic-set:hover { border-color: var(--accent); }
 /* окно без белой полосы Windows: кнопки окна в шапке, тянуть за шапку, растягивать за края */
@@ -502,6 +519,23 @@ THEME_DARK.addEventListener("change", applyTheme);
   <h1 id="title">Трой</h1>
   <div class="status" id="status"><span class="dot"></span><span id="status-text">подключаюсь…</span></div>
   <div class="spacer"></div>
+  <button class="hdr-handle" id="hdr-handle" title="Меню Троя: звук, подключения, оформление, браузер">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+  <div class="hdr-tools" id="hdr-tools">
+  <div class="snd-wrap">
+  <button class="icon-btn" id="web-btn" title="Открыть сайт во встроенном браузере">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+  </button>
+  <div class="snd-menu hk-pop theme-pop web-pop" id="web-pop">
+    <div class="hk-title">Встроенный браузер</div>
+    <div class="hk-desc">Сайт откроется вкладкой в окне Троя. Вход на сайтах запоминается.</div>
+    <input id="web-url" type="text" placeholder="адрес или запрос, например ya.ru" autocomplete="off" spellcheck="false">
+    <div class="seg" id="web-seg"><button data-m="direct" title="С адреса этого компьютера">Напрямую</button><button data-m="server" title="Как через VPN: сайт увидит адрес сервера Троя">Через сервер</button></div>
+    <div class="hk-row"><button id="web-go">Открыть</button></div>
+    <div class="hk-err" id="web-err"></div>
+  </div>
+  </div>
   <div class="snd-wrap">
   <button class="icon-btn" id="hk-btn" title="Голосовая команда по клавише">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
@@ -563,6 +597,7 @@ THEME_DARK.addEventListener("change", applyTheme);
   <button class="icon-btn" id="to-bottom" title="К последним сообщениям">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
   </button>
+  </div>
   <div class="win-ctl">
     <button class="win-btn" data-win="min" title="Свернуть"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 7h10"/></svg></button>
     <button class="win-btn" data-win="max" id="win-max" title="Развернуть"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="9" height="9" rx="1"/></svg></button>
@@ -1709,7 +1744,7 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
   }
   const state = () => fetch(BASE + "/win").then(r => r.json()).then(paint).catch(() => {});
   document.querySelectorAll(".win-btn").forEach(b => b.addEventListener("click", () => win(b.dataset.win)));
-  const passive = "button, a, input, textarea, select, label, [contenteditable], .snd-menu, .status, .tab";
+  const passive = "button, a, input, textarea, select, label, [contenteditable], .snd-menu, .tab, .hdr-tools";
   for (const zone of [document.querySelector("header"), document.getElementById("tabs")]) {
     zone.addEventListener("mousedown", e => {
       if (e.button !== 0 || e.detail > 1 || !document.body.classList.contains("frameless") || e.target.closest(passive)) return;
@@ -1731,6 +1766,59 @@ THEME_DARK.addEventListener("change", () => { if ($("theme-pop").classList.conta
     const f = window[n];
     if (typeof f === "function") window[n] = function () { toChat(); return f.apply(this, arguments); };
   }
+})();
+</script>
+<script>
+/* меню шапки и кнопка встроенного браузера */
+(() => {
+  const tools = $("hdr-tools"), handle = $("hdr-handle"), head = document.querySelector("header");
+  function showTools(on) {
+    tools.classList.toggle("show", on); handle.classList.toggle("on", on);
+    if (on) toChat();                                    // панель рисуется на странице Троя — под открытым сайтом её не видно
+    else tools.querySelectorAll(".snd-menu.show").forEach((m) => m.classList.remove("show"));
+  }
+  head.addEventListener("click", (e) => {
+    if (e.target.closest(".hdr-tools")) {               // обычная кнопка (не с выпадающим меню) — панель больше не нужна
+      if (e.target.closest("button") && !e.target.closest(".snd-wrap")) showTools(false);
+      return;
+    }
+    if (e.target.closest(".win-ctl") || e.target.closest("#tabs")) return;
+    if (e.target.closest("button") && !e.target.closest("#hdr-handle")) return;
+    showTools(!tools.classList.contains("show"));        // щелчок по середине шапки или по «язычку»
+  });
+  document.addEventListener("click", (e) => { if (!e.target.closest("header")) showTools(false); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") showTools(false); });
+
+  // встроенный браузер без команды
+  const pop = $("web-pop"), url = $("web-url"), err = $("web-err");
+  let mode = "direct";
+  try { mode = localStorage.getItem("web-mode") || "direct"; url.value = localStorage.getItem("web-url") || ""; } catch (e) {}
+  const drawMode = () => document.querySelectorAll("#web-seg button").forEach((b) => b.classList.toggle("on", b.dataset.m === mode));
+  drawMode();
+  document.querySelectorAll("#web-seg button").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); mode = b.dataset.m; drawMode(); }));
+  $("web-btn").onclick = (e) => {
+    e.stopPropagation();
+    tools.querySelectorAll(".snd-menu.show").forEach((m) => { if (m !== pop) m.classList.remove("show"); });
+    pop.classList.toggle("show"); err.textContent = "";
+    if (pop.classList.contains("show")) { url.focus(); url.select(); }
+  };
+  pop.addEventListener("click", (e) => e.stopPropagation());
+  async function go() {
+    let v = url.value.trim();
+    if (!v) { url.focus(); return; }
+    try { localStorage.setItem("web-mode", mode); localStorage.setItem("web-url", v); } catch (e) {}
+    if (!/^https?:\/\//i.test(v)) v = /^[^\s]+\.[^\s.]{2,}(\/\S*)?$/.test(v) ? "https://" + v : "https://ya.ru/search/?text=" + encodeURIComponent(v);
+    const btn = $("web-go"); btn.disabled = true; btn.textContent = "Открываю…"; err.textContent = "";
+    try {
+      const r = await fetch(BASE + "/site/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: v, mode }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) { err.textContent = "⚠️ " + (d.text || d.error || "не получилось открыть"); return; }
+      showTools(false); pollTabs();
+    } catch (ex) { err.textContent = "⚠️ " + ex.message; }
+    finally { btn.disabled = false; btn.textContent = "Открыть"; }
+  }
+  $("web-go").onclick = (e) => { e.stopPropagation(); go(); };
+  url.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go(); } });
 })();
 </script>
 </body>
