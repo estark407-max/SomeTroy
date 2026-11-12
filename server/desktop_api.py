@@ -229,7 +229,7 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                     self.end_headers()
                     self.wfile.write(blob)
                     return
-                ok, text = pc.backup_import(password, raw)
+                ok, text = pc.backup_import(password, raw, (self.headers.get("X-Troy-Mode") or "") == "merge")
                 self.reply(200 if ok else 400, {"ok": ok, "text": text} if ok else {"error": text})
                 return
             if path == "/api/pc/choose":

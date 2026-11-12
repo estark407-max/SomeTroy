@@ -48,13 +48,14 @@ def backup_save(remote, password: str, folder: Path) -> dict:
     return {"path": str(target), "size": len(body)}
 
 
-def backup_load(remote, password: str, blob: bytes) -> dict:
-    """Отправить файл копии Трою: он проверит пароль и заменит свою память содержимым копии."""
+def backup_load(remote, password: str, blob: bytes, merge: bool = False) -> dict:
+    """Отправить файл копии Трою: он проверит пароль и заменит свою память содержимым копии или дополнит её."""
     if not blob.startswith(b"TROYBAK1"):
         return {"error": "Это не файл копии Троя (нужен файл .troybak)."}
     if not password:
         return {"error": "Введи пароль программы того Троя, с которого сделана копия."}
-    code, body = remote._send("POST", "/api/backup/import", blob, headers={"X-Troy-Password": quote(password)})
+    code, body = remote._send("POST", "/api/backup/import", blob,
+                              headers={"X-Troy-Password": quote(password), "X-Troy-Mode": "merge" if merge else "replace"})
     if code == 404:
         return {"error": "Трой на сервере старой версии и не умеет загружать копии — сначала обнови его."}
     if code != 200:

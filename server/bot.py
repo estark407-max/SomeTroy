@@ -3160,16 +3160,16 @@ def backup_export(password: str) -> tuple:
     return blob, ""
 
 
-def backup_import(password: str, blob: bytes) -> tuple:
+def backup_import(password: str, blob: bytes, merge: bool = False) -> tuple:
     """Загрузить копию в этого Троя: нужен пароль программы того Троя, с которого её сняли. (получилось, текст)"""
     try:
         data = backup.unpack(blob, password)
         with BACKUP_LOCK:
-            text = backup.restore(db, data, ALLOWED_USER_ID, LOCAL_IDEAS_DIR)
+            text = backup.restore(db, data, ALLOWED_USER_ID, LOCAL_IDEAS_DIR, merge)
     except backup.BackupError as e:
         time.sleep(1)                           # перебор паролей к файлу через Троя — медленно
         return False, str(e)
-    log.info("Загружена копия памяти: %s", backup.summary(data))
+    log.info("Загружена копия памяти (%s): %s", "дополнение" if merge else "замена", backup.summary(data))
     extra = (" Идеи прежнего Троя лежали в GitHub — подключи тот же репозиторий в «Подключениях»."
              if data.get("ideas_in_github") and not (GITHUB_TOKEN and GITHUB_REPO) else "")
     return True, text + " Ключи моделей, Telegram и Битрикс24 в копию не входят — они настраиваются отдельно." + extra

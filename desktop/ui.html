@@ -227,6 +227,8 @@ textarea.secret { -webkit-text-security: disc; }
 .conn-form label { display: grid; gap: 5px; font-size: 13px; color: var(--muted); }
 .conn-form input, .conn-form select { border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 10px;
   padding: 9px 11px; font: inherit; font-size: 14px; }
+.conn-form label.radio { display: flex; gap: 8px; align-items: flex-start; color: var(--text); line-height: 1.45; cursor: pointer; }
+.conn-form label.radio input { width: auto; margin-top: 3px; }
 .conn-form .err { color: var(--danger); font-size: 13px; white-space: pre-line; }
 .conn-form .ok { color: var(--accent); font-size: 13px; }
 .conn-note { font-size: 13px; line-height: 1.45; background: var(--accent-soft); border-radius: 10px; padding: 8px 10px; }
@@ -1365,8 +1367,10 @@ function drawSysForm(kind) {
       about: "Трой соберёт переписку, напоминания, подключения, места и идеи в один файл и зашифрует его паролем программы. Файл появится в папке «Загрузки\\Трой». Ключи моделей, Telegram и Битрикс24 в копию не входят.",
       fields: `<label>Пароль программы (им ты входишь в Троя)<input name="password" type="password" autocomplete="off"></label>` },
     load: { title: "Загрузить копию памяти", btn: "Загрузить в этого Троя",
-      about: "Память этого Троя — переписка, напоминания, подключения, места — будет ЗАМЕНЕНА содержимым копии. Пароль программы и входы на компьютерах не изменятся.",
-      fields: `<label>Файл копии (.troybak)<input name="file" type="file" accept=".troybak"></label>
+      about: "Выбери, что сделать с памятью этого Троя. Пароль программы и входы на компьютерах в любом случае не изменятся.",
+      fields: `<label class="radio"><input type="radio" name="mode" value="merge" checked> <span><b>Дополнить</b> — всё, что есть у этого Троя, остаётся; из копии добавится то, чего нет: переписка встанет по времени, напоминания, места и подключения — только новые.</span></label>
+        <label class="radio"><input type="radio" name="mode" value="replace"> <span><b>Заменить полностью</b> — переписка, напоминания, подключения и места этого Троя будут стёрты, на их место встанет копия.</span></label>
+        <label>Файл копии (.troybak)<input name="file" type="file" accept=".troybak"></label>
         <label>Пароль программы того Троя, с которого сделана копия<input name="password" type="password" autocomplete="off"></label>` },
     server: { title: "Сменить сервер", btn: "Проверить и перейти",
       about: "Укажи адрес сервера, где Трой уже установлен, и пароль программы на нём. Программа проверит связь и пароль и только потом переключится. Память переносится отдельно: здесь «Сохранить копию», там «Загрузить копию».",
@@ -1388,7 +1392,9 @@ function drawSysForm(kind) {
       const file = form.file.files[0];
       if (!file) { err.textContent = "⚠️ Выбери файл копии."; return; }
       if (file.size > 64 * 1024 * 1024) { err.textContent = "⚠️ Файл слишком большой для копии Троя."; return; }
-      req = { method: "POST", headers: { "X-Troy-Password": encodeURIComponent(pw) }, body: await file.arrayBuffer() };
+      const mode = form.mode.value;
+      if (mode === "replace" && !confirm("Стереть память этого Троя и заменить её копией?")) return;
+      req = { method: "POST", headers: { "X-Troy-Password": encodeURIComponent(pw), "X-Troy-Mode": mode }, body: await file.arrayBuffer() };
     } else {
       req = { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(kind === "save" ? { password: pw } : { password: pw, address: form.address.value.trim() }) };

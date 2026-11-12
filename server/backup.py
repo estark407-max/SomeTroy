@@ -120,11 +120,36 @@ def summary(data: dict) -> str:
     return f"копия от {made}: " + ", ".join(parts)
 
 
-def restore(db: Callable, data: dict, owner: str, ideas_dir: Path) -> str:
-    """Заменить память этого Троя содержимым копии. Пароль программы и входы на компьютерах не меняются."""
+def _merge_kv(key: str, current: str, saved: str) -> str:
+    """Дополнить настройку из копии: то, что уже есть у этого Троя, не трогаем."""
+    try:
+        cur, old = json.loads(current), json.loads(saved)
+    except ValueError:
+        return current
+    if not (isinstance(cur, dict) and isinstance(old, dict)):
+        return current
+    for k, v in old.items():
+        if k not in cur:
+            cur[k] = v
+        elif isinstance(v, list) and isinstance(cur[k], list):       # списки (например, за чем слежу) — объединяем
+            ids = {json.dumps(x.get("id") if isinstance(x, dict) and "id" in x else x, sort_keys=True, ensure_ascii=False)
+                   for x in cur[k]}
+            for x in v:
+                i = json.dumps(x.get("id") if isinstance(x, dict) and "id" in x else x, sort_keys=True, ensure_ascii=False)
+                if i not in ids:
+                    cur[k].append(x)
+                    ids.add(i)
+    return json.dumps(cur, ensure_ascii=False)
+
+
+def restore(db: Callable, data: dict, owner: str, ideas_dir: Path, merge: bool = False) -> str:
+    """Загрузить копию в этого Троя: заменить его память или дополнить её (merge).
+    Пароль программы и входы на компьютерах не меняются.
+    Дополнение: переписка сливается по времени без повторов, напоминания и подключения добавляются только новые."""
     if data.get("v") != 1 or not isinstance(data.get("tables"), dict):
         raise BackupError("копия сделана другой версией Троя — этот Трой её не понимает")
     old_owner, owner = str(data.get("owner") or ""), str(owner or "")
+    added: dict = {}
     with closing(db()) as con, con:                          # одной операцией: либо всё, либо ничего
         for table, cols in TABLES.items():
             part = data["tables"].get(table)
@@ -136,21 +161,56 @@ def restore(db: Callable, data: dict, owner: str, ideas_dir: Path) -> str:
                 continue
             idx = [part["cols"].index(c) for c in use]
             who = use.index("chat_id")
-            con.execute(f"DELETE FROM {table}")
+            rows = []
             for row in part.get("rows") or []:
                 vals = [row[i] for i in idx]
                 if owner and str(vals[who]) == old_owner:    # у нового Троя хозяин может называться иначе
                     vals[who] = owner
-                con.execute(f"INSERT INTO {table}({', '.join(use)}) VALUES ({', '.join('?' * len(use))})", vals)
+                rows.append(tuple(vals))
+            if merge:                                        # то, что уже есть, + новое из копии, без повторов
+                same = [c for c in use if c not in ("active", "anchor")]     # одинаковые — по смыслу, а не по служебным полям
+                pos = [use.index(c) for c in same]
+                mine = [tuple(r) for r in con.execute(f"SELECT {', '.join(use)} FROM {table} ORDER BY id")]
+                rep_i = use.index("repeat") if "repeat" in use else None
+                due_i = use.index("due") if "due" in use else None
+
+                def same_key(r):                             # повторяющееся напоминание — то же, даже если срок уже сдвинулся
+                    return tuple(None if (i == due_i and rep_i is not None and r[rep_i] != "none") else r[i] for i in pos)
+                seen = {same_key(r) for r in mine}
+                for r in rows:
+                    k = same_key(r)
+                    if k not in seen:
+                        seen.add(k)
+                        mine.append(r)
+                        added[table] = added.get(table, 0) + 1
+                order = use.index("ts") if "ts" in use else None
+                rows = sorted(mine, key=lambda r: r[order]) if order is not None else mine   # переписка — по времени
+            con.execute(f"DELETE FROM {table}")
+            con.executemany(f"INSERT INTO {table}({', '.join(use)}) VALUES ({', '.join('?' * len(use))})", rows)
         for key, value in (data.get("kv") or {}).items():
-            if key not in SKIP_KV and isinstance(value, str):
-                con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)", (key, value))
+            if key in SKIP_KV or not isinstance(value, str):
+                continue
+            if merge:
+                row = con.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+                if row:
+                    value = _merge_kv(key, row[0], value)
+            con.execute("INSERT OR REPLACE INTO kv(key, value) VALUES (?, ?)", (key, value))
     ideas = 0
     for rel, text in (data.get("ideas") or {}).items():
         if not re.fullmatch(r"[\w .-]+(?:/[\w .-]+)*\.md", rel) or ".." in rel or not isinstance(text, str):
             continue                                          # только обычные имена внутри папки идей
         target = ideas_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+        if merge and target.exists():                         # дописываем только те строки, которых ещё нет
+            have = target.read_text(encoding="utf-8")
+            lines = set(have.splitlines())
+            new = [ln for ln in text.splitlines() if ln.strip() and ln not in lines]
+            if new:
+                target.write_text(have.rstrip("\n") + "\n" + "\n".join(new) + "\n", encoding="utf-8")
+        else:
+            target.write_text(text, encoding="utf-8")
         ideas += 1
-    return "Загружена " + summary(data) + "."
+    if merge:
+        return (f"Память дополнена из копии ({summary(data)}). Добавлено: сообщений — {added.get('message_log', 0)}, "
+                f"напоминаний — {added.get('reminders', 0)}. Подключения и места: добавлены только те, которых не было.")
+    return "Память заменена: загружена " + summary(data) + "."
