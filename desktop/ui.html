@@ -1223,7 +1223,13 @@ async function checkUpdate(quiet) {
   try { u = await fetch(BASE + "/update/check").then((r) => r.json()); } catch (e) { if (!quiet) flash("Не удалось проверить: " + e.message); return; }
   try { localStorage.setItem("troy-upd-check", String(Date.now())); } catch (e) {}
   if (u.error) { if (!quiet) flash("Не удалось проверить обновления: " + u.error); return; }
-  if (!u.newer) { if (!quiet) addBox("info", `✅ У тебя последняя версия Троя — ${u.current}.`); return; }
+  if (!u.newer) {
+    if (quiet) return;
+    if (u.why === "none") addBox("info", `У тебя версия ${u.current}. На GitHub пока не опубликовано ни одного выпуска Троя, поэтому сравнить не с чем — новая версия появится здесь, когда автор её выпустит.`);
+    else if (u.why === "no_file") addBox("info", `У тебя версия ${u.current}. На GitHub есть выпуск ${u.latest}, но к нему не приложен установщик — обновиться из программы пока нельзя.`);
+    else addBox("info", `✅ У тебя последняя выпущенная версия Троя — ${u.current}` + (u.latest && u.latest !== u.current ? ` (на GitHub — ${u.latest}).` : "."));
+    return;
+  }
   if ($("upd-modal")) return;
   const m = document.createElement("div"); m.id = "upd-modal"; m.className = "wn-modal show";
   m.innerHTML = `<div class="wn-card" role="dialog">

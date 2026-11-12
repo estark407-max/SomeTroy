@@ -328,13 +328,14 @@ def check_update() -> dict:
     except requests.RequestException as e:
         return {"current": APP_VERSION, "error": f"нет связи с GitHub: {e.__class__.__name__}"}
     if r.status_code == 404:
-        return {"current": APP_VERSION, "newer": False, "latest": APP_VERSION}       # релизов ещё нет
+        return {"current": APP_VERSION, "newer": False, "latest": "", "why": "none"}   # выпусков на GitHub ещё нет
     if r.status_code != 200:
         return {"current": APP_VERSION, "error": f"GitHub ответил {r.status_code}"}
     rel = r.json()
     latest = str(rel.get("tag_name") or "").lstrip("vV")
     asset = next((a for a in rel.get("assets", []) if re.match(r"SomeTroySetup.*\.exe$", a.get("name", ""), re.I)), None)
     return {"current": APP_VERSION, "latest": latest, "newer": bool(asset) and _vnum(latest) > _vnum(APP_VERSION),
+            "why": "" if asset else "no_file",
             "notes": (rel.get("body") or "")[:4000], "url": asset["browser_download_url"] if asset else "",
             "size": asset.get("size", 0) if asset else 0, "name": asset["name"] if asset else ""}
 
