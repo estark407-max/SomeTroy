@@ -108,6 +108,9 @@ def jbytes(data: dict) -> bytes:
     return json.dumps(data, ensure_ascii=False).encode()
 
 
+_NET_WARN: dict = {}       # текст ошибки связи → когда последний раз писали её в журнал
+
+
 class Remote:
     """Связь с сервером Троя: вход по паролю + проверка сертификата."""
 
@@ -173,7 +176,11 @@ class Remote:
             return 502, json.dumps({"error": "сертификат сервера не совпадает — нужен свежий troy-cert.pem"},
                                    ensure_ascii=False).encode()
         except requests.exceptions.ConnectionError as e:
-            log.warning("Нет связи с сервером: %s", e)
+            msg, now = str(e)[:300], time.time()          # одна и та же ошибка — в журнал не чаще раза в 10 минут
+            last = _NET_WARN.get(msg, 0)
+            if now - last > 600:
+                _NET_WARN[msg] = now
+                log.warning("Нет связи с сервером (%s): %s", path.split("?")[0], msg)
             return 502, json.dumps({"error": "нет связи с сервером"}, ensure_ascii=False).encode()
         except requests.exceptions.Timeout:
             return 504, json.dumps({"error": "сервер долго не отвечает"}, ensure_ascii=False).encode()
