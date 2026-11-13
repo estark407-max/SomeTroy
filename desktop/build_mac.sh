@@ -62,6 +62,11 @@ cat > "build/dmg/Как открыть в первый раз.txt" <<TXT
 TXT
 DMG="Troy-mac-$ARCH-$VER.dmg"
 rm -f "$DMG"
-hdiutil create -volname "Troy $VER" -srcfolder build/dmg -ov -format UDZO "$DMG" >/dev/null
+ok=""
+for n in 1 2 3 4 5; do            # «Resource busy» бывает, пока система индексирует свежую папку, — повторяем
+  if hdiutil create -volname "Troy $VER" -srcfolder build/dmg -ov -format UDZO "$DMG" >/dev/null 2>>build-mac.log; then ok=1; break; fi
+  echo "      образ не собрался (попытка $n), повторяю…"; sleep 8
+done
+[ -n "$ok" ] || { echo "Образ .dmg не собрался — смотри build-mac.log"; exit 1; }
 echo
 echo "Готово: $(pwd)/$DMG"
