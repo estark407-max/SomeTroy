@@ -126,7 +126,8 @@ def open_app(name: str):
 def find_apps(word: str, limit: int = 15) -> list:
     q, st = pc.norm(word), pc.stem(pc.norm(word))
     have = apps()
-    found = sorted(n for n in have if q in n or st in pc.stem(n))
+    c = canon(word)                                      # «калькулятор» → calculator: программы лежат под английскими именами
+    found = sorted(n for n in have if q in n or st in pc.stem(n) or (c != q and c in n))
     if not found:
         found = difflib.get_close_matches(q, list(have), n=limit, cutoff=0.5)
     return [have[n][0] for n in found[:limit]]

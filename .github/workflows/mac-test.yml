@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel]
+        os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
@@ -45,9 +45,13 @@ jobs:
 
       - name: Запуск программы
         run: |
-          dist/Troy.app/Contents/MacOS/Troy &
-          sleep 25
+          dist/Troy.app/Contents/MacOS/Troy > run.log 2>&1 &
+          PID=$!
           D="$HOME/Library/Application Support/SomeTroy"
+          for i in $(seq 1 30); do [ -f "$D/instance.json" ] && break; sleep 2; done
+          echo "--- вывод программы:"; cat run.log || true
+          if [ ! -f "$D/instance.json" ]; then echo "--- где программа застряла:"; sample $PID 3 2>/dev/null | head -80 || true; fi
+          sleep 6
           ls -la "$D" || true
           cat "$D/troy.log" || true
           python3 - <<'PY'
