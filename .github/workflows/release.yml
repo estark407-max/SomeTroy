@@ -86,28 +86,3 @@ jobs:
           gh release create "v$ver" "SomeTroySetup-$ver.exe" --title "Troy $ver" --notes-file notes.md --target $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { throw "выпуск не создался" }
 
-  # Сборки для Mac — прикладываются к тому же выпуску (Intel и Apple Silicon отдельно)
-  mac:
-    needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15-intel, macos-15]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
-    defaults:
-      run:
-        working-directory: desktop
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Сборка
-        run: PYTHON=python3 bash build_mac.sh
-      - name: Образ — в выпуск
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VER="$(python3 set_version.py)"
-          gh release upload "v$VER" Troy-mac-*.dmg --clobber
