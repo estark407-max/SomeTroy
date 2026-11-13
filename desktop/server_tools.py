@@ -85,7 +85,7 @@ def fetch_cert(host: str, port: int) -> tuple:
     return ssl.DER_cert_to_PEM_cert(der), ":".join(fp[i:i + 2] for i in range(0, 16, 2))
 
 
-def switch_server(remote, address: str, password: str, data_dir: Path, mode_key: bool) -> dict:
+def switch_server(remote, address: str, password: str, data_dir: Path, mode_key: bool, device: str = "") -> dict:
     """Перейти на другой сервер, где Трой уже установлен. Ничего не меняем, пока вход туда не удался."""
     try:
         cur = re.search(r":(\d+)$", remote.base)
@@ -105,7 +105,7 @@ def switch_server(remote, address: str, password: str, data_dir: Path, mode_key:
     data_dir.mkdir(parents=True, exist_ok=True)
     new_cert = data_dir / "troy-cert.new.pem"
     new_cert.write_text(pem, encoding="utf-8")
-    device = os.environ.get("COMPUTERNAME") or "компьютер"
+    device = device or os.environ.get("COMPUTERNAME") or "компьютер"
     try:
         r = requests.post(server + "/api/login", json={"password": password, "device": device}, timeout=25,
                           verify=str(new_cert))

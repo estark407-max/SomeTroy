@@ -1,0 +1,75 @@
+# Пробная сборка Troy для Mac с проверкой: программа запускается, отвечает и умеет открывать программы.
+# Выпуск не создаёт. Запуск — вручную со страницы Actions.
+name: Проверка сборки для Mac
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Сборка
+        run: PYTHON=python3 bash build_mac.sh
+
+      - name: Команды для Mac (программы, громкость)
+        run: |
+          .venv-mac/bin/python - <<'PY'
+          import time, pc_mac
+          apps = pc_mac.apps(); print("программ:", len(apps), "| браузер по умолчанию:", pc_mac.default_browser())
+          for cmd, arg in [("find_app", "калькулятор"), ("open_app", "калькулятор"), ("open_app", "блокнот и заметки"),
+                           ("volume_up", ""), ("volume_down", ""), ("mute", ""), ("mute", ""), ("play_pause", "")]:
+              print(cmd, repr(arg), "→", pc_mac.execute(cmd, arg))
+          time.sleep(3)
+          run = pc_mac.running(); print("запущено:", sorted(run.values())[:25])
+          assert any("calculator" in k for k in run), "Калькулятор не открылся"
+          print("close →", pc_mac.execute("close_app", "калькулятор"))
+          print("нет такой →", pc_mac.execute("open_app", "несуществующая программа ыыы"))
+          import mac_support
+          print("браузер для окна:", mac_support.find_browser()); mac_support.notify("проверка", "Трой")
+          print("автозапуск:", mac_support.autostart(True), mac_support.AGENT.exists(), mac_support.autostart(False))
+          PY
+
+      - name: Запуск программы
+        run: |
+          dist/Troy.app/Contents/MacOS/Troy &
+          sleep 25
+          D="$HOME/Library/Application Support/SomeTroy"
+          ls -la "$D" || true
+          cat "$D/troy.log" || true
+          python3 - <<'PY'
+          import json, os, urllib.request
+          d = os.path.expanduser("~/Library/Application Support/SomeTroy")
+          i = json.load(open(d + "/instance.json"))
+          base = f"http://127.0.0.1:{i['port']}/{i['key']}/"
+          page = urllib.request.urlopen(base, timeout=10).read().decode()
+          print("страница:", len(page), "байт;", "Трой" in page)
+          assert "<header>" in page
+          for p in ("win", "tabs", "whatsnew", "server/info"):
+              print(p, urllib.request.urlopen(base + p, timeout=10).read()[:150])
+          urllib.request.urlopen(base + "show", timeout=10)
+          PY
+          sleep 4
+          screencapture -x shot.png || true
+          ps -axo comm= | grep -i "app/Contents/MacOS" | sed 's#.*/##' | sort | uniq -c | head -20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-${{ matrix.os }}
+          path: |
+            desktop/*.dmg
+            desktop/shot.png
+            desktop/build-mac.log

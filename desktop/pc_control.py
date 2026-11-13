@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -295,6 +296,9 @@ def several(fn, names: str):
 
 def execute(action: str, arg: str = "", report=None):
     """Возвращает (успех, текст для владельца). report(ok, text) — сообщить владельцу позже (отмена выключения)."""
+    if sys.platform == "darwin":                 # на Mac — свои способы (pc_mac.py)
+        import pc_mac
+        return pc_mac.execute(action, arg, report)
     if action in MEDIA_KEYS:
         press(MEDIA_KEYS[action], 5 if action in ("volume_up", "volume_down") else 1)
         return True, MEDIA_TEXT[action]

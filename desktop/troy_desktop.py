@@ -32,7 +32,11 @@ import requests
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SomeTroy"
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:                                   # на Mac данные программ живут в «Application Support»
+    DATA_DIR = Path.home() / "Library" / "Application Support" / "SomeTroy"
+else:
+    DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SomeTroy"
 # настройки, которые сделал мастер, — в папке данных; ручная установка — рядом с программой
 CONFIG = DATA_DIR / "config.json" if (DATA_DIR / "config.json").exists() else APP_DIR / "config.json"
 CERT = DATA_DIR / "troy-cert.pem" if (DATA_DIR / "troy-cert.pem").exists() else APP_DIR / "troy-cert.pem"
@@ -62,7 +66,37 @@ WINDOW_TITLE = "Трой"                 # заголовок окна (по н
 PRODUCT = "Troy"                  # название программы: значок у часов, «О программе», установщик
 
 
+def device_name() -> str:
+    """Как этот компьютер называется у Троя."""
+    name = os.environ.get("COMPUTERNAME") or ""
+    if not name and IS_MAC:
+        try:
+            name = subprocess.run(["scutil", "--get", "ComputerName"], capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not name and os.name != "nt":
+        import platform
+        name = platform.node().split(".")[0]
+    return name or "компьютер"
+
+
+def reveal(path) -> None:
+    """Показать файл в Проводнике (в Finder на Mac)."""
+    try:
+        if IS_MAC:
+            import mac_support
+            mac_support.reveal(path)
+        else:
+            subprocess.Popen(["explorer.exe", "/select,", str(path)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        pass
+
+
 def message_box(text: str) -> None:
+    if IS_MAC:
+        import mac_support
+        mac_support.dialog(text, PRODUCT, "stop")
+        return
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, text, PRODUCT, 0x10)
@@ -102,7 +136,7 @@ class Remote:
                 pass
 
     def login(self, password: str):
-        device = os.environ.get("COMPUTERNAME") or "компьютер"
+        device = device_name()
         code, body = self._send("POST", "/api/login", jbytes({"password": password, "device": device}), auth=False)
         if code == 200:
             self._save(json.loads(body).get("session", ""))
@@ -250,7 +284,7 @@ def app_diagnostics(remote: "Remote") -> str:
     """/diag в программе: сначала проверки этого компьютера, потом — отчёт самого Троя."""
     cfg = load_config()
     mode = cfg.get("mode") or ("сервер" if cfg.get("server") else "не настроена")
-    lines = [f"🖥 Программа Трой {APP_VERSION} на {os.environ.get('COMPUTERNAME') or 'этом компьютере'}",
+    lines = [f"🖥 Программа Трой {APP_VERSION} на {device_name()}",
              f"✅ Режим: {'на этом компьютере' if mode == 'local' else 'сервер ' + remote.base}"]
     if mode == "local":
         try:
@@ -333,7 +367,13 @@ def check_update() -> dict:
         return {"current": APP_VERSION, "error": f"GitHub ответил {r.status_code}"}
     rel = r.json()
     latest = str(rel.get("tag_name") or "").lstrip("vV")
-    asset = next((a for a in rel.get("assets", []) if re.match(r"SomeTroySetup.*\.exe$", a.get("name", ""), re.I)), None)
+    pattern = r"Troy-mac.*\.dmg$" if IS_MAC else r"SomeTroySetup.*\.exe$"
+    assets = [a for a in rel.get("assets", []) if re.match(pattern, a.get("name", ""), re.I)]
+    if IS_MAC and len(assets) > 1:               # отдельные сборки для Apple Silicon и Intel
+        import platform
+        arch = "arm64" if platform.machine() == "arm64" else "intel"
+        assets = [a for a in assets if arch in a["name"].lower()] or assets
+    asset = assets[0] if assets else None
     return {"current": APP_VERSION, "latest": latest, "newer": bool(asset) and _vnum(latest) > _vnum(APP_VERSION),
             "why": "" if asset else "no_file",
             "notes": (rel.get("body") or "")[:4000], "url": asset["browser_download_url"] if asset else "",
@@ -366,6 +406,18 @@ def install_update() -> None:
         return
     UPD["state"] = "install"
     log.info("Ставлю обновление %s", info["latest"])
+    if IS_MAC:                                    # открываем образ: останется перетащить Troy в «Программы»
+        import mac_support
+        import pc_control
+        keep = pc_control._downloads() / info["name"]
+        try:
+            keep.write_bytes(target.read_bytes())
+        except OSError:
+            keep = target
+        mac_support.open_file(keep)
+        UPD.update(state="error", error="Образ с новой версией открыт. Закрой Троя (значок в строке меню → «Закрыть Троя») "
+                                        "и перетащи Troy в папку «Программы» с заменой.")
+        return
     try:
         subprocess.Popen([str(target), "/SP-", "/SILENT", "/NOCANCEL", "/SUPPRESSMSGBOXES"],
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))   # установщик сам закроет Троя
@@ -447,6 +499,9 @@ def bug_report(remote: "Remote", text: str) -> dict:
 
 def bug_shot_window() -> bytes:
     """Снимок окна Троя (PNG). Окно отчёта при этом видно — это нормально, главное, что видно и чат."""
+    if IS_MAC:
+        import mac_support
+        return mac_support.screenshot()
     import ctypes
     import io
     from ctypes import wintypes
@@ -464,6 +519,9 @@ def bug_shot_window() -> bytes:
 
 def image_to_clipboard(png: bytes) -> bool:
     """Скриншот — в буфер обмена: на странице GitHub его вставляют в задачу через Ctrl+V."""
+    if IS_MAC:
+        import mac_support
+        return mac_support.image_to_clipboard(png)
     import tempfile
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
@@ -489,10 +547,7 @@ def bug_save(rep_: dict) -> str:
         z.writestr("отчёт.md", rep_["full"])
         if BUG["shot"]:
             z.writestr("скриншот.png", BUG["shot"])
-    try:
-        subprocess.Popen(["explorer.exe", "/select,", str(target)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except OSError:
-        pass
+    reveal(target)
     return str(target)
 
 
@@ -501,7 +556,7 @@ def switch_server(remote, address: str, password: str) -> dict:
     global CONFIG, CERT
     import server_tools
     was_local = not str(remote.base).startswith("https://")
-    res = server_tools.switch_server(remote, address, password, DATA_DIR, mode_key=True)
+    res = server_tools.switch_server(remote, address, password, DATA_DIR, mode_key=True, device=device_name())
     if res.get("ok"):
         CONFIG, CERT = DATA_DIR / "config.json", DATA_DIR / "troy-cert.pem"
         restart = globals().get("APP_HOOKS", {}).get("restart")
@@ -624,7 +679,11 @@ def make_handler(remote: Remote, key: str):
                 return
             if path == "/micsettings":                      # «Открыть настройки микрофона» (Windows)
                 try:
-                    os.startfile("ms-settings:privacy-microphone")
+                    if IS_MAC:
+                        import mac_support
+                        mac_support.mic_settings()
+                    else:
+                        os.startfile("ms-settings:privacy-microphone")
                 except Exception as e:
                     log.warning("Настройки микрофона: %s", e)
                 self.send(200, b"{}")
@@ -665,10 +724,7 @@ def make_handler(remote: Remote, key: str):
                         res = (server_tools.backup_save(remote, pw, pc_control._downloads() / "Трой")
                                if path == "/backup/save" else switch_server(remote, str(data.get("address") or ""), pw))
                     if res.get("path"):
-                        try:
-                            subprocess.Popen(["explorer.exe", "/select,", res["path"]], creationflags=0x08000000)
-                        except OSError:
-                            pass
+                        reveal(res["path"])
                 except Exception as e:
                     log.exception("%s", path)
                     res = {"error": f"не получилось: {e}"}
@@ -688,7 +744,7 @@ def make_handler(remote: Remote, key: str):
                         n += 1
                     target.write_bytes(base64.b64decode(data.get("b64") or ""))
                     try:
-                        subprocess.Popen(["explorer.exe", "/select,", str(target)], creationflags=0x08000000)
+                        reveal(target)
                     except OSError:
                         pass
                     self.send(200, jbytes({"path": str(target)}))
@@ -843,6 +899,9 @@ def make_handler(remote: Remote, key: str):
 
 
 def find_browser():
+    if IS_MAC:
+        import mac_support
+        return mac_support.find_browser()
     pf = [os.environ.get(v, "") for v in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA")]
     for base in pf:
         for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"):
@@ -1055,6 +1114,10 @@ def _open_edge_window(url: str) -> None:
     if not browser:
         webbrowser.open(url)
         return
+    if IS_MAC:
+        import mac_support
+        mac_support.open_window(browser, url, DATA_DIR / "window", DEFAULT_SIZE)
+        return
     subprocess.Popen([
         browser, f"--app={url}", f"--user-data-dir={DATA_DIR / 'window'}", *window_args(),
         "--no-first-run", "--no-default-browser-check", "--disable-features=Translate",
@@ -1070,6 +1133,8 @@ def find_window():
     sh = _shell()
     if sh and sh.started():
         return sh.hwnd_of()
+    if os.name != "nt":
+        return None
     try:
         import ctypes
         from ctypes import wintypes
@@ -1106,6 +1171,12 @@ def show_window() -> None:
     if sh and sh.started():
         sh.show()
         return
+    if IS_MAC:
+        import mac_support
+        if not (window_open() and mac_support.activate()):
+            if not window_open():
+                open_window(APP_URL)
+        return
     hwnd = find_window() if window_open() else None
     if hwnd:
         import ctypes
@@ -1119,6 +1190,10 @@ def close_window() -> None:
     sh = _shell()
     if sh and sh.started():
         sh.hide()
+        return
+    if IS_MAC:
+        import mac_support
+        mac_support.close_window()
         return
     hwnd = find_window()
     if hwnd:
@@ -1340,6 +1415,8 @@ def _hotkey_loop(mods: int, vk: int, ready: dict) -> None:
 
 def apply_hotkey(hk) -> tuple:
     """Снимает старую клавишу и ставит новую. Возвращает (успех, ошибка)."""
+    if os.name != "nt":
+        return (True, "") if not hk else (False, "Клавиша голоса пока работает только в Windows.")
     if _hk["thread"] and _hk["tid"]:
         try:
             import ctypes
@@ -1408,8 +1485,9 @@ def tray_hint_once(icon) -> None:
         if window_open():
             was_open = True
         elif was_open:
-            icon.notify("Я остался в трее у часов. Щёлкни по иконке, чтобы открыть; "
-                        "правая кнопка → «Выйти».", WINDOW_TITLE)
+            icon.notify("Я остался в строке меню вверху экрана. Щёлкни по значку, чтобы открыть или закрыть меня."
+                        if IS_MAC else "Я остался в трее у часов. Щёлкни по иконке, чтобы открыть; "
+                                       "правая кнопка → «Выйти».", WINDOW_TITLE)
             flag.write_text("1")
 
 
@@ -1425,7 +1503,7 @@ def make_wizard():
     """Мастер первой настройки: что делать, когда человек всё ввёл."""
     import setup_wizard
     import local_server
-    device = os.environ.get("COMPUTERNAME") or "компьютер"
+    device = device_name()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     def finish_local(settings: str, password: str) -> None:
@@ -1691,6 +1769,12 @@ def main():
         show_window()
 
     def on_about(_icon, _item):
+        if IS_MAC:
+            import mac_support
+            threading.Thread(target=mac_support.dialog, daemon=True, args=(
+                f"{PRODUCT} {APP_VERSION}\nЛичный ассистент — в Telegram и на компьютере.\n\n"
+                "Авторы: Claude и Egor Zhidetskiy\n© 2026 Claude и Egor Zhidetskiy", "О программе")).start()
+            return
         import ctypes
         threading.Thread(target=lambda: ctypes.windll.user32.MessageBoxW(
             0, f"{PRODUCT} {APP_VERSION}\nЛичный ассистент — в Telegram и на компьютере.\n\n"
@@ -1708,6 +1792,10 @@ def main():
         pystray.MenuItem("Выйти из аккаунта", on_logout, enabled=lambda item: remote.logged_in),
         pystray.MenuItem("Закрыть Троя", on_close),
     ))
+
+    if IS_MAC:                            # в строке меню Mac у значка нет всплывающих подсказок — показываем уведомлением
+        import mac_support
+        icon.notify = lambda text, title=None: mac_support.notify(text, title or PRODUCT)
 
     def after_wizard():
         time.sleep(0.5)
@@ -1729,7 +1817,8 @@ def main():
         threading.Thread(target=watch_events, args=(remote, icon), daemon=True).start()
         threading.Thread(target=pc_worker, args=(remote,), daemon=True).start()
         threading.Thread(target=server_check_loop, args=(remote, icon), daemon=True).start()
-        threading.Thread(target=remember_window, daemon=True).start()
+        if os.name == "nt":
+            threading.Thread(target=remember_window, daemon=True).start()
         hk = load_settings().get("hotkey")
         if hk and not apply_hotkey(hk)[0]:
             icon.notify(f"Горячая клавиша {hk.get('label', '')} занята другой программой — назначь другую.", WINDOW_TITLE)
