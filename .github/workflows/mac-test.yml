@@ -68,6 +68,9 @@ jobs:
           PY
           sleep 4
           screencapture -x shot.png || true
+          ps -axo args= | grep -c -- "--app=http://127.0.0.1" || true
+          sips -Z 900 -s format jpeg -s formatOptions 35 shot.png --out shot.jpg >/dev/null 2>&1 || true
+          echo "SHOT-BEGIN"; base64 -i shot.jpg | fold -w 200 || true; echo "SHOT-END"
           ps -axo comm= | grep -i "app/Contents/MacOS" | sed 's#.*/##' | sort | uniq -c | head -20
 
       - uses: actions/upload-artifact@v4

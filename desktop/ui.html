@@ -1006,7 +1006,9 @@ function micError(e) {                                  // почему нет �
   const name = (e && e.name) || "";
   fetch(BASE + "/micinfo", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, message: String((e && e.message) || "") }) }).catch(() => {});
-  const text = name === "NotFoundError" ? "Не вижу микрофон: он не подключён или выключен в Windows."
+  const mac = /Mac/i.test(navigator.platform || navigator.userAgent);
+  const text = name === "NotFoundError" ? "Не вижу микрофон: он не подключён или выключен в системе."
+    : mac ? "macOS не даёт Трою микрофон. Открой настройки микрофона и включи там браузер, в котором открыт Трой (Chrome, Edge или Яндекс). Потом закрой и снова открой окно Троя."
     : "Windows не даёт Трою микрофон. Открой настройки микрофона и включи «Разрешить приложениям доступ к микрофону» "
       + "и ниже — «Разрешить классическим приложениям доступ к микрофону». Потом нажми 🎤 ещё раз.";
   $("empty")?.remove();

@@ -45,7 +45,7 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.7.0"
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -916,6 +916,17 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 WHATS_NEW = [
  {
+  "version": "0.7.0",
+  "added": [
+   "Troy для Mac: значок в строке меню, окно в Chrome, Edge или Яндекс Браузере (если их нет — вкладка в Safari), голос, напоминания, подключения, копия памяти и смена сервера — как в Windows.",
+   "Команды компьютеру на Mac: открыть и закрыть программу, громкость, пауза и переключение треков, сон, выключение и перезагрузка с отсчётом.",
+   "На Mac пока нет: клавиши голоса, сайтов вкладками внутри окна Троя (сайт открывается отдельным окном) и установки обновления одной кнопкой (Трой скачает образ и откроет его)."
+  ],
+  "fixed": [
+   "Проверка обновлений честно говорит, если на GitHub ещё нет выпуска или к нему не приложен установщик."
+  ]
+ },
+ {
   "version": "0.6.1",
   "added": [
    "Шапка стала чище: кнопки (звук, подключения, оформление, выход…) всплывают панелью по щелчку на середине шапки или по «язычку».",
@@ -1768,6 +1779,10 @@ def main():
         icon.notify("Ты вышел из аккаунта. Чтобы снова пользоваться Троем, введи пароль.", WINDOW_TITLE)
         show_window()
 
+    def on_autostart(_icon, _item):        # только на Mac: в Windows автозапуск ставит установщик
+        import mac_support
+        mac_support.autostart(not mac_support.autostart())
+
     def on_about(_icon, _item):
         if IS_MAC:
             import mac_support
@@ -1784,6 +1799,8 @@ def main():
 
     icon = pystray.Icon("troy", Image.open(RES_DIR / "favicon.png"), PRODUCT, menu=pystray.Menu(
         pystray.MenuItem("Открыть Троя", lambda icon, item: show_window(), default=True),
+        pystray.MenuItem("Запускать при входе в систему", on_autostart, visible=IS_MAC,
+                         checked=lambda _item: IS_MAC and __import__("mac_support").autostart()),
         pystray.MenuItem("О программе", on_about),
         pystray.MenuItem("Диагностика", lambda icon, item: show_diag()),
         pystray.MenuItem("Обновить и починить сервер", lambda icon, item: show_repair(),
