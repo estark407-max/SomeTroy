@@ -1788,6 +1788,7 @@ def main():
             import mac_support
             threading.Thread(target=mac_support.dialog, daemon=True, args=(
                 f"{PRODUCT} {APP_VERSION}\nЛичный ассистент — в Telegram и на компьютере.\n\n"
+                "«Сей модуль является симбиозом дружеского взаимодействия лысого бородатого человека и сверхумной, но очень приятной машины»\n\n"
                 "Авторы: Claude и Egor Zhidetskiy\n© 2026 Claude и Egor Zhidetskiy", "О программе")).start()
             return
         import ctypes

@@ -150,6 +150,6 @@ def autostart(enable: bool = None) -> bool:
     args = [sys.executable] + ([] if getattr(sys, "frozen", False) else [str(Path(sys.argv[0]).resolve())]) + ["--tray"]
     AGENT.parent.mkdir(parents=True, exist_ok=True)
     with open(AGENT, "wb") as f:
-        plistlib.dump({"Label": "io.github.sometroy.troy", "ProgramArguments": args, "RunAtLoad": True,
+        plistlib.dump({"Label": AGENT.stem, "ProgramArguments": args, "RunAtLoad": True,
                        "ProcessType": "Interactive"}, f)
     return True
