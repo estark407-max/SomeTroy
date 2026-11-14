@@ -28,6 +28,8 @@ TABLES = {                                   # что переносим: таб
     "history": ["chat_id", "role", "text", "ts"],
     "message_log": ["chat_id", "role", "text", "ts"],
     "reminders": ["chat_id", "due", "text", "repeat", "active", "anchor"],
+    "notes": ["chat_id", "text", "ts"],
+    "expenses": ["chat_id", "day", "amount", "category", "shop", "note", "ts"],
 }
 SKIP_KV = {"app_password"}                   # пароль программы у нового Троя свой — его не трогаем
 
@@ -91,6 +93,8 @@ def make(db: Callable, owner: str, ideas_dir: Path, ideas_in_github: bool, bot_n
     with closing(db()) as con:
         for table, cols in TABLES.items():
             have = [c for c in cols if c in _columns(con, table)]
+            if "chat_id" not in have:                         # такой таблицы у этого Троя ещё нет
+                continue
             rows = con.execute(f"SELECT {', '.join(have)} FROM {table} ORDER BY id").fetchall()
             data["tables"][table] = {"cols": have, "rows": [list(r) for r in rows]}
         for row in con.execute("SELECT key, value FROM kv"):
@@ -115,6 +119,10 @@ def summary(data: dict) -> str:
     made = time.strftime("%d.%m.%Y %H:%M", time.localtime(data.get("made") or 0))
     parts = [f"сообщений в журнале — {n('message_log')}", f"напоминаний — {n('reminders')}",
              f"подключений — {conns}"]
+    if n("notes"):
+        parts.append(f"заметок — {n('notes')}")
+    if n("expenses"):
+        parts.append(f"трат — {n('expenses')}")
     if data.get("ideas"):
         parts.append(f"файлов с идеями — {len(data['ideas'])}")
     return f"копия от {made}: " + ", ".join(parts)

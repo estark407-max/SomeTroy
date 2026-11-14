@@ -506,3 +506,54 @@ def wait_ready(timeout: float = 15) -> bool:
             return True
         time.sleep(0.1)
     return started()
+
+
+# ── для «дел на сайтах»: прочитать страницу вкладки и действовать на ней ──
+def tab_eval(tid, js: str, timeout: float = 20) -> str:
+    """Выполнить JavaScript во вкладке сайта и вернуть результат (строку JSON, как отдаёт WebView2)."""
+    box = {}
+
+    def run():
+        t = TABS.get(tid)
+        if not t or t["view"] is None or t["view"].CoreWebView2 is None:
+            return
+        box["task"] = t["view"].CoreWebView2.ExecuteScriptAsync(js)
+    _ui(run)
+    task = box.get("task")
+    if task is None:
+        raise RuntimeError("вкладка сайта закрыта")
+    end = time.time() + timeout
+    while not task.IsCompleted:                            # ждём в своём потоке, окно при этом не замирает
+        if time.time() > end:
+            raise TimeoutError("страница не ответила")
+        time.sleep(0.05)
+    if task.IsFaulted:
+        raise RuntimeError(str(task.Exception)[:200])
+    return str(task.Result)
+
+
+def tab_navigate(tid, url: str) -> None:
+    def run():
+        t = TABS.get(tid)
+        if t and t["view"] is not None and t["view"].CoreWebView2 is not None:
+            t["view"].CoreWebView2.Navigate(url)
+            t["url"] = url
+    _ui(run)
+
+
+def tab_ready(tid, timeout: float = 20) -> bool:
+    """Дождаться, пока вкладка создастся (WebView2 запускается не мгновенно)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        t = TABS.get(tid)
+        if t is None:
+            return False
+        if t["view"] is not None and _ui(lambda: t["view"].CoreWebView2 is not None):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def last_tab():
+    with _lock:
+        return max(TABS) if TABS else None

@@ -29,7 +29,7 @@ jobs:
       - name: Библиотеки
         run: |
           python -m pip install -q --upgrade pip
-          python -m pip install -q "requests[socks]" pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf pywebview pythonnet
+          python -m pip install -q "requests[socks]" pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf pywebview pythonnet "edge-tts==7.2.3"
 
       - name: Версия
         id: ver
@@ -53,13 +53,28 @@ jobs:
             --collect-all pythonnet --collect-all clr_loader `
             --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import connectors `
             --hidden-import desktop_api --hidden-import backup `
+            --hidden-import notes --hidden-import expenses --hidden-import alerts --hidden-import gigachat --hidden-import speech_text --hidden-import voice --hidden-import web_agent --hidden-import edge_tts --collect-submodules edge_tts `
+            --add-data "silero_service.py;." `
             --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata `
             --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" `
             --add-data "..\server\connectors.py;server_src" --add-data "..\server\desktop_api.py;server_src" `
             --add-data "..\server\backup.py;server_src" --add-data "..\server\requirements.txt;server_src" `
+            --add-data "..\server\notes.py;server_src" --add-data "..\server\expenses.py;server_src" --add-data "..\server\alerts.py;server_src" --add-data "..\server\gigachat.py;server_src" --add-data "..\server\speech_text.py;server_src" --add-data "..\server\watchdog.py;server_src" `
             --add-data "..\server\install.sh;server_src" --add-data "..\server\uninstall.sh;server_src" `
             --add-data "..\server\settings.env.example;server_src" troy_desktop.py
           if (-not (Test-Path "dist\SomeTroy\SomeTroy.exe")) { throw "SomeTroy.exe не собрался" }
+
+      - name: Голос Евгений (Silero, работает без интернета)
+        run: |
+          python -m venv .venv-voice
+          .venv-voice\Scripts\python.exe -m pip install -q --upgrade pip
+          .venv-voice\Scripts\python.exe -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          .venv-voice\Scripts\python.exe -m pip install -q numpy pyinstaller
+          Invoke-WebRequest https://models.silero.ai/models/tts/ru/v4_ru.pt -OutFile v4_ru.pt
+          .venv-voice\Scripts\python.exe -m PyInstaller --noconfirm --clean --onedir --console --name troy-voice `
+            --add-data "v4_ru.pt;." silero_service.py
+          if (-not (Test-Path "dist\troy-voice\troy-voice.exe")) { throw "голос Евгений не собрался" }
+          Copy-Item -Recurse -Force "dist\troy-voice" "dist\SomeTroy\voice-engine"
 
       - name: Установщик (Inno Setup)
         run: |

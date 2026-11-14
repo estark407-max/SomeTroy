@@ -12,6 +12,7 @@
 import argparse
 import base64
 import calendar
+import collections
 import hashlib
 import hmac
 import json
@@ -40,10 +41,15 @@ import backup
 import bitrix
 import connectors
 import desktop_api
+import notes
+import speech_text
+import gigachat
+import alerts
+import expenses
 
 # TROY_HOME — папка с настройками и базой. Программа на компьютере в локальном режиме
 # указывает свою (%LOCALAPPDATA%\SomeTroy\server); на сервере — папка рядом с bot.py.
-SERVER_VERSION = "0.7.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
+SERVER_VERSION = "0.8.0"          # программа сравнивает со своей версией и подсказывает обновить Троя на сервере
 BASE = Path(os.environ.get("TROY_HOME") or Path(__file__).resolve().parent)
 load_dotenv(BASE / "settings.env", override=True)
 LOCAL_MODE = os.environ.get("TROY_LOCAL") == "1"     # всё на этом компьютере: без сертификата, только 127.0.0.1
@@ -69,8 +75,14 @@ GROQ_STT_MODEL = env("GROQ_STT_MODEL", "whisper-large-v3-turbo")     # расп�
 GROQ_PROXY = env("GROQ_PROXY")
 # Цепочка моделей: у каждой модели Groq свой лимит, упёрлась одна — берём следующую
 GROQ_MODELS = [m.strip() for m in env(
-    "GROQ_MODELS", f"{GROQ_MODEL},{GROQ_FALLBACK_MODEL},llama-3.3-70b-versatile,openai/gpt-oss-20b").split(",") if m.strip()]
+    "GROQ_MODELS", f"{GROQ_MODEL},{GROQ_FALLBACK_MODEL},openai/gpt-oss-20b").split(",") if m.strip()]
 GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))
+# GigaChat (Сбер): у физлиц — бесплатный пакет токенов на год. Если ключ указан — отвечает первым.
+GIGACHAT_KEY = env("GIGACHAT_KEY")
+GIGACHAT_MODELS = [m.strip() for m in env("GIGACHAT_MODELS", ",".join(gigachat.MODELS)).split(",") if m.strip()]
+# Быстрая модель для коротких простых вопросов («напомни…», «сколько градусов») — отвечает за 1–3 секунды.
+# Сложное (Битрикс, компьютер, файлы, маршруты, фото) по-прежнему идёт по основной цепочке. Пусто — выключено.
+FAST_MODEL = env("FAST_MODEL", "openai/gpt-oss-20b")
 VISION_MODELS = {m.strip() for m in env("VISION_MODELS", "qwen/qwen3.8-27b,mistral-small-latest").split(",")}
 # Запасной провайдер — Mistral (бесплатный режим без карты). Пусто — не используется
 MISTRAL_API_KEY = env("MISTRAL_API_KEY")
@@ -332,6 +344,8 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    notes.init(db)
+    expenses.init(db)
     with closing(db()) as con, con:
         con.executescript(SCHEMA)
         if "anchor" not in [c[1] for c in con.execute("PRAGMA table_info(reminders)")]:
@@ -658,8 +672,19 @@ class Ideas:
         r.raise_for_status()
 
     def projects(self) -> List[str]:
+        """Список проектов (кэш на 10 минут). Устарел — обновляем в фоне, ответ Троя не ждёт GitHub."""
         if time.time() - self._projects_at < 600:
             return self._projects
+        if self._projects_at and not getattr(self, "_refreshing", False):
+            self._refreshing = True
+            threading.Thread(target=self._refresh_projects, daemon=True).start()
+            return self._projects
+        if getattr(self, "_refreshing", False):
+            return self._projects
+        self._refresh_projects()
+        return self._projects
+
+    def _refresh_projects(self) -> None:
         try:
             if self.github:
                 r = self.s.get(self._url("projects"), params={"ref": GITHUB_BRANCH}, timeout=30)
@@ -672,7 +697,9 @@ class Ideas:
             self._projects_at = time.time()
         except Exception as e:
             log.warning("Не получил список проектов: %s", e)
-        return self._projects
+            self._projects_at = time.time() - 300            # повторим через 5 минут, а не на каждом ответе
+        finally:
+            self._refreshing = False
 
     def save(self, project: str, text: str) -> str:
         slug = slugify(project)
@@ -715,6 +742,9 @@ class LLMError(RuntimeError):
         super().__init__(f"{provider} {status}: {message}")
 
 
+LLM_TIMEOUT = (10, int(env("LLM_TIMEOUT", "75")))   # ждём модель не дольше 75 с — дальше отвечает следующая
+
+
 class Groq:
     API = "https://api.groq.com/openai/v1/"
     NAME = "Groq"
@@ -741,7 +771,7 @@ class Groq:
         if tools:
             body["tools"] = tools
         for attempt in range(2):
-            r = self.s.post(self.API + "chat/completions", json=body, timeout=180)
+            r = self.s.post(self.API + "chat/completions", json=body, timeout=LLM_TIMEOUT)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]
             if r.status_code in (500, 502, 503) and attempt == 0:
@@ -813,7 +843,7 @@ class CustomLLM(Groq):
         if tools:
             body["tools"] = tools
         for attempt in range(3):
-            r = self.s.post(self.API + "chat/completions", json=body, timeout=180)
+            r = self.s.post(self.API + "chat/completions", json=body, timeout=(10, 150))
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]
             if r.status_code == 400 and "temperature" in r.text and "temperature" in body:
@@ -825,6 +855,13 @@ class CustomLLM(Groq):
                 continue
             self._raise(r)
         raise LLMError(503, "сервис недоступен", self.NAME)
+
+
+def make_gigachat() -> Optional["gigachat.GigaChat"]:
+    if not GIGACHAT_KEY:
+        return None
+    return gigachat.GigaChat(GIGACHAT_KEY, LLMError, BASE / "tls", env("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
+                             env("GIGACHAT_PROXY"))
 
 
 def make_custom_llm() -> Optional["CustomLLM"]:
@@ -845,20 +882,25 @@ class Router:
         self.groq = groq
         self.mistral = Mistral() if MISTRAL_API_KEY else None
         self.custom = make_custom_llm()      # своя (платная) модель — первой, бесплатные — запасные
+        self.giga = make_gigachat()
         self.cool: dict = {}        # модель -> до какого времени не трогать
         self.last: Optional[tuple] = None   # (провайдер, модель, время) — кто отвечал последним
         self.errors: dict = {}              # модель -> (время, код, текст) последней ошибки
 
     def chain(self) -> list:
         items = [(self.custom, LLM_MODEL)] if self.custom else []
+        items += [(self.giga, m) for m in GIGACHAT_MODELS] if self.giga else []
         items += [(self.groq, m) for m in GROQ_MODELS]
         if self.mistral:
             items.append((self.mistral, MISTRAL_MODEL))
         return items
 
-    def candidates(self, vision: bool, skip: set) -> list:
+    def candidates(self, vision: bool, skip: set, fast: bool = False) -> list:
         now = time.time()
-        free = [(p, m) for p, m in self.chain() if self.cool.get(m, 0) <= now and m not in skip]
+        chain = self.chain()
+        if fast and FAST_MODEL:                  # простой вопрос — сначала быстрая модель, остальные как обычно
+            chain = [(self.groq, FAST_MODEL)] + [(p, m) for p, m in chain if m != FAST_MODEL]
+        free = [(p, m) for p, m in chain if self.cool.get(m, 0) <= now and m not in skip]
         if vision:   # с картинкой — сначала модели, которые видят
             free.sort(key=lambda pm: pm[1] not in VISION_MODELS)
         return free
@@ -878,9 +920,18 @@ class Router:
             lines.append("- Mistral: не подключён (нет MISTRAL_API_KEY)")
         if not self.custom:
             lines.append("- Своя модель: не подключена (LLM_API_URL, LLM_API_KEY, LLM_MODEL)")
+        if not self.giga:
+            lines.append("- GigaChat: не подключён (программа → «Подключения»)")
         last = (f"Последним отвечал: {self.last[0]} {self.last[1]} в "
                 f"{datetime.fromtimestamp(self.last[2], TZ):%H:%M}") if self.last else "С запуска ещё никто не отвечал."
-        return "Модели Троя (по порядку):\n" + "\n".join(lines) + "\n\n" + last + "\n\n" + pcs_status()
+        recent = [t for t in TIMINGS if now - t[0] < 24 * 3600]
+        speed = ""
+        if recent:
+            secs = sorted(t[1] for t in recent)
+            speed = (f"\nОтветы за сутки: {len(secs)}, обычно {secs[len(secs) // 2]:.0f} с, "
+                     f"самый долгий {secs[-1]:.0f} с" + (f", дольше 20 с — {sum(s > 20 for s in secs)}" if secs[-1] > 20 else ""))
+        fast = (f"\nКороткие простые вопросы — сначала {FAST_MODEL} (быстрее)." if FAST_MODEL else "")
+        return "Модели Троя (по порядку):\n" + "\n".join(lines) + fast + "\n\n" + last + speed + "\n\n" + pcs_status()
 
     def describe(self, provider, model) -> str:
         names = ", ".join(f"{getattr(p, 'NAME', '')} {m}" for p, m in self.chain())
@@ -902,10 +953,19 @@ class Router:
                 sec = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0) + 2
             if "per day" in (e.text or "") or "TPD" in (e.text or "") or "RPD" in (e.text or ""):
                 sec = max(sec, 600)
+            if "Request too large" in (e.text or ""):     # запрос не влезает в её лимит — не пробуем её зря
+                sec = max(sec, 600)
             self.cool[model] = time.time() + sec
             log.warning("%s на перерыве %d с: %s", model, sec, (e.text or "")[:120])
         elif e.status in (500, 502, 503):
             self.cool[model] = time.time() + 30
+        elif e.status == 404 and "does not exist" in (e.text or ""):     # модель убрали у провайдера
+            self.cool[model] = time.time() + 24 * 3600
+            log.warning("%s больше нет у провайдера — пропускаю сутки", model)
+        elif e.status in (400, 404, 422) and model in GIGACHAT_MODELS:
+            # GigaChat не принимает запрос (формат, функции) — не тратим на него секунду в каждом ответе
+            self.cool[model] = time.time() + 600
+            log.warning("%s отказал (%s): %s — 10 мин отвечают другие модели", model, e.status, (e.text or "")[:200])
         elif e.status in (401, 402, 403):     # ключ не подошёл или кончились деньги — пока отвечают запасные
             self.cool[model] = time.time() + 1800
             log.warning("%s недоступна (%s) — 30 мин отвечают запасные модели", model, e.status)
@@ -954,6 +1014,72 @@ TOOLS = [
 ]
 
 BITRIX_TOOLS = [fn(*t) for t in bitrix.TOOLS]
+MEMORY_TOOLS = [
+    fn("remember", "Запомнить факт надолго (заметка): что сделал, где лежит, код, номер, договорённость, предпочтение.",
+       {"text": {"type": "string", "description": "Факт словами пользователя, с датой, если она важна"}}, ["text"]),
+    fn("recall", "Найти в заметках и во всей переписке за год: что пользователь говорил, просил, что обсуждали.", {
+        "query": {"type": "string", "description": "Ключевые слова (существительные), например «фильтр котёл»"},
+        "date_from": {"type": "string", "description": "с какой даты, YYYY-MM-DD (если спросили про период)"},
+        "date_to": {"type": "string", "description": "по какую дату включительно, YYYY-MM-DD"}}, ["query"]),
+    fn("forget_note", "Удалить заметку (по номеру или по словам из неё).",
+       {"id": {"type": "integer"}, "query": {"type": "string"}}),
+]
+EXPENSE_TOOLS = [
+    fn("add_expense", "Записать трату (с чека на фото или со слов). Чек с товарами разных категорий — "
+                      "вызови по разу на каждую категорию с суммой по ней.", {
+        "amount": {"type": "number", "description": "сумма в рублях"},
+        "category": {"type": "string", "enum": expenses.CATEGORIES},
+        "shop": {"type": "string", "description": "магазин или кому заплатили (с чека)"},
+        "date": {"type": "string", "description": "дата покупки YYYY-MM-DD (с чека; не указана — сегодня)"},
+        "note": {"type": "string", "description": "что купили, коротко"},
+        "force": {"type": "boolean", "description": "true — записать, даже если такая же трата уже есть"}},
+       ["amount", "category"]),
+    fn("expenses_report", "Сколько потрачено: итог за период по категориям, магазинам, дням, месяцам или списком.", {
+        "date_from": {"type": "string", "description": "YYYY-MM-DD (по умолчанию — начало месяца)"},
+        "date_to": {"type": "string", "description": "YYYY-MM-DD (по умолчанию — сегодня)"},
+        "by": {"type": "string", "enum": ["category", "shop", "day", "month", "list"]},
+        "category": {"type": "string", "description": "только эта категория / магазин / слово"},
+        "file": {"type": "boolean", "description": "true — ещё и таблицей (файл для Excel)"}}),
+    fn("delete_expense", "Удалить трату по номеру.", {"id": {"type": "integer"}}, ["id"]),
+]
+EXPENSE_HINT_RE = re.compile(r"трат|потратил|расход|чек|купил|заплатил|оплатил|стоил[оа]?|сколько ушло|"
+                             r"бюджет|покупк|₽|руб", re.I)
+EXPENSE_RULES = """
+- Траты: фото чека («запиши чек», «учти») или «потратил/купил … за …» — add_expense (сумму, дату и магазин бери с чека;
+  чек сразу в несколько категорий — по вызову на категорию). Фото чека без подписи — тоже запиши
+  и скажи, как отменить («удали трату №…»).
+  «Сколько потратил / ушло на …» — expenses_report. Таблицу — с file=true. Удалить — delete_expense по номеру."""
+ALERTS_TOOL = fn("alerts", "Что Трой сообщает сам, без вопроса: сроки задач и сообщения в Битриксе, письма от "
+                           "важных отправителей. Показать, включить/выключить, добавить или убрать отправителя.", {
+    "action": {"type": "string", "enum": ["show", "on", "off", "add_sender", "remove_sender"]},
+    "kind": {"type": "string", "enum": ["all", "deadlines", "bitrix_messages", "mail"]},
+    "sender": {"type": "string", "description": "адрес или имя отправителя письма"}}, ["action"])
+ALERTS_HINT_RE = re.compile(r"сообщай|уведомля|предупрежда|пиши (?:мне )?(?:сам|когда|если)|оповещ|не беспокой|"
+                            r"перестань (?:писать|сообщать)|письм\w* от", re.I)
+WEB_TOOL = fn("web_task", "Сделать дело на сайте за пользователя во вкладке программы Трой на компьютере: найти и "
+                          "сравнить, записаться, заполнить форму, проверить статус заказа или посылки, узнать что-то в "
+                          "личном кабинете. Трой сам ходит по страницам и спросит «да?» перед отправкой/заказом/оплатой.", {
+    "action": {"type": "string", "enum": ["start", "answer", "stop"],
+               "description": "start — новое дело; answer — ответ пользователя на вопрос Троя по текущему делу; stop"},
+    "goal": {"type": "string", "description": "для start: что сделать — подробно, со всеми данными пользователя"},
+    "url": {"type": "string", "description": "для start: с какого сайта начать (если известен)"},
+    "answer": {"type": "string", "description": "для answer: ответ пользователя дословно"}}, ["action"])
+WEB_HINT_RE = re.compile(r"на сайте|зайди на|запиши меня|записаться|запишись|оформи|закажи|заказать|забронир|"
+                         r"проверь (?:статус|заказ|посылк|баланс)|отследи|трек.номер|подешевле|дешевле всего|"
+                         r"сравни цен|заполни|личн\w+ кабинет|госуслуг|Ответь «да» — продолжу|дело на сайте", re.I)
+WEB_RULES = """
+- Дела на сайтах (записаться, заказать, заполнить, проверить статус, найти дешевле в нескольких магазинах) — web_task
+  action=start с подробной целью (все данные пользователя: имя, даты, адрес, что именно). Трой сделает это во вкладке
+  программы. Если Трой спросил «❓ … Ответь «да»» и пользователь ответил — web_task action=answer с его ответом.
+  «Стоп», «хватит» про дело на сайте — action=stop. Просто «открой сайт» — это open_site, не web_task."""
+MEMORY_HINT_RE = re.compile(r"запомн|помнишь|не забудь|забудь|говорил|обсуждал|писал[аи]? (?:тебе|про|о )|"
+                            r"в прошлый раз|когда (?:я|мы) |где (?:лежит|лежат)|что я |как я |какой у меня|"
+                            r"какая у меня|какие у меня|сколько у меня|код от|пароль от|номер (?:от|телефона)|"
+                            r"заметк|вспомни|найди в (?:переписке|чате|истории)", re.I)
+MEMORY_RULES = """
+- Память: «запомни …» — remember (адреса мест для маршрутов — save_place). Вопросы о прошлом («что я говорил про …»,
+  «когда менял …», «где лежит …», «какой у меня …») — сначала посмотри в список «Что пользователь просил запомнить»,
+  не нашёл — recall с ключевыми словами. Отвечай по найденному, с датой. Не нашёл — так и скажи, не выдумывай."""
 PC_ACTIONS = {"shutdown": "выключить компьютер", "restart": "перезагрузить компьютер", "sleep": "отправить в сон",
               "lock": "заблокировать экран", "open_app": "открыть", "close_app": "закрыть",
               "play_pause": "пауза / продолжить", "next_track": "следующий трек", "prev_track": "предыдущий трек",
@@ -996,6 +1122,21 @@ MCCLURE_FILMS = [
     "«Сколько сделок закрыли в октябре»", "«Заблокируй комп, я отошёл»", "«Перезагрузить? Ответь „да“»",
     "«Голосовое на ходу»", "«Пароль для приложения»", "«Выбери компьютер»",
 ]
+
+
+THANKS_RE = re.compile(r"^(?:ну\s+)?(?:(?:ок(?:ей)?|понял|ясно|отлично|супер|класс|круто)[\s,]+)?"
+                       r"(?:спасибо|спс|благодарю|пасиб[оа]?|сенкс|thanks|thank you)"
+                       r"(?:[\s,]+(?:большое|огромное|тебе|вам|трой|бро|друг|понял|ясно))*\s*[.!)\s]*$", re.I)
+THANKS_REPLIES = ["Пожалуйста!", "Обращайся.", "Всегда рад помочь.", "Не за что.", "Обращайся, если что."]
+
+
+def thanks(text: str) -> Optional[str]:
+    """«Спасибо» — короткий ответ без модели (модель любит заново выполнять прошлую просьбу).
+    Только благодарность: «ок», «да», «хорошо» могут быть ответом на вопрос Троя («Выключаю?») — их не трогаем."""
+    text = re.sub(r"^\[голосовое\]\s*", "", (text or "").strip(), flags=re.I).replace("ё", "е")
+    if not THANKS_RE.match(text):
+        return None
+    return random.choice(THANKS_REPLIES)
 
 
 def mcclure(text: str) -> Optional[str]:
@@ -1115,6 +1256,231 @@ _SOUND_MULTI = {"j": ["дж"], "x": ["кс"], "i": ["ай"], "u": ["ю"]}
 _SPOKEN = {"pc": ["пи\\s*си", "писи", "пэ\\s*ка", "пэ\\s*сэ"], "nb": ["нб", "ноут"]}
 
 
+# ───────────────────────── Утренняя сводка ─────────────────────────
+# Раз в день одним сообщением: погода, напоминания и календарь на сегодня, задачи Битрикса, траты.
+# Собирается без модели (быстро и не тратит лимиты); каждая часть сама по себе — сломалась одна, остальные придут.
+
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+              "октября", "ноября", "декабря"]
+BRIEF_KEY = "morning_brief"
+BRIEF_DEFAULT = {"on": True, "time": "07:30", "days": "all", "last": ""}
+BRIEF_TOOL = fn("morning_brief", "Утренняя сводка (погода, напоминания, календарь, задачи Битрикса, траты): "
+                                 "настроить или прислать сейчас.", {
+    "action": {"type": "string", "enum": ["now", "set", "off", "show"],
+               "description": "now — прислать сводку сейчас; set — включить/поменять время или дни; off — выключить; "
+                              "show — как настроена"},
+    "time": {"type": "string", "description": "для set: во сколько присылать, ЧЧ:ММ"},
+    "days": {"type": "string", "enum": ["all", "weekdays"], "description": "для set: каждый день или только в будни"}},
+    ["action"])
+BRIEF_NOW_RE = re.compile(r"^(?:тро[йю],?\s*)?(?:пришли|покажи|дай|сделай|скинь|присылай)\s+(?:мне\s+)?"
+                          r"(?:утреннюю\s+|свою\s+)?сводку(?:\s+(?:сейчас|сегодня|на сегодня))?\s*[.!?]*$", re.I)
+BRIEF_HINT_RE = re.compile(r"сводк|брифинг|утренн\w* (?:сообщ|отч)", re.I)
+WMO = {0: "ясно", 1: "в основном ясно", 2: "переменная облачность", 3: "пасмурно", 45: "туман", 48: "туман с изморозью",
+       51: "морось", 53: "морось", 55: "сильная морось", 56: "ледяная морось", 57: "ледяная морось",
+       61: "небольшой дождь", 63: "дождь", 65: "сильный дождь", 66: "ледяной дождь", 67: "ледяной дождь",
+       71: "небольшой снег", 73: "снег", 75: "сильный снег", 77: "снежная крупа", 80: "ливень", 81: "ливень",
+       82: "сильный ливень", 85: "снегопад", 86: "сильный снегопад", 95: "гроза", 96: "гроза с градом",
+       99: "гроза с градом"}
+
+
+def brief_settings() -> dict:
+    return {**BRIEF_DEFAULT, **kv_json(BRIEF_KEY)}
+
+
+def brief_configure(a: dict) -> str:
+    cfg = brief_settings()
+    act = a.get("action") or "show"
+    if act == "off":
+        cfg["on"] = False
+    elif act == "set":
+        t = str(a.get("time") or "").strip().replace(".", ":")
+        if t:
+            m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", t)
+            if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:
+                return "Ошибка: время в виде ЧЧ:ММ, например 07:30."
+            new = f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
+            if new != cfg["time"]:
+                cfg["last"] = ""                 # перенесли на позже — сегодня тоже придёт
+            cfg["time"] = new
+        if a.get("days") in ("all", "weekdays"):
+            cfg["days"] = a["days"]
+        cfg["on"] = True
+    kv_json_set(BRIEF_KEY, cfg)
+    if not cfg["on"]:
+        return "Утренняя сводка выключена. Включить: /brief 7:30."
+    return (f"Утренняя сводка приходит в {cfg['time']}, {'по будням' if cfg['days'] == 'weekdays' else 'каждый день'}. "
+            "Прислать сейчас: /brief сейчас; выключить: /brief выкл.")
+
+
+def brief_weather(places: "connectors.Places") -> str:
+    p = places.all()
+    home = p.get("дом") or p.get("работа") or next(iter(p.values()), None)
+    if not home:
+        return "🌤 Погода: скажи «запомни дом — город, улица, дом», и я буду присылать прогноз."
+    r = requests.get("https://api.open-meteo.com/v1/forecast", timeout=(8, 20), params={
+        "latitude": home["lat"], "longitude": home["lon"], "timezone": TZ_NAME, "forecast_days": 1,
+        "current": "temperature_2m,weather_code",
+        "daily": "temperature_2m_min,temperature_2m_max,precipitation_probability_max,weather_code,wind_speed_10m_max"})
+    r.raise_for_status()
+    d, cur = r.json()["daily"], r.json().get("current") or {}
+    t = lambda x: f"{round(x):+d}°".replace("+0°", "0°")          # noqa: E731
+    line = (f"🌤 Погода: сейчас {t(cur['temperature_2m'])}, {WMO.get(cur.get('weather_code'), '')}; днём "
+            f"{t(d['temperature_2m_min'][0])}…{t(d['temperature_2m_max'][0])}, {WMO.get(d['weather_code'][0], '')}")
+    rain, wind = d.get("precipitation_probability_max", [None])[0], d.get("wind_speed_10m_max", [None])[0]
+    if rain is not None and rain >= 40:
+        line += f", осадки {rain}%"
+    if wind is not None and wind >= 36:                              # км/ч → м/с: сильный ветер — от 10 м/с
+        line += f", ветер до {round(wind / 3.6)} м/с"
+    return line + "."
+
+
+def brief_reminders(chat_id: str, day_end: datetime) -> str:
+    with closing(db()) as con:
+        rows = con.execute("SELECT due, text FROM reminders WHERE chat_id=? AND active=1 AND due<=? ORDER BY due",
+                           (str(chat_id), int(day_end.timestamp()))).fetchall()
+    if not rows:
+        return ""
+    return "⏰ Напоминания на сегодня:\n" + "\n".join(
+        f"- {datetime.fromtimestamp(r['due'], TZ):%H:%M} {r['text']}" for r in rows[:10])
+
+
+def brief_calendar(assistant: "Assistant", today: str) -> str:
+    on = assistant.conns.enabled()
+    out = []
+    for tool in ("calendar_events", "caldav_events"):
+        cid = assistant.conns.owner_of(tool)
+        if cid in on:
+            text = assistant.conns.run(tool, {"date_from": today, "date_to": today})
+            if text and not text.startswith(("Ошибка", "Событий нет", "Нет событий")):
+                out.append(text.strip())
+    return ("📅 Календарь:\n" + "\n".join(out)) if out else ""
+
+
+def brief_bitrix(assistant: "Assistant") -> str:
+    if not assistant.bx:
+        return ""
+    text = assistant.bx.tasks("today", limit=10)
+    if text.startswith("Задач не найдено"):
+        return "📋 Битрикс: задач на сегодня и просроченных нет."
+    lines = [re.sub(r", исполнитель .*$", "", ln) for ln in text.splitlines()]
+    return "📋 Задачи Битрикса на сегодня и просроченные:\n" + "\n".join(f"- {ln}" for ln in lines)
+
+
+def morning_brief(assistant: "Assistant", chat_id: str) -> str:
+    now = now_local()
+    day_end = now.replace(hour=23, minute=59, second=59)
+    today = now.strftime("%Y-%m-%d")
+    parts = [("погода", lambda: brief_weather(assistant.places)),
+             ("напоминания", lambda: brief_reminders(chat_id, day_end)),
+             ("календарь", lambda: brief_calendar(assistant, today)),
+             ("Битрикс", lambda: brief_bitrix(assistant)),
+             ("траты", lambda: expenses.month_line(db, chat_id, TZ))]
+    results: dict = {}
+
+    def one(name, f):
+        t0 = time.time()
+        try:
+            results[name] = f() or ""
+        except Exception as e:
+            log.warning("Сводка, %s: %s", name, human_error(e) if isinstance(e, requests.RequestException) else e)
+            results[name] = f"⚠️ {name}: не получилось ({human_error(e) if isinstance(e, requests.RequestException) else e})"
+        if time.time() - t0 > 5:
+            log.info("Сводка, %s: %.1f с", name, time.time() - t0)
+    threads = [threading.Thread(target=one, args=p, daemon=True) for p in parts]
+    for th in threads:
+        th.start()
+    deadline = time.time() + 90                  # дольше полутора минут никого не ждём
+    for th in threads:
+        th.join(max(0.0, deadline - time.time()))
+    body = []
+    for name, _ in parts:
+        if name in results:
+            if results[name]:
+                body.append(results[name])
+        else:
+            body.append(f"⚠️ {name}: долго не отвечает — пропустил")
+    who = f", {USER_NAME}" if USER_NAME else ""
+    hello = "Доброе утро" if now.hour < 12 else "Добрый день" if now.hour < 18 else "Добрый вечер"
+    head = f"{hello}{who}! Сегодня {WEEKDAYS[now.weekday()]}, {now.day} {MONTHS_GEN[now.month - 1]}."
+    return head + "\n\n" + ("\n\n".join(body) if body else "Ничего важного на сегодня.")
+
+
+def brief_due(cfg: dict, now: datetime) -> bool:
+    if not cfg.get("on") or cfg.get("last") == now.strftime("%Y-%m-%d"):
+        return False
+    if cfg.get("days") == "weekdays" and now.weekday() >= 5:
+        return False
+    h, m = (int(x) for x in cfg["time"].split(":"))
+    at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return at <= now < at + timedelta(hours=3)   # сервер был выключен с утра — к обеду старую сводку не шлём
+
+
+def brief_loop(assistant: "Assistant") -> None:
+    time.sleep(30)
+    while True:
+        try:
+            cfg = brief_settings()
+            now = now_local()
+            if ALLOWED_USER_ID and brief_due(cfg, now):
+                cfg["last"] = now.strftime("%Y-%m-%d")
+                kv_json_set(BRIEF_KEY, cfg)          # сначала отмечаем: даже при сбое не пришлём дважды
+                text = morning_brief(assistant, ALLOWED_USER_ID)
+                push_event(text)
+                add_history(ALLOWED_USER_ID, "assistant", text)
+                for attempt in range(5 if tg_linked() else 0):
+                    try:
+                        Telegram(TELEGRAM_TOKEN).send(ALLOWED_USER_ID, text)
+                        break
+                    except Exception as e:
+                        log.warning("Сводка не ушла в Telegram (%s), попытка %d", e, attempt + 1)
+                        time.sleep(60)
+        except Exception:
+            log.exception("Утренняя сводка")
+        time.sleep(30)
+
+
+def alerts_loop(assistant: "Assistant") -> None:
+    """Трой пишет сам (сроки, сообщения Битрикса, важные письма). Раз в 5 минут; ночью копит до утра."""
+    pending: list = []
+    first = True
+    time.sleep(90)
+    while True:
+        try:
+            mail_cfg = assistant.conns.enabled().get("mail")
+            now = now_local()
+            new = alerts.check_once(db, assistant.bx, mail_cfg, connectors._imap if mail_cfg else None, now, first)
+            first = False
+            pending = (pending + new)[-50:]
+            if pending and not alerts.quiet(now) and ALLOWED_USER_ID:
+                text = ("Пока ты спал:\n" if now.hour == alerts.QUIET[1] and len(pending) > 1 else "") + \
+                    "\n\n".join(pending[:15]) + (f"\n\n…и ещё {len(pending) - 15}" if len(pending) > 15 else "")
+                push_event(text)
+                add_history(ALLOWED_USER_ID, "assistant", text)
+                pending = []
+                if tg_linked():
+                    Telegram(TELEGRAM_TOKEN).send(ALLOWED_USER_ID, text)
+        except (requests.RequestException, TelegramError) as e:
+            log.warning("Сам пишу: Telegram недоступен (%s) — пришлю позже", e)
+        except Exception:
+            log.exception("Сам пишу")
+        time.sleep(300)
+
+
+def brief_command(assistant: "Assistant", chat_id: str, arg: str) -> str:
+    a = arg.strip().lower()
+    if not a:
+        return brief_configure({"action": "show"})
+    if a in ("сейчас", "now", "пришли"):
+        return morning_brief(assistant, chat_id)
+    if a in ("выкл", "выключить", "off", "нет", "стоп"):
+        return brief_configure({"action": "off"})
+    days = "weekdays" if "будн" in a else "all" if ("кажд" in a or "все" in a) else None
+    t = re.search(r"\d{1,2}(?:[:.]\d{2})?", a)
+    if not t and not days:
+        return "Так: /brief 7:30 — время, /brief будни или /brief каждый день, /brief сейчас, /brief выкл."
+    return brief_configure({"action": "set", "time": t.group(0) if t else "", "days": days})
+
+
 def _letter_rx(ch: str, prev: str) -> str:
     alts = [re.escape(ch)] + list(_SOUNDS.get(ch, "")) + _SOUND_MULTI.get(ch, [])
     rx = "(?:" + "|".join(sorted(set(alts), key=len, reverse=True)) + ")"
@@ -1209,6 +1575,8 @@ YES_ONLY_RE = re.compile(rf"^(?:\[голосовое\]\s*)?(?:трой[\s,.!]*)?
 NO_RE = re.compile(r"^(?:\[голосовое\]\s*)?(?:нет|не надо|не нужно|не делай|отмена|отмени|стоп)\b[\s,.!]*$", re.I)
 
 
+TIMINGS = collections.deque(maxlen=500)   # (когда, сколько секунд думал, модель) — для /status
+SLOW_TOOLS: list = []                      # функции дольше 3 с в текущем ответе
 BX_PENDING: dict = {}       # chat_id -> действие в Битриксе, которое ждёт «да» (name, args, ts, what)
 
 
@@ -1219,7 +1587,9 @@ def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = Fa
 Обращение по имени («{BOT_NAME}, …») — просто обращение к тебе, отвечай на суть. Представляйся этим именем, если спросят.
 Пиши обычным текстом: без Markdown, звёздочек, решёток и таблиц, Telegram их не отрисует. Списки — через «-».
 
-Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS[now.weekday()]}, часовой пояс {TZ_NAME}.
+Сейчас {now:%Y-%m-%d %H:%M}, {WEEKDAYS[now.weekday()]}, часовой пояс {TZ_NAME} (UTC{now:%z}); по UTC сейчас {datetime.utcnow():%H:%M}.
+Время в другом городе считай сам от UTC и пояса города (Омск UTC+6, Новосибирск UTC+7, Екатеринбург UTC+5,
+Владивосток UTC+10, Калининград UTC+2…) — не ищи в интернете: результаты поиска бывают устаревшими.
 
 Правила:
 - Напоминания: вызывай create_reminder. «Через 20 минут», «в пятницу», «завтра утром» переводи в точное время
@@ -1234,6 +1604,9 @@ def system_prompt(projects: List[str], bitrix_on: bool = False, pc_on: bool = Fa
 - Сообщения с пометкой [голосовое] — это расшифровка речи пользователя: отвечай на смысл, не пересказывай.
   В расшифровке бывают ошибки распознавания — понимай по смыслу.
 - Фото и документы: сделай то, о чём просит подпись. Без подписи — коротко скажи, что там, и чем можешь помочь.
+- Отвечай на последнее сообщение. Благодарность, «ок», «понял» — коротко ответь и НЕ повторяй прошлый поиск или действие.
+- Живые данные (пробки, погода, курсы, наличие): называй только числа, которые источник прямо даёт на текущий момент.
+  Нет свежего значения — так и скажи и дай ссылку, где посмотреть. Не сочиняй заторы, перекрытия и скорости.
 - Если не уверен в факте — так и скажи.{APP_RULES}{BITRIX_RULES if bitrix_on else ""}{PC_RULES if pc_on else ""}{BOILER_RULES if boiler_on else ""}"""
 
 
@@ -1286,8 +1659,12 @@ class Assistant:
     def web_search(self, query: str) -> str:
         messages = [
             {"role": "system", "content": f"Найди в интернете актуальный ответ и изложи факты кратко: цены, адреса, "
-                                          f"даты, названия, со ссылками на источники. Сегодня {now_local():%Y-%m-%d}. "
-                                          f"Отвечай по-русски."},
+                                          f"даты, названия, со ссылками на источники. Сейчас {now_local():%Y-%m-%d %H:%M} "
+                                          f"(по времени пользователя). Для того, что меняется каждый час (пробки, погода, курсы), бери "
+                                          f"только значение на сегодня и сейчас и укажи, на какое время оно; если на "
+                                          f"странице нет свежего значения — так и напиши, не подставляй старое или "
+                                          f"примерное. Ничего не добавляй от себя. Отвечай по-русски."},
+
             {"role": "user", "content": query}]
         # gpt-oss иногда выдаёт битый вызов поиска (Groq отвечает 400 «Parsing failed») — пробуем ещё раз и запасную
         attempts = [(GROQ_SEARCH_MODEL, "low"), (GROQ_SEARCH_MODEL, "medium"), ("openai/gpt-oss-20b", "low")]
@@ -1306,6 +1683,17 @@ class Assistant:
         return ("ПОИСК НЕ УДАЛСЯ" + (f" ({last})" if last else "") +
                 ". Скажи пользователю, что сейчас не получилось поискать, и предложи повторить через минуту; "
                 "не выдумывай цены и наличие.")
+
+    def timed_execute(self, chat_id: str, name: str, args: dict) -> str:
+        t0 = time.time()
+        try:
+            return self.execute(chat_id, name, args)
+        finally:
+            took = time.time() - t0
+            getattr(self, "perf", []).append(f"{name} {took:.1f}с")
+            if took > 3:
+                SLOW_TOOLS.append((name, took))
+                log.info("Функция %s: %.1f с", name, took)
 
     def execute(self, chat_id: str, name: str, args: dict) -> str:
         try:
@@ -1345,6 +1733,31 @@ class Assistant:
                     return ("НЕ ВЫПОЛНЕНО: сначала покажи пользователю, что именно добавишь (название, дата, время), "
                             "и спроси «Добавляю?». Вызови функцию снова только после его ответа «да».")
                 return self.conns.run(name, args)
+            if name == "web_task":
+                return self.web_task(chat_id, args)
+            if name == "alerts":
+                return alerts.configure(db, args, bool(self.bx), "mail" in self.conns.enabled())
+            if name == "add_expense":
+                return expenses.add(db, chat_id, args, TZ)
+            if name == "delete_expense":
+                return expenses.delete(db, chat_id, int(args.get("id") or 0))
+            if name == "expenses_report":
+                text, file = expenses.report(db, chat_id, args, TZ)
+                if file:
+                    self.export = file
+                return text
+            if name == "remember":
+                return notes.add(db, chat_id, str(args.get("text") or ""))
+            if name == "recall":
+                return notes.search(db, chat_id, str(args.get("query") or ""), TZ, str(args.get("date_from") or ""),
+                                    str(args.get("date_to") or ""))
+            if name == "forget_note":
+                return notes.delete(db, chat_id, int(args.get("id") or 0), str(args.get("query") or ""))
+            if name == "morning_brief":
+                if args.get("action") == "now":
+                    return "Сводка (перескажи её пользователю полностью, ничего не выдумывая):\n" + \
+                        morning_brief(self, chat_id)
+                return brief_configure(args)
             if name.startswith("bitrix_"):
                 if not self.bx:
                     return "Ошибка: Битрикс24 не подключён (нет BITRIX_WEBHOOK в настройках)."
@@ -1462,6 +1875,27 @@ class Assistant:
             self.pc_choice = choice
         return text + (" Режим: через сервер." if mode == "server" else " Режим: напрямую.")
 
+    def web_task(self, chat_id: str, a: dict) -> str:
+        act = a.get("action") or "start"
+        if act == "start" and not str(a.get("goal") or "").strip():
+            return "Ошибка: опиши goal — что сделать на сайте."
+        fresh = fresh_pcs()
+        if not fresh:
+            return ("НЕ ВЫПОЛНЕНО: дела на сайтах Трой делает в программе на компьютере, а она " +
+                    ("сейчас не в сети." if not online_pcs() else "старой версии — нужна 0.8.0 или новее.") +
+                    " Скажи это пользователю.")
+        arg = {"start": {"goal": str(a.get("goal") or ""), "url": str(a.get("url") or "")},
+               "answer": {"answer": str(a.get("answer") or self.user_text or "да")}, "stop": {"stop": True}}[act]
+        if arg.get("url") and not re.match(r"https?://", arg["url"]):
+            arg["url"] = "https://" + arg["url"]
+        self.pc_used = True
+        device = getattr(self, "caller_device", "") or (WEB_DEVICE.get("last") if act != "start" else "")
+        text, choice = pc_create("web_task", json.dumps(arg, ensure_ascii=False), device if device in fresh else "",
+                                 self.channel, chat_id)
+        if choice:
+            self.pc_choice = choice
+        return text + " Итог и вопросы придут отдельными сообщениями — скажи пользователю, что начал."
+
     def bx_confirm(self, chat_id: str) -> Optional[str]:
         """«Да» на «Делаю?» по Битриксу — выполняем подтверждённое сами (нейросеть могла бы его «забыть»)."""
         pend = BX_PENDING.get(chat_id)
@@ -1570,13 +2004,24 @@ class Assistant:
         fixed = connectors.fix_layout(content) if isinstance(content, str) else content
         if isinstance(fixed, str) and fixed != content and secret_guard(fixed):
             content = fixed              # в ответ «Понял как…» пароль не попадёт
+        t0 = time.time()
+        self.perf = []
         answer = self._run_main(chat_id, fixed, channel)
+        took = time.time() - t0
+        self.last_perf = f"всего {took:.1f}с: " + (", ".join(self.perf) or "без модели")
+        TIMINGS.append((time.time(), took, self.router.last[1] if self.router.last else ""))
+        if took > 20:
+            log.warning("Долгий ответ: %.0f с (%s)", took, ", ".join(f"{n} {s:.0f} с" for n, s in SLOW_TOOLS[-5:]) or "без функций")
+        SLOW_TOOLS.clear()
         if fixed != content and isinstance(answer, str):
             answer = f"⌨️ Понял как: «{fixed.strip()}»\n\n{answer}"
         return answer
 
     def _run_main(self, chat_id: str, content, channel: str = "telegram") -> str:
+        t_wait = time.time()
         with self.lock:
+            if time.time() - t_wait > 0.3:
+                self.perf.append(f"очередь {time.time() - t_wait:.1f}с")
             self.channel = channel
             self.pc_choice, self.pc_used = None, False
             self.user_text = content if isinstance(content, str) else " ".join(
@@ -1589,9 +2034,11 @@ class Assistant:
                 saved = log_request(self, chat_id, self.user_text)
                 if saved:
                     return saved
-                hello = mcclure(self.user_text)
+                hello = mcclure(self.user_text) or thanks(self.user_text)
                 if hello:
                     return hello
+                if BRIEF_NOW_RE.match(self.user_text.strip()):     # сводка — без модели, сразу
+                    return morning_brief(self, chat_id)
                 fast = self.bx_confirm(chat_id) or self.fast_pc(chat_id)
                 if fast:
                     return fast
@@ -1621,13 +2068,20 @@ class Assistant:
 
     def _run(self, chat_id: str, content) -> str:
         self.run_id = time.time()
+        t_prep = time.time()
         history = get_history(chat_id)
         use_bx = self.bitrix_needed(history)
         recent = ([self.user_text, getattr(self, "reply_quote", "")]
                   + [h["content"] for h in history[-2:] if isinstance(h.get("content"), str)])
         use_pc = any(PC_HINT_RE.search(t or "") for t in recent)
         use_boiler = BOILER_ON and any(BOILER_HINT_RE.search(t or "") for t in recent)
+        use_brief = any(BRIEF_HINT_RE.search(t or "") for t in recent)
+        use_memory = any(MEMORY_HINT_RE.search(t or "") for t in recent)
+        use_alerts = any(ALERTS_HINT_RE.search(t or "") for t in recent)
+        use_web = any(WEB_HINT_RE.search(t or "") for t in recent)
+        use_money = isinstance(content, list) or any(EXPENSE_HINT_RE.search(t or "") for t in recent)   # фото — вдруг чек
         conn_tools, conn_names = self.conns.tools_for(recent)
+        use_yhome = any(t["function"]["name"].startswith("yhome_") for t in conn_tools)
         use_route = any(re.search(connectors.ROUTE_HINT, t or "", re.I) for t in recent)
         if use_route:
             conn_tools = conn_tools + connectors.ROUTE_TOOLS
@@ -1635,8 +2089,14 @@ class Assistant:
         use_site = getattr(self, "channel", "") == "desktop" and any(SITE_HINT_RE.search(t or "") for t in recent)
         tools = (TOOLS + (BITRIX_TOOLS if use_bx else []) + ([PC_TOOL] if use_pc else [])
                  + ([FILE_TOOL] if use_file else []) + ([SITE_TOOL] if use_site else [])
-                 + ([BOILER_TOOL] if use_boiler else []) + conn_tools)
+                 + ([BOILER_TOOL] if use_boiler else []) + ([BRIEF_TOOL] if use_brief else [])
+                 + (MEMORY_TOOLS if use_memory else []) + (EXPENSE_TOOLS if use_money else [])
+                 + ([ALERTS_TOOL] if use_alerts else []) + ([WEB_TOOL] if use_web else []) + conn_tools)
         prompt = system_prompt(self.ideas.projects(), use_bx, use_pc, use_boiler)
+        if time.time() - t_prep > 0.3:
+            self.perf.append(f"подготовка {time.time() - t_prep:.1f}с")
+        prompt += notes.prompt_block(db, chat_id) + (MEMORY_RULES if use_memory else "") + \
+            (EXPENSE_RULES if use_money else "") + (WEB_RULES if use_web else "")
         if use_route:
             prompt += connectors.ROUTE_RULES
         if conn_names:
@@ -1650,6 +2110,9 @@ class Assistant:
         messages = ([{"role": "system", "content": prompt}]
                     + history + [{"role": "user", "content": content}])
         has_image = isinstance(content, list)
+        # простой вопрос: короткий текст, без картинок и без «тяжёлых» тем — его быстрее и не хуже решит быстрая модель
+        simple = (not has_image and not quote and len(self.user_text or "") <= 160
+                  and not (use_bx or use_pc or use_file or use_site or use_route or use_yhome))
         must_pc = (use_pc and bool(PC_ORDER_RE.search(self.user_text or "")) and not HOME_RE.search(self.user_text or "")
                    and not SITE_HINT_RE.search(self.user_text or ""))
         nudged = False
@@ -1657,7 +2120,7 @@ class Assistant:
         provider, model = None, None
         last_err: Optional[LLMError] = None
         for _ in range(12):
-            cands = self.router.candidates(has_image, skip)
+            cands = self.router.candidates(has_image, skip, fast=simple)
             if not cands:
                 if last_err and last_err.status != 429:
                     raise last_err
@@ -1670,11 +2133,18 @@ class Assistant:
             send = messages if model in VISION_MODELS else self.strip_images(messages)
             send = [{**send[0], "content": send[0]["content"] + self.router.describe(provider, model)}] + send[1:]
             try:
-                msg = provider.chat(model, send, tools)
+                extra = {"reasoning_effort": "low"} if simple and model.startswith("openai/gpt-oss") else {}
+                t_llm = time.time()
+                try:
+                    msg = provider.chat(model, send, tools, **extra)
+                finally:
+                    self.perf.append(f"{model.split('/')[-1]} {time.time() - t_llm:.1f}с")
                 self.router.last = (getattr(provider, "NAME", ""), model, time.time())
             except LLMError as e:
+                if self.perf:                            # в журнале программы видно, почему модель не ответила
+                    self.perf[-1] += f" ✗{e.status}"
                 if e.status in (400, 404, 413, 422, 429, 500, 502, 503, 529) or (
-                        e.status in (401, 402, 403) and provider is self.router.custom):
+                        e.status in (401, 402, 403) and provider in (self.router.custom, self.router.giga)):
                     self.router.penalize(model, e)
                     skip.add(model)          # в этом сообщении к ней больше не возвращаемся
                     last_err = e
@@ -1710,7 +2180,7 @@ class Assistant:
                     args = {}
                 log.info("Функция: %s %s", name, json.dumps(args, ensure_ascii=False)[:200])
                 messages.append({"role": "tool", "tool_call_id": c["id"],
-                                 "content": self.execute(chat_id, name, args)})
+                                 "content": self.timed_execute(chat_id, name, args)})
         return "Запутался в шагах — попробуй сформулировать иначе."
 
 
@@ -1725,9 +2195,14 @@ HELP = """Я {name}, твой помощник. Пиши текстом, гол�
 - «где купить термопасту и почём»
 - фото ценника, квитанции, схемы — с вопросом в подписи
 - «что у меня по задачам в битриксе», «сколько сделок закрыли в октябре по менеджерам»
+- «запомни: фильтр в котле менял 3 ноября», «когда я менял фильтр?»
+- фото чека — запишу трату; «сколько я потратил на продукты в этом месяце»
+- «запиши меня к стоматологу на сайте клиники» — сделаю во вкладке программы и спрошу перед отправкой
 
 Команды:
 /reminders — мои напоминания
+/alerts — о чём я пишу сам (сроки и сообщения Битрикса, важные письма)
+/brief — утренняя сводка: /brief сейчас, /brief 7:30, /brief будни, /brief выкл
 /ideas — проекты с идеями, /ideas имя — идеи проекта
 /new — начать разговор с чистого листа
 /log — сохранить переписку файлом: /log, /log сегодня, /log неделя
@@ -1780,6 +2255,13 @@ class Bot:
                 for r in rows) if rows else "Программа сейчас нигде не авторизована.")
         elif cmd == "/status":
             self.tg.send(chat_id, self.assistant.router.status())
+        elif cmd == "/alerts":
+            self.tg.send(chat_id, alerts.configure(db, {"action": "show"}, bool(self.assistant.bx),
+                                                   "mail" in self.assistant.conns.enabled()))
+        elif cmd == "/brief":
+            if arg.strip().lower() in ("сейчас", "now", "пришли"):
+                self.tg.typing(chat_id)
+            self.tg.send(chat_id, brief_command(self.assistant, chat_id, arg))
         elif cmd == "/apps":
             if not arg.strip():
                 self.tg.send(chat_id, "Напиши так: /apps яндекс — покажу, какие программы с этим словом видит Трой на компьютере.")
@@ -1994,6 +2476,7 @@ class Bot:
     def poll_forever(self, stop_when: Callable[[], bool] = lambda: False) -> None:
         offset = None
         while not stop_when():
+            HEARTBEAT["poll"] = time.time()
             try:
                 updates = self.tg.call("getUpdates", timeout=40, data={
                     "timeout": 30, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])})
@@ -2176,6 +2659,10 @@ def desktop_command(assistant: "Assistant", text: str) -> Optional[str]:
     cmd = cmd.lower()
     if cmd == "/status":
         return assistant.router.status()
+    if cmd == "/alerts":
+        return alerts.configure(db, {"action": "show"}, bool(assistant.bx), "mail" in assistant.conns.enabled())
+    if cmd == "/brief":
+        return brief_command(assistant, ALLOWED_USER_ID, arg)
     if cmd == "/apps":
         if not arg.strip():
             return "Напиши так: /apps яндекс — покажу, какие программы с этим словом видит Трой на компьютере."
@@ -2275,9 +2762,10 @@ def desktop_message(assistant: "Assistant", text: str, files: Optional[list]) ->
         assistant.secret_seen, note = False, ["[сообщение с паролем или ключом — не сохранено]"]
     add_history(chat_id, "pc_user" if pc else "user", " ".join(note))
     add_history(chat_id, "pc_reply" if pc else "assistant", answer)
+    perf = getattr(assistant, "last_perf", "")
     if export:
-        return {"reply": answer, "download": {"name": export[0], "b64": base64.b64encode(export[1]).decode()}}
-    return {"reply": answer, "choice": choice} if choice else answer
+        return {"reply": answer, "download": {"name": export[0], "b64": base64.b64encode(export[1]).decode()}, "perf": perf}
+    return {"reply": answer, "choice": choice, "perf": perf} if choice else {"reply": answer, "perf": perf}
 
 
 def desktop_history(after: int = 0) -> list:
@@ -2581,9 +3069,59 @@ def _host(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def _giga_connect(assistant: "Assistant", v: dict) -> tuple:
+    key = re.sub(r"\s+", "", v.get("key", ""))
+    if len(key) < 20:
+        return "Вставь «Ключ авторизации» целиком — длинную строку из кабинета GigaChat API.", ""
+    test = gigachat.GigaChat(key, LLMError, BASE / "tls", env("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"), env("GIGACHAT_PROXY"))
+    try:
+        reply = clean_answer(test.chat("GigaChat-2", [{"role": "user", "content": "Ответь одним словом: работаю"}])
+                             .get("content"))
+    except LLMError as e:
+        if e.status in (400, 401, 403):
+            return f"GigaChat не принял ключ: {e.text}. Скопируй «Ключ авторизации» заново (кнопка «Получить ключ»).", ""
+        if e.status == 402:
+            return "GigaChat: бесплатный пакет закончился или не активирован (402). Проверь тариф в кабинете.", ""
+        return f"GigaChat ответил ошибкой {e.status}: {(e.text or '')[:150]}", ""
+    except (requests.RequestException, RuntimeError, OSError) as e:
+        msg = human_error(e) if isinstance(e, requests.RequestException) else str(e)
+        return f"Не достучался до GigaChat: {msg}.", ""
+    save_setting("GIGACHAT_KEY", key)
+    assistant.router.giga = make_gigachat()
+    for m in GIGACHAT_MODELS:
+        assistant.router.cool.pop(m, None)
+        assistant.router.errors.pop(m, None)
+    log.info("GigaChat подключён (ответ: %s)", reply[:30])
+    return None, ""
+
+
+def _giga_disconnect(assistant: "Assistant") -> None:
+    save_setting("GIGACHAT_KEY", "")
+    assistant.router.giga = None
+
+
 def register_modules(assistant: "Assistant") -> None:
     """Модули в окне «Подключения» — вверху списка, с той же формой и инструкцией."""
     assistant.conns.modules = {
+        "gigachat": {
+            "title": "GigaChat (Сбер) — основная модель",
+            "about": "Сильная русскоязычная модель. Для физлиц — бесплатный пакет на год (сотни миллионов токенов). "
+                     "Трой отвечает ею первым, остальные модели остаются запасными.",
+            "fields": [{"name": "key", "label": "Ключ авторизации", "secret": True}],
+            "state": lambda: (bool(GIGACHAT_KEY), "GigaChat: " + ", ".join(GIGACHAT_MODELS) if GIGACHAT_KEY else "", ""),
+            "connect": lambda v: _giga_connect(assistant, v),
+            "disconnect": lambda: _giga_disconnect(assistant),
+            "help": """
+1. Открой https://developers.sber.ru/studio и войди через **Сбер ID** (нужен российский номер телефона).
+2. Нажми **Создать проект** → **GigaChat API** → тариф **для физических лиц** (Freemium, бесплатно).
+3. В проекте открой **Настройки API** и нажми **Получить ключ**.
+4. Скопируй **Ключ авторизации** (длинная строка) — он показывается один раз — и вставь сюда.
+
+Трой сам получает по этому ключу пропуск на 30 минут и обновляет его. Если серверам Сбера нужен
+российский сертификат Минцифры, Трой один раз скачает его с официального сайта gu-st.ru.
+Модели по очереди: GigaChat-2-Max → Pro → Lite — у каждой свой бесплатный пакет; закончится один — ответит следующий.
+Фото и чеки GigaChat этим способом не видит — их по-прежнему разбирает модель Groq.
+"""},
         "telegram": {
             "title": "Telegram", "about": "Пиши Трою с телефона, получай напоминания где угодно.",
             "fields": [{"name": "token", "label": "Токен бота от @BotFather", "secret": True,
@@ -2855,12 +3393,31 @@ def pcs_status() -> str:
     return "Компьютеры:\n" + "\n".join(rows)
 
 
+WEB_DEVICE: dict = {}              # на каком компьютере идёт последнее дело на сайте
+
+
+def fresh_pcs(min_version: tuple = (0, 8, 0)) -> list:
+    """Компьютеры в сети с программой не старше нужной версии."""
+    return [d for d in online_pcs()
+            if tuple(int(x) for x in PC_VERSION.get(d, "0").split(".") if x.isdigit()) >= min_version]
+
+
 def online_pcs() -> list:
     now = time.time()
     return sorted(d for d, t in PRESENCE.items() if now - t < PC_ONLINE_SEC)
 
 
 def pc_label(action: str, arg: str) -> str:
+    if action == "web_task":
+        try:
+            info = json.loads(arg or "{}")
+        except ValueError:
+            info = {}
+        if info.get("stop"):
+            return "остановить дело на сайте"
+        if "answer" in info:
+            return "продолжить дело на сайте"
+        return "дело на сайте: " + (info.get("goal") or "")[:80]
     if action == "open_site":
         try:
             info = json.loads(arg or "{}")
@@ -2986,10 +3543,13 @@ def pc_result(device: str, cmd_id: int, ok: bool, text: str, late: bool = False)
                 return
             con.execute("UPDATE pc_commands SET status=?, result=? WHERE id=?",
                         ("done" if ok else "failed", text[:300], cmd_id))
+    if row and row["action"] == "web_task":
+        WEB_DEVICE["last"] = device
     if late:                                               # записи в историю — уже после закрытия транзакции
         if not ok:
             POWER_WATCH.pop(cmd_id, None)
-        pc_notify(row["channel"], row["chat_id"], f"{'⏻' if ok else '↩️'} {device}: {text}")
+        icon = ("🌐" if ok else "⚠️") if row["action"] == "web_task" else ("⏻" if ok else "↩️")
+        pc_notify(row["channel"], row["chat_id"], f"{icon} {device}: {text}")
         add_history(row["chat_id"], "pc_result", f"{device}: {text}")
         return
     if row["action"] == "file_get":
@@ -3175,6 +3735,292 @@ def backup_import(password: str, blob: bytes, merge: bool = False) -> tuple:
     return True, text + " Ключи моделей, Telegram и Битрикс24 в копию не входят — они настраиваются отдельно." + extra
 
 
+AGENT_TOOLS = [
+    fn("click", "Нажать на элемент [номер] (кнопку, ссылку, флажок, вариант).",
+       {"id": {"type": "integer"}, "say": {"type": "string", "description": "что делаешь, 3–6 слов"}}, ["id"]),
+    fn("type_text", "Ввести текст в поле [номер]. enter=true — сразу отправить (поиск).", {
+        "id": {"type": "integer"}, "text": {"type": "string"}, "enter": {"type": "boolean"},
+        "say": {"type": "string"}}, ["id", "text"]),
+    fn("select_option", "Выбрать вариант в выпадающем списке [номер].",
+       {"id": {"type": "integer"}, "option": {"type": "string"}, "say": {"type": "string"}}, ["id", "option"]),
+    fn("open_url", "Открыть адрес во вкладке.", {"url": {"type": "string"}, "say": {"type": "string"}}, ["url"]),
+    fn("scroll", "Прокрутить страницу, чтобы увидеть больше.", {"direction": {"type": "string", "enum": ["down", "up"]}}),
+    fn("go_back", "Вернуться на предыдущую страницу."),
+    fn("wait", "Подождать 3 секунды (страница грузится)."),
+    fn("ask_user", "Остановиться и спросить пользователя: перед отправкой, записью, заказом, оплатой, сообщением "
+                   "кому-то — с точными деталями; или когда не хватает данных, нужна капча, пароль, код из СМС.",
+       {"question": {"type": "string"}}, ["question"]),
+    fn("finish", "Дело сделано или сделать нельзя: итог для пользователя (факты, цены, время, ссылки).",
+       {"result": {"type": "string"}}, ["result"]),
+]
+AGENT_PROMPT = """Ты — {name}, делаешь дело на сайте за пользователя во вкладке браузера. Сейчас {now}.
+Каждый ход ты видишь страницу: адрес, текст и список элементов «[номер] тип: подпись». Отвечай ОДНИМ вызовом функции.
+Правила:
+- Действуй как аккуратный человек: найди нужное, заполни, проверь. Номера элементов бери только из текущего списка.
+- Не знаешь сайт — открой поиск (open_url https://ya.ru/search/?text=…) и перейди на подходящий результат.
+- Перед НЕОБРАТИМЫМ шагом (отправить заявку, записаться, оформить или оплатить заказ, отправить сообщение,
+  подтвердить, удалить) — ask_user с точными деталями («Записываю на сб 21.11 в 12:00 к Ольге, массаж ШВЗ. Да?»).
+  Если в истории уже есть «Пользователь ответил: да» именно на это — делай.
+- Поля «СЕКРЕТНОЕ» (пароль, карта, код из СМС) НЕ заполняй никогда: ask_user — попроси пользователя ввести их
+  самому во вкладке и ответить «готово». Капча — тоже ask_user.
+- Оплату не проводи никогда: доведи до страницы оплаты и ask_user.
+- Не ходи кругами: если действие дважды не сработало — попробуй иначе или finish с объяснением.
+- Когда цель достигнута или узнал ответ — finish с итогом: коротко, с фактами, ценами, датами и ссылками."""
+
+
+def agent_step(assistant: "Assistant", data: dict) -> dict:
+    page = data.get("page") or {}
+    hist = [str(x)[:400] for x in (data.get("history") or [])][-14:]
+    user = (f"Цель: {str(data.get('goal') or '')[:1500]}\n\nСделано:\n" + ("\n".join(hist) or "пока ничего") +
+            f"\n\nСейчас открыто: {str(page.get('url') or '')[:300]}\nЗаголовок: {str(page.get('title') or '')[:200]}\n"
+            f"Прокручено: {page.get('scroll', 0)}%\n\nТекст страницы:\n{str(page.get('text') or '')[:4000]}\n\n"
+            f"Элементы:\n{str(page.get('els') or '')[:7000]}\n\nСледующее действие?")
+    now = now_local()
+    messages = [{"role": "system", "content": AGENT_PROMPT.format(name=BOT_NAME, now=f"{now:%Y-%m-%d %H:%M}, "
+                                                                                     f"{WEEKDAYS[now.weekday()]}")},
+                {"role": "user", "content": user}]
+    skip: set = set()
+    for _ in range(6):
+        cands = assistant.router.candidates(False, skip)
+        if not cands:
+            return {"do": "done", "text": "Модели сейчас недоступны (лимиты) — остановился. Попробуй позже."}
+        provider, model = cands[0]
+        try:
+            msg = provider.chat(model, messages, AGENT_TOOLS)
+        except LLMError as e:
+            assistant.router.penalize(model, e)
+            skip.add(model)
+            continue
+        except requests.RequestException:
+            assistant.router.cool[model] = time.time() + 60
+            skip.add(model)
+            continue
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            text = clean_answer(msg.get("content"))
+            return {"do": "done", "text": text or "Не понял, что делать дальше — остановился."}
+        c = calls[0]["function"]
+        try:
+            a = json.loads(c.get("arguments") or "{}") or {}
+        except ValueError:
+            a = {}
+        name, say = c.get("name"), str(a.get("say") or "")
+        log.info("Дело на сайте: %s %s", name, json.dumps({k: v for k, v in a.items() if k != "text"}, ensure_ascii=False)[:150])
+        if name == "click":
+            return {"do": "click", "id": int(a.get("id") or 0), "say": say or f"нажал [{a.get('id')}]"}
+        if name == "type_text":
+            return {"do": "type", "id": int(a.get("id") or 0), "text": str(a.get("text") or ""),
+                    "enter": bool(a.get("enter")), "say": say or f"ввёл в [{a.get('id')}]"}
+        if name == "select_option":
+            return {"do": "select", "id": int(a.get("id") or 0), "text": str(a.get("option") or ""), "say": say}
+        if name == "open_url":
+            url = str(a.get("url") or "")
+            return {"do": "open", "url": url if re.match(r"https?://", url) else "https://" + url, "say": say}
+        if name == "scroll":
+            return {"do": "scroll", "text": a.get("direction") or "down", "say": "прокрутил"}
+        if name == "go_back":
+            return {"do": "back", "say": "назад"}
+        if name == "wait":
+            return {"do": "wait", "say": "жду"}
+        if name == "ask_user":
+            return {"do": "ask", "text": str(a.get("question") or "Продолжить?")}
+        return {"do": "done", "text": str(a.get("result") or "Готово.")}
+    return {"do": "done", "text": "Модели не ответили — остановился."}
+
+
+# ───────────────────────── Голос для программы ─────────────────────────
+# Голоса Microsoft (как «Читать вслух» в Edge): программа просит озвучку у сервера (с некоторых компьютеров
+# Microsoft напрямую не отвечает). Библиотеку edge-tts сервер ставит себе сам при первом запуске;
+# версия закреплена: в новых (7.3+) Microsoft бросает большинство запросов.
+
+# Кандидаты: русские и «многоязычные» голоса (они говорят и по-русски). Какие из них Microsoft сейчас
+# действительно озвучивает — проверяем короткой фразой раз в сутки и показываем в программе только рабочие.
+TTS_CANDIDATES = [("ru-RU-DmitryNeural", "Дмитрий", "м"), ("en-US-AndrewMultilingualNeural", "Эндрю", "м"),
+                  ("en-US-BrianMultilingualNeural", "Брайан", "м"), ("de-DE-FlorianMultilingualNeural", "Флориан", "м"),
+                  ("fr-FR-RemyMultilingualNeural", "Реми", "м"), ("it-IT-GiuseppeMultilingualNeural", "Джузеппе", "м"),
+                  ("en-AU-WilliamMultilingualNeural", "Уильям", "м"), ("ru-RU-SvetlanaNeural", "Светлана", "ж"),
+                  ("ru-RU-DariyaNeural", "Дария", "ж"), ("en-US-AvaMultilingualNeural", "Ава", "ж"),
+                  ("en-US-EmmaMultilingualNeural", "Эмма", "ж")]
+TTS_VOICE_RE = re.compile(r"[a-z]{2}-[A-Z]{2}-[A-Za-z]+Neural")
+_TTS_PROBE: dict = {"at": 0.0, "voices": [], "failed": []}
+TTS_STATS = collections.deque(maxlen=30)                 # (секунды, как получено, букв) — для замеров
+TTS_GATE = threading.BoundedSemaphore(2)
+TTS_PLAIN: dict = {}                                       # (голос, темп, высота) → когда Microsoft с ними молчал
+_TTS_LOCK = threading.Lock()
+
+
+def tts_voices() -> list:
+    """Рабочие живые голоса: [{"id", "name", "sex"}] (проверка раз в сутки, по одной фразе на голос)."""
+    with _TTS_LOCK:
+        if time.time() - _TTS_PROBE["at"] < 86400 and _TTS_PROBE["voices"]:
+            return _TTS_PROBE["voices"]
+        works: dict = {}
+
+        def probe(vid):                                    # все голоса проверяем разом — так быстрее
+            try:
+                works[vid] = bool(tts_for_desktop({"text": "Проверка голоса.", "voice": vid}))
+            except Exception as e:
+                log.info("Голос %s сейчас не работает: %s", vid, str(e)[:80])
+        cands = list(TTS_CANDIDATES)
+        try:                                               # что Microsoft сам называет: русские и многоязычные голоса
+            import asyncio
+            import edge_tts
+            known = {c[0] for c in cands}
+            for v in asyncio.run(asyncio.wait_for(edge_tts.list_voices(), 30)):
+                sid = v.get("ShortName", "")
+                if sid in known or not TTS_VOICE_RE.fullmatch(sid):
+                    continue
+                if sid.startswith("ru-") or "Multilingual" in sid:
+                    nm = re.sub(r"(Multilingual)?Neural$", "", sid.split("-")[-1])
+                    cands.append((sid, nm, "м" if v.get("Gender") == "Male" else "ж"))
+                    known.add(sid)
+        except Exception as e:
+            log.info("Список голосов Microsoft не получен: %s", e)
+        threads = [threading.Thread(target=probe, args=(v,), daemon=True) for v, _, _ in cands]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(25)
+        ok = [{"id": vid, "name": name, "sex": sex} for vid, name, sex in cands if works.get(vid)]
+        log.info("Голоса: проверено %d, не работают: %s", len(cands),
+                 ", ".join(c[0] for c in cands if not works.get(c[0])) or "все работают")
+        log.info("Живые голоса: %s", ", ".join(v["name"] for v in ok) or "ни одного")
+        _TTS_PROBE.update(at=time.time() if ok else 0.0, voices=ok,
+                          failed=[c[0] for c in cands if not works.get(c[0])])
+        return ok
+
+
+def ensure_edge_tts() -> bool:
+    try:
+        import edge_tts  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    import sys
+    if getattr(sys, "frozen", False):      # Трой внутри программы на компьютере: ставить нечем (библиотека — в сборке)
+        return False
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "edge-tts==7.2.3"], capture_output=True, text=True,
+                       timeout=600)
+    if r.returncode != 0:
+        log.warning("edge-tts не поставился: %s", (r.stderr or r.stdout)[-300:])
+        return False
+    import importlib
+    importlib.invalidate_caches()
+    log.info("Поставил edge-tts — живой голос для программы готов")
+    return True
+
+
+TTS_READY: dict = {}             # заранее озвученное: (голос, темп, высота, текст) → [событие, звук, когда]
+_TTS_READY_LOCK = threading.Lock()
+
+
+def tts_prefetch(reply: str, speak: dict) -> None:
+    """Ответ ещё летит до компьютера, а сервер уже озвучивает первые фразы — программа заберёт готовое."""
+    try:
+        voice = str(speak.get("voice") or "")
+        if not TTS_VOICE_RE.fullmatch(voice):
+            return
+        pitches = [str(speak.get("pitch") or "+0Hz")] + ([str(speak["layer_pitch"])] if speak.get("layer_pitch") else [])
+        keys = []
+        for part in speech_text.parts(reply)[:2]:
+            text = speech_text.clean(part)
+            for pitch in pitches:
+                key = (voice, str(speak.get("rate") or "+0%"), pitch, text)
+                with _TTS_READY_LOCK:
+                    if key in TTS_READY:
+                        continue
+                    TTS_READY[key] = [threading.Event(), b"", time.time()]
+                keys.append(key)
+        # первая фраза — сразу и одна (не делим с другими канал до Microsoft), вторая — следом
+        threading.Thread(target=lambda: [_tts_fill(k) for k in keys], daemon=True).start()
+        now = time.time()
+        with _TTS_READY_LOCK:                                 # старое (дольше 5 минут) выбрасываем
+            for k in [k for k, v in TTS_READY.items() if now - v[2] > 300]:
+                TTS_READY.pop(k, None)
+    except Exception as e:
+        log.info("Заранее озвучить не вышло: %s", e)
+
+
+def _tts_fill(key: tuple) -> None:
+    item = TTS_READY.get(key)
+    try:
+        item[1] = tts_for_desktop({"voice": key[0], "rate": key[1], "pitch": key[2], "text": key[3]}, ready=False)
+    except Exception as e:
+        log.info("Заранее озвучить не вышло: %s", e)
+    finally:
+        item[0].set()
+
+
+def tts_for_desktop(data: dict, ready: bool = True) -> bytes:
+    text = str(data.get("text") or "").strip()[:2000]
+    voice = str(data.get("voice") or "ru-RU-DmitryNeural")
+    rate, pitch = str(data.get("rate") or "+0%"), str(data.get("pitch") or "+0Hz")
+    if not text or not TTS_VOICE_RE.fullmatch(voice) or not re.fullmatch(r"[+-]\d{1,3}%", rate) \
+            or not re.fullmatch(r"[+-]\d{1,3}Hz", pitch):
+        raise ValueError("неверный запрос озвучки")
+    t0 = time.time()
+    if ready:                                                 # заготовка: готова — сразу; готовится — ждём её,
+        item = TTS_READY.get((voice, rate, pitch, text))      # но не дольше, чем заняла бы новая озвучка
+        if item is not None:
+            if item[0].wait(2.0) and item[1]:
+                TTS_STATS.append((round(time.time() - t0, 2), "заготовка", len(text)))
+                return item[1]
+            box: dict = {}
+
+            def fresh():
+                try:
+                    box["a"] = tts_for_desktop(data, ready=False)
+                except Exception as e:
+                    box["e"] = e
+            th = threading.Thread(target=fresh, daemon=True)
+            th.start()
+            while th.is_alive() and not (item[0].is_set() and item[1]) and time.time() - t0 < 60:
+                time.sleep(0.05)
+            if item[0].is_set() and item[1]:
+                TTS_STATS.append((round(time.time() - t0, 2), "заготовка (поздняя)", len(text)))
+                return item[1]
+            th.join(1)
+            if box.get("a"):
+                TTS_STATS.append((round(time.time() - t0, 2), "заново (заготовка опоздала)", len(text)))
+                return box["a"]
+            raise box.get("e") or RuntimeError("Microsoft не вернул звук")
+    if not ensure_edge_tts():
+        raise RuntimeError("на сервере нет edge-tts")
+    import asyncio
+    import edge_tts
+
+    async def run(r, p):
+        out = bytearray()
+        async for chunk in edge_tts.Communicate(text, voice, rate=r, pitch=p).stream():
+            if chunk.get("type") == "audio":
+                out += chunk["data"]
+        return bytes(out)
+    # Некоторые голоса (например, Дмитрий) Microsoft сейчас не озвучивает с изменённой высотой или темпом —
+    # тогда пробуем проще: без высоты, потом без темпа (понизить голос программа умеет и сама)
+    # сбой у Microsoft обычно разовый — сначала повторяем те же настройки, потом самые простые
+    tries = [(rate, pitch), (rate, pitch), ("+0%", "+0Hz")]
+    last = None
+    for n, (r, p) in enumerate(tries):
+        if n:
+            time.sleep(1.0)
+        t1 = time.time()
+        try:
+            with TTS_GATE:                                     # не больше двух соединений с Microsoft разом
+                audio = asyncio.run(asyncio.wait_for(run(r, p), 15))
+        except Exception as e:
+            audio, last = b"", e
+        if audio:
+            if ready:
+                TTS_STATS.append((round(time.time() - t0, 2), "озвучено сейчас", len(text)))
+            else:
+                TTS_STATS.append((round(time.time() - t1, 2), "заготовка готова", len(text)))
+            return audio
+        why = f"{type(last).__name__}: {str(last)[:90]}" if last else "пусто"
+        TTS_STATS.append((round(time.time() - t1, 2), f"Microsoft молчит ({r}, {p}) [{why}]: «{text[:40]}»", len(text)))
+        TTS_PLAIN.setdefault((voice, r, p), []).append(time.time())     # с этими настройками голос молчал
+    raise RuntimeError(f"Microsoft не вернул звук ({last})" if last else "Microsoft не вернул звук")
+
+
 class PcHooks:
     backup_export = staticmethod(backup_export)
     backup_import = staticmethod(backup_import)
@@ -3192,6 +4038,13 @@ def start_desktop_api(assistant: "Assistant"):
     if not ALLOWED_USER_ID:
         log.warning("Программа на компьютере не запущена: сначала впиши ALLOWED_USER_ID")
         return None
+    PcHooks.stt = staticmethod(lambda audio, name: assistant.llm.transcribe(audio, name))   # «Трой, …» вслух
+    PcHooks.agent_step = staticmethod(lambda data: agent_step(assistant, data))           # дела на сайтах
+    PcHooks.tts = staticmethod(tts_for_desktop)                                              # живой голос
+    PcHooks.tts_voices = staticmethod(tts_voices)
+    PcHooks.tts_prefetch = staticmethod(tts_prefetch)
+    PcHooks.tts_failed = staticmethod(lambda: _TTS_PROBE.get("failed") or [])
+    PcHooks.tts_stats = staticmethod(lambda: list(TTS_STATS))
     if LOCAL_MODE:                      # программа и сервер на одном компьютере — связь не выходит наружу
         return desktop_api.start(DESKTOP_PORT, AppAuth(), PcHooks, None, None,
                                  lambda text, files: desktop_reply(assistant, text, files),
@@ -3292,6 +4145,74 @@ def self_check() -> bool:
     return ok
 
 
+HEARTBEAT = {"poll": time.time()}             # когда Трой последний раз проверял Telegram
+BEAT_FILE = Path(__file__).resolve().parent / "heartbeat.json"
+WATCHDOG_UNITS = {
+    "troy-watchdog.service": """[Unit]
+Description=Troy watchdog: restart sometroy if it hangs
+
+[Service]
+Type=oneshot
+WorkingDirectory={dir}
+ExecStart="{python}" "{dir}/watchdog.py"
+""",
+    "troy-watchdog.timer": """[Unit]
+Description=Check Troy every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+""",
+}
+
+
+def heartbeat_loop() -> None:
+    while True:
+        try:
+            tmp = BEAT_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"ts": time.time(), "poll": HEARTBEAT["poll"]}), encoding="utf-8")
+            tmp.replace(BEAT_FILE)
+        except OSError as e:
+            log.warning("Отметка для сторожа: %s", e)
+        time.sleep(30)
+
+
+def install_watchdog() -> None:
+    """Поставить сторожа (один раз; при обновлении — только если что-то поменялось). Нужны Linux, systemd и root."""
+    here = Path(__file__).resolve().parent
+    units = Path("/etc/systemd/system")
+    if not (here / "watchdog.py").exists() or not units.is_dir() or not hasattr(os, "geteuid") or os.geteuid() != 0 \
+            or not os.environ.get("INVOCATION_ID"):          # запущен не службой systemd (например, вручную) — не трогаем
+        return
+    import sys
+    changed = False
+    for name, text in WATCHDOG_UNITS.items():
+        text = text.format(dir=here, python=sys.executable)
+        f = units / name
+        try:
+            if not f.exists() or f.read_text(encoding="utf-8") != text:
+                f.write_text(text, encoding="utf-8")
+                changed = True
+        except OSError as e:
+            log.warning("Сторож не поставлен: %s", e)
+            return
+    try:
+        if changed:
+            subprocess.run(["systemctl", "daemon-reload"], timeout=60)
+        r = subprocess.run(["systemctl", "enable", "--now", "troy-watchdog.timer"], capture_output=True, text=True,
+                           timeout=60)
+        if r.returncode == 0:
+            if changed:
+                log.info("Сторож поставлен: проверяет Троя каждые 2 минуты")
+        else:
+            log.warning("Сторож не включился: %s", r.stderr.strip()[:200])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("Сторож не включился: %s", e)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Личный ассистент в Telegram")
     ap.add_argument("--check", action="store_true", help="проверить настройки и доступ к сервисам")
@@ -3301,6 +4222,12 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    for secret_file in (BASE / "settings.env", DB_FILE):     # ключи и переписка — только владельцу службы
+        try:
+            if secret_file.exists() and secret_file.stat().st_mode & 0o077:
+                secret_file.chmod(0o600)
+        except OSError:
+            pass
     for h in logging.getLogger().handlers:      # токены и ключи в журнал не пишем
         h.addFilter(_RedactFilter())
         h.setFormatter(_RedactFormatter("%(asctime)s %(levelname)s %(message)s"))
@@ -3334,7 +4261,14 @@ def serve(stop: Optional[threading.Event] = None) -> None:
     start_desktop_api(assistant)
     threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=power_watch_loop, daemon=True).start()
+    threading.Thread(target=brief_loop, args=(assistant,), daemon=True).start()
+    threading.Thread(target=alerts_loop, args=(assistant,), daemon=True).start()
+    threading.Thread(target=lambda: ensure_edge_tts() and tts_voices(), daemon=True).start()   # голоса — заранее
+    if not LOCAL_MODE:                       # на сервере: отметка «жив» и сторож, который перезапустит зависшего
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
+        threading.Thread(target=install_watchdog, daemon=True).start()
     while not stop.is_set():                 # Telegram можно подключить, сменить или отключить на ходу
+        HEARTBEAT["poll"] = time.time()      # без Telegram тоже живы — сторожу перезапускать незачем
         if not TELEGRAM_TOKEN:
             stop.wait(3)
             continue
@@ -3359,10 +4293,12 @@ def telegram_session(assistant: "Assistant") -> None:
         except (requests.RequestException, TelegramError) as e:
             log.warning("Telegram недоступен (%s) — пробую снова через 30 с", human_error(e))
             TG_STATE.update(ok=False, error=human_error(e), at=time.time())
+            HEARTBEAT["poll"] = time.time()      # ждём Telegram, а не зависли
             time.sleep(30)
     TG_STATE.update(ok=True, error="", at=time.time())
     tg.call("setMyCommands", data={"commands": json.dumps([
         {"command": "reminders", "description": "Мои напоминания"},
+        {"command": "brief", "description": "Утренняя сводка (/brief сейчас, /brief 7:30)"},
         {"command": "ideas", "description": "Проекты с идеями"},
         {"command": "new", "description": "Начать разговор заново"},
         {"command": "log", "description": "Сохранить переписку файлом (/log неделя)"},

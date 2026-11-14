@@ -8,22 +8,46 @@ GET  /api/events?after=N        — сработавшие напоминани�
 GET  /api/pc/poll               — команды для этого компьютера (заодно «я в сети»)
 POST /api/pc/result             — {"id", "ok", "text"} — чем закончилась команда
 POST /api/pc/choose             — {"id", "device"} — выбор компьютера кнопкой
+GET  /api/app/update            — какая версия программы лежит на сервере: {"version", "files": {имя: sha256}}
+GET  /api/app/file?name=…       — файл этой версии (программа обновляется без переустановки)
 POST /api/message               — {"text": "...", "files": [{"name", "mime", "data"(base64)}]} → {"reply": "..."}
 
 Всё, кроме входа, — только с заголовком Authorization: Bearer <session>.
 """
+import hashlib
 import ipaddress
 import json
 import logging
+import re
 import select
 import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger("assistant.desktop")
 MAX_BODY = 25 * 1024 * 1024
+APP_DIR = Path(__file__).resolve().parent / "desktop-app"      # сюда update.bat кладёт свежие файлы программы
+APP_FILE_RE = re.compile(r"^[a-z_]+\.(?:py|html|png)$")
+_APP_CACHE: dict = {}
+
+
+def app_manifest() -> dict:
+    """Версия программы на сервере и контрольные суммы её файлов (пересчитываются, когда файлы меняются)."""
+    try:
+        files = sorted(f for f in APP_DIR.iterdir() if f.is_file() and APP_FILE_RE.match(f.name))
+    except OSError:
+        return {}
+    stamp = tuple((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+    if _APP_CACHE.get("stamp") != stamp:
+        main = APP_DIR / "troy_desktop.py"
+        m = re.search(r'^APP_VERSION = "([\d.]+)"', main.read_text(encoding="utf-8"), re.M) if main.exists() else None
+        _APP_CACHE.update(stamp=stamp, data={
+            "version": m.group(1) if m else "",
+            "files": {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in files}} if m else {})
+    return _APP_CACHE["data"]
 
 
 def relay(a, b, idle: int = 300) -> None:
@@ -100,6 +124,10 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
             url = urlparse(self.path)
             if url.path == "/api/ping":
                 self.reply(200, {"ok": True, "name": bot_name, "version": getattr(pc, "server_version", "")})
+            elif url.path == "/api/tts/voices" and hasattr(pc, "tts_voices"):   # какие живые голоса сейчас работают
+                voices = pc.tts_voices()
+                self.reply(200, {"voices": voices, "failed": getattr(pc, "tts_failed", lambda: [])(),
+                                 "stats": getattr(pc, "tts_stats", lambda: [])()})
             elif url.path == "/api/history":
                 after = int((parse_qs(url.query).get("after") or ["0"])[0] or 0)
                 self.reply(200, {"messages": get_history(after)})
@@ -109,6 +137,19 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                     self.reply(404, {"error": "файл не найден или уже доставлен"})
                     return
                 data, _name = got
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            elif url.path == "/api/app/update":       # программа спрашивает, нет ли новой версии
+                self.reply(200, app_manifest())
+            elif url.path == "/api/app/file":
+                name = (parse_qs(url.query).get("name") or [""])[0]
+                if not APP_FILE_RE.match(name) or name not in app_manifest().get("files", {}):
+                    self.reply(404, {"error": "нет такого файла"})
+                    return
+                data = (APP_DIR / name).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(len(data)))
@@ -232,6 +273,47 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 ok, text = pc.backup_import(password, raw, (self.headers.get("X-Troy-Mode") or "") == "merge")
                 self.reply(200 if ok else 400, {"ok": ok, "text": text} if ok else {"error": text})
                 return
+            if path == "/api/agent/step" and hasattr(pc, "agent_step"):   # дела на сайтах: следующий шаг
+                data = self.body()
+                if data is None:
+                    return
+                try:
+                    self.reply(200, pc.agent_step(data))
+                except Exception as e:
+                    log.exception("Шаг дела на сайте")
+                    self.reply(500, {"error": str(e)[:200]})
+                return
+            if path == "/api/tts" and hasattr(pc, "tts"):   # голос Microsoft для программы (с сервера он доступен)
+                data = self.body()
+                if data is None:
+                    return
+                try:
+                    audio = pc.tts(data)
+                except Exception as e:
+                    log.warning("Голос для программы: %s", e)
+                    self.reply(502, {"error": str(e)[:200]})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Content-Length", str(len(audio)))
+                self.end_headers()
+                self.wfile.write(audio)
+                return
+            if path == "/api/stt" and hasattr(pc, "stt"):   # речь → текст (режим «Трой, …» в программе)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length <= 0 or length > 5 * 1024 * 1024:
+                    self.reply(413, {"error": "запись слишком длинная"})
+                    return
+                audio = self.rfile.read(length)
+                try:
+                    self.reply(200, {"text": pc.stt(audio, "voice.webm")})
+                except Exception as e:
+                    log.warning("Распознавание речи: %s", e)
+                    self.reply(502, {"error": "не получилось распознать речь"})
+                return
             if path == "/api/pc/choose":
                 data = self.body()
                 if data is None:
@@ -249,6 +331,10 @@ def make_handler(auth, pc, on_message, get_history, get_events, bot_name: str, c
                 threading.current_thread().troy_device = auth.device(self.session()) or ""   # кто спросил
                 threading.current_thread().troy_reply = str(data.get("reply_to") or "")[:1500]   # «Ответить»
                 answer = on_message(str(data.get("text") or ""), files)
+                speak = data.get("speak")
+                reply_text = answer.get("reply") if isinstance(answer, dict) else answer
+                if isinstance(speak, dict) and reply_text and hasattr(pc, "tts_prefetch"):
+                    threading.Thread(target=pc.tts_prefetch, args=(str(reply_text), speak), daemon=True).start()
                 self.reply(200, answer if isinstance(answer, dict) else {"reply": answer})
             except Exception as e:
                 log.exception("Ошибка обработки сообщения с компьютера")

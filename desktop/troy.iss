@@ -59,6 +59,7 @@ procedure KillTroy();
 var Code: Integer;
 begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM SomeTroy.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM troy-voice.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);   { голос Евгений }
 end;
 
 { Команда Защитника с правами администратора (Windows спросит разрешение) }

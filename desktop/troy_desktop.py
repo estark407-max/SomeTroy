@@ -45,7 +45,12 @@ SERVER_SRC = RES_DIR / "server_src" if getattr(sys, "frozen", False) else APP_DI
 INSTANCE = DATA_DIR / "instance.json"
 SESSION = DATA_DIR / "session.json"
 SETTINGS = DATA_DIR / "settings.json"
-APP_VERSION = "0.7.0"
+import voice                                      # noqa: E402 — голос Троя (Microsoft, Евгений, Piper + обработка)
+VOICE = voice.Voice(DATA_DIR)
+VOICE.local = voice.LocalSilero(DATA_DIR, RES_DIR / "silero_service.py",       # Евгений — на этом компьютере
+                                APP_DIR / "voice-engine" / "troy-voice.exe")  # (вшит в установщик)
+APP_VERSION = "0.8.0"
+MS_DOWN = {"fails": 0, "until": 0.0}         # Microsoft подряд не дал голос — когда снова его пробовать
 HOTKEY_HITS = {"n": 0, "down": False}   # нажатия клавиши голоса и держат ли её сейчас (окно следит)
 
 LOG = DATA_DIR / "troy.log"
@@ -650,6 +655,72 @@ def make_handler(remote: Remote, key: str):
                 self.send(200, jbytes({**whats_new(), "product": PRODUCT}))
             elif path == "/version":
                 self.send(200, jbytes({"version": APP_VERSION}))
+            elif path.startswith("/tts/file/"):           # готовый звук из кэша голоса
+                f = VOICE.file(path.rsplit("/", 1)[-1])
+                data = None
+                for _ in range(10):                          # файл могут ещё держать (антивирус) — подождём
+                    try:
+                        data = f.read_bytes() if f is not None else None
+                        break
+                    except PermissionError:
+                        time.sleep(0.2)
+                if data is None:
+                    self.send(404, b"")
+                else:
+                    self.send(200, data, "audio/mpeg" if f.suffix == ".mp3" else "audio/wav")
+            elif path == "/tts/voices":                  # какие живые голоса сейчас работают (проверяет сервер)
+                code, resp = remote.forward("GET", "/api/tts/voices")
+                log.info("Живые голоса (%s): %s", code, resp[:1500].decode("utf-8", "replace"))
+                if code == 200 and not IS_MAC and VOICE.local.possible():   # Евгений — на этом компьютере
+                    try:
+                        j = json.loads(resp)
+                        if not any(v.get("id") == "silero:eugene" for v in j.get("voices") or []):
+                            j["voices"] = [{"id": "silero:eugene", "name": "Евгений", "sex": "м"}] + (j.get("voices") or [])
+                        resp = jbytes(j)
+                    except ValueError:
+                        pass
+                self.send(code, resp)
+            elif path == "/tts/timing":                  # сколько прошло от ответа до голоса (для настройки)
+                q = parse_qs(url.query)
+                log.info("Голос зазвучал через %s мс после ответа (готовили %s мс, звук %s мс)",
+                         (q.get("total") or ["?"])[0], (q.get("tts") or ["?"])[0], (q.get("decode") or ["?"])[0])
+                self.send(200, b"{}")
+                try:                                         # долго — запишем, что об этом знает сервер
+                    if int((q.get("total") or ["0"])[0]) > 2500:
+                        code, resp = remote.forward("GET", "/api/tts/voices")
+                        stats = json.loads(resp).get("stats") if code == 200 else None
+                        log.info("Голос на сервере (последние): %s", json.dumps(stats[-6:] if stats else resp[:200].decode("utf-8", "replace"), ensure_ascii=False))
+                except Exception as e:
+                    log.info("Замер голоса: %s", e)
+            elif path == "/tts/status":                  # голос: скачан ли, идёт ли скачивание
+                name = (parse_qs(url.query).get("voice") or ["irina"])[0]
+                if name.startswith("silero:") and not IS_MAC:
+                    st = VOICE.local.status()
+                    if not st["ready"] and not st["busy"] and VOICE.ready("dmitri"):
+                        st["ready"] = True                    # пока Евгений ставится — есть запасной голос
+                    self.send(200, jbytes(st))
+                    return
+                self.send(200, jbytes(VOICE.status(name) if not IS_MAC else {"ready": False, "error": "на Mac пока нет"}))
+            elif path == "/server/info":                 # к какому серверу подключена программа
+                base = str(remote.base)
+                self.send(200, jbytes({"server": base.split("://", 1)[-1], "local": not base.startswith("https://")}))
+            elif path == "/win":                         # окно без системной полосы: развёрнуто ли
+                import window_frame
+                hwnd = find_window() if os.name == "nt" else None
+                sh = _shell()
+                self.send(200, jbytes({"frameless": window_frame.STATE["enabled"] and window_frame.frameless(hwnd),
+                                       "shell": bool(sh and sh.started()), "max": window_frame.is_max(hwnd)}))
+            elif path == "/tabs":                        # вкладки сайтов в шапке
+                sh = _shell()
+                if sh and sh.started():
+                    self.send(200, jbytes({"tabs": sh.listing()}))
+                else:
+                    import site_tabs
+                    self.send(200, jbytes({"tabs": site_tabs.listing()}))
+            elif path == "/whatsnew":
+                self.send(200, jbytes({**whats_new(), "product": PRODUCT}))
+            elif path == "/version":
+                self.send(200, jbytes({"version": APP_VERSION}))
             elif path == "/session":
                 self.send(200, jbytes({"logged_in": remote.logged_in, "setup": WIZARD["w"] is not None}))
             elif path == "/alive":
@@ -683,6 +754,233 @@ def make_handler(remote: Remote, key: str):
                     return
                 msgs = w.start() if data.get("action") == "start" else w.handle(str(data.get("text") or ""))
                 self.send(200, jbytes({"messages": msgs}))
+                return
+            if path == "/tts":                               # озвучить ответ → файлы звука и как их свести
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                text, style = str(data.get("text") or ""), str(data.get("style") or "plain")
+                t_req = time.time()
+                name = str(data.get("voice") or "dmitry")
+                try:
+                    if name.startswith("silero:") and not IS_MAC and VOICE.local.possible() and not VOICE.local.ensure():
+                        # Евгений на этом компьютере ещё ставится/запускается — пока говорим запасным голосом
+                        if VOICE.ready("dmitri"):
+                            res = VOICE.piper_file(text, "dmitri", "plain")
+                            res["fx"] = voice.style_for(name, style)["fx"]
+                            self.send(200, jbytes(res))
+                        else:
+                            VOICE.install("dmitri")
+                            self.send(409, jbytes({"installing": True, **VOICE.local.status(),
+                                                   "step": VOICE.local.status()["step"] or "голос Евгений"}))
+                        return
+                    if (name in voice.NEURAL or voice.VOICE_ID_RE.fullmatch(name)) and not name.startswith("silero:") \
+                            and not IS_MAC and time.time() < MS_DOWN["until"] and VOICE.local.up():
+                        # Microsoft подряд молчал — пару минут не ждём его, сразу говорит Евгений
+                        res = VOICE.neural(text, "silero:eugene", style if style in voice.NEURAL_STYLE else "plain")
+                        log.info("Озвучка фразы (%d букв) Евгением, Microsoft на паузе: %.2f с", len(text), time.time() - t_req)
+                        self.send(200, jbytes(res))
+                        return
+                    if name in voice.NEURAL or voice.VOICE_ID_RE.fullmatch(name):   # живой голос (интернет)
+                        late = {}
+
+                        def via_server(t, v, rate, pitch):
+                            if late:                       # уже ждали 5 с в этой фразе — второй раз не ждём
+                                return b""
+                            box = {}
+
+                            def ask():
+                                box["r"] = remote._send("POST", "/api/tts", jbytes(
+                                    {"text": t, "voice": v, "rate": rate, "pitch": pitch}))
+                            th = threading.Thread(target=ask, daemon=True)
+                            th.start()
+                            # Microsoft задумался — не ждём: есть свой голос на компьютере, он ответит сразу
+                            th.join(5 if (not v.startswith("silero:") and VOICE.local.up()) else 60)
+                            if "r" not in box:
+                                late["y"] = True
+                                log.info("Голос Microsoft не успел за 5 с — фразу скажет Евгений")
+                                return b""
+                            code, resp = box["r"]
+                            if code != 200 or not resp or resp[:1] == b"{":     # пришла ошибка, а не звук
+                                log.warning("Голос через сервер: код %s %s", code, resp[:150])
+                                return b""
+                            return resp
+                        try:
+                            res = VOICE.neural(text, name, style if style in voice.NEURAL_STYLE else "plain", via_server)
+                        except RuntimeError as e:          # Microsoft промолчал — говорим запасным голосом без интернета
+                            if not name.startswith("silero:"):
+                                MS_DOWN["fails"] += 1
+                                if MS_DOWN["fails"] >= 2:      # два раза подряд — 3 минуты сразу Евгений
+                                    MS_DOWN["until"], MS_DOWN["fails"] = time.time() + 180, 0
+                                    log.info("Microsoft молчит подряд — 3 мин говорит Евгений без ожидания")
+                            if not name.startswith("silero:") and not IS_MAC and VOICE.local.up():
+                                log.info("Живой голос не вышел (%s) — фразу говорит Евгений", e)
+                                res = VOICE.neural(text, "silero:eugene", style if style in voice.NEURAL_STYLE else "plain")    # свой голос на компьютере
+                                log.info("Озвучка фразы (%d букв): %.2f с", len(text), time.time() - t_req)
+                                self.send(200, jbytes(res))
+                                return
+                            if IS_MAC or not VOICE.ready("dmitri"):
+                                if not IS_MAC:
+                                    VOICE.install("dmitri")     # скачаем запасной голос на будущее
+                                raise
+                            log.info("Живой голос не вышел (%s) — запасной голос", e)
+                            res = VOICE.piper_file(text, "dmitri", "plain")
+                            res["fx"] = voice.style_for(name, style)["fx"]
+                        else:
+                            MS_DOWN["fails"] = 0
+                        log.info("Озвучка фразы (%d букв): %.2f с", len(text), time.time() - t_req)
+                        self.send(200, jbytes(res))
+                        return
+                    name = name if name in voice.VOICES else "dmitri"
+                    if IS_MAC or not VOICE.ready(name):     # Piper ещё не скачан — качаем
+                        if not IS_MAC:
+                            VOICE.install(name)
+                        self.send(409, jbytes({"installing": not IS_MAC, **VOICE.status(name)}))
+                        return
+                    self.send(200, jbytes(VOICE.piper_file(text, name, style)))
+                except Exception as e:
+                    log.warning("Озвучка: %s", e)
+                    self.send(500, jbytes({"error": str(e)}))
+                return
+            if path == "/stt":                               # «Трой, …» вслух: запись → текст (распознаёт сервер)
+                code, resp = remote.forward("POST", "/api/stt", body)
+                self.send(code, resp)
+                return
+            if path == "/micsettings":                      # «Открыть настройки микрофона» (Windows)
+                try:
+                    if IS_MAC:
+                        import mac_support
+                        mac_support.mic_settings()
+                    else:
+                        os.startfile("ms-settings:privacy-microphone")
+                except Exception as e:
+                    log.warning("Настройки микрофона: %s", e)
+                self.send(200, b"{}")
+                return
+            if path == "/micinfo":                          # почему не дали микрофон — в журнал (для разбора)
+                try:
+                    info = json.loads(body or b"{}")
+                except ValueError:
+                    info = {}
+                sh = _shell()
+                log.warning("Микрофон не дали: %s %s (окно: %s, Windows %s)", info.get("name"), info.get("message"),
+                            "WebView2" if sh and sh.started() else "Edge", getattr(sys, "getwindowsversion", lambda: "?")())
+                self.send(200, b"{}")
+                return
+            if path == "/site/open":                         # кнопка «встроенный браузер» в меню шапки
+                try:
+                    data = json.loads(body or b"{}")
+                    link = str(data.get("url") or "")
+                    if not link.startswith(("http://", "https://")):
+                        raise ValueError("нужен адрес сайта")
+                    ok, text = open_site(remote, json.dumps({"url": link, "mode": "server" if data.get("mode") == "server" else "direct"}))
+                except Exception as e:
+                    log.exception("site/open")
+                    ok, text = False, str(e)
+                self.send(200, jbytes({"ok": bool(ok), "text": text}))
+                return
+            if path in ("/backup/save", "/backup/load", "/server/switch"):   # копия памяти и смена сервера
+                import pc_control
+                import server_tools
+                from urllib.parse import unquote
+                try:
+                    if path == "/backup/load":           # тело — сам файл копии, пароль — в заголовке
+                        res = server_tools.backup_load(remote, unquote(self.headers.get("X-Troy-Password") or ""), body,
+                                                       (self.headers.get("X-Troy-Mode") or "") == "merge")
+                    else:
+                        data = json.loads(body or b"{}")
+                        pw = str(data.get("password") or "")
+                        res = (server_tools.backup_save(remote, pw, pc_control._downloads() / "Трой")
+                               if path == "/backup/save" else switch_server(remote, str(data.get("address") or ""), pw))
+                    if res.get("path"):
+                        reveal(res["path"])
+                except Exception as e:
+                    log.exception("%s", path)
+                    res = {"error": f"не получилось: {e}"}
+                self.send(400 if res.get("error") else 200, jbytes(res))
+                return
+            if path == "/savefile":                         # файл от Троя (например, переписка) → «Загрузки\\Трой»
+                import base64
+                import pc_control
+                try:
+                    data = json.loads(body or b"{}")
+                    name = "".join(c for c in str(data.get("name") or "Трой.txt") if c not in '\\/:*?"<>|')[:120]
+                    folder = pc_control._downloads() / "Трой"
+                    folder.mkdir(parents=True, exist_ok=True)
+                    target, n = folder / name, 1
+                    while target.exists():
+                        target = folder / f"{Path(name).stem} ({n}){Path(name).suffix}"
+                        n += 1
+                    target.write_bytes(base64.b64decode(data.get("b64") or ""))
+                    try:
+                        reveal(target)
+                    except OSError:
+                        pass
+                    self.send(200, jbytes({"path": str(target)}))
+                except Exception as e:
+                    log.error("savefile: %s", e)
+                    self.send(500, jbytes({"error": str(e)}))
+                return
+            if path == "/login":
+                try:
+                    password = json.loads(body or b"{}").get("password", "")
+                except ValueError:
+                    password = ""
+                code, resp = remote.login(password)
+                self.send(code, resp)
+                return
+            if path == "/logout":
+                remote.logout()
+                self.send(200, b"{}")
+                return
+            if path == "/win":                           # кнопки окна в шапке Троя: свернуть, развернуть, закрыть, тянуть
+                import window_frame
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                hwnd = find_window() if os.name == "nt" else None
+                act = str(data.get("action") or "")
+                if hwnd:
+                    if act == "min":
+                        window_frame.minimize(hwnd)
+                    elif act == "max":
+                        window_frame.toggle_max(hwnd)
+                    elif act == "drag":
+                        window_frame.drag(hwnd, str(data.get("edge") or ""))
+                    elif act == "close":
+                        threading.Thread(target=close_window, daemon=True).start()
+                self.send(200, jbytes({"max": window_frame.is_max(hwnd)}))
+                return
+            if path in ("/tabs/show", "/tabs/close", "/tabs/layout") and _shell() and _shell().started():
+                sh = _shell()
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                if "top" in data:
+                    sh.set_top(data.get("top"))
+                if path == "/tabs/show":
+                    sh.show_tab(data.get("id"))
+                elif path == "/tabs/close":
+                    sh.close(data.get("id"))
+                self.send(200, jbytes({"tabs": sh.listing()}))
+                return
+            if path in ("/tabs/show", "/tabs/close", "/tabs/layout"):
+                import site_tabs
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                if "top" in data:                       # высота шапки с вкладками — в настоящих пикселях
+                    site_tabs.STATE["top"] = float(data.get("top") or 0)
+                site_tabs.STATE["find_troy"] = find_window
+                if path == "/tabs/show":
+                    site_tabs.show(data.get("id"))
+                elif path == "/tabs/close":
+                    site_tabs.close(data.get("id"))
+                self.send(200, jbytes({"tabs": site_tabs.listing()}))
                 return
             if path == "/micsettings":                      # «Открыть настройки микрофона» (Windows)
                 try:
@@ -899,8 +1197,27 @@ def make_handler(remote: Remote, key: str):
             if text in ("/diag", "/диагностика", "диагностика"):
                 self.send(200, jbytes({"reply": app_diagnostics(remote)}))
                 return
+            try:                                             # ответ озвучат — пусть сервер начнёт голос заранее
+                msg = json.loads(body or b"{}")
+                sp = msg.get("speak")
+                if isinstance(sp, dict):
+                    vid = str(sp.get("voice") or "")
+                    vid = vid if voice.VOICE_ID_RE.fullmatch(vid) else voice.NEURAL.get(vid, ("",))[0]
+                    st = voice.style_for(vid, str(sp.get("style") or "plain"))
+                    msg["speak"] = {"voice": vid, "rate": st["rate"], "pitch": st["pitch"],
+                                    "layer_pitch": st["layer_pitch"]} if vid else None
+                    body = jbytes(msg)
+            except ValueError:
+                pass
+            t_msg = time.time()
             code, resp = remote.forward("POST", path, body)
+            try:                                             # сколько думал Трой: на сервере и в дороге
+                perf = json.loads(resp).get("perf") if code == 200 and resp[:1] == b"{" else ""
+                log.info("Ответ за %.1f с (сервер: %s)", time.time() - t_msg, perf or "—")
+            except ValueError:
+                pass
             self.send(code, resp)
+
 
     return Handler
 
@@ -922,6 +1239,24 @@ DEFAULT_SIZE = (500, 880)        # по умолчанию — узкое вер
 
 
 WHATS_NEW = [
+ {
+  "version": "0.8.0",
+  "added": [
+   "Голос Троя (значок волны в шапке): Трой читает ответы вслух — на голосовые или все. Живые голоса Microsoft (по умолчанию Дмитрий), запасной голос Евгений работает прямо на компьютере без интернета. Звучание — обычное или с обработкой («Сверхразум», «ИИ станции», «Бортовой»). В режиме «Без звука» Трой отвечает только текстом.",
+   "«Трой, …» без кнопок: включи в меню голоса — скажи «Трой» и вопрос, пока окно Троя открыто.",
+   "Дела на сайтах: «запиши меня…», «проверь статус заказа…», «найди дешевле…» — Трой сам ходит по страницам во вкладке окна, а перед оплатой, заказом, записью или отправкой спрашивает «да?». Пароли, карты и коды из СМС вводишь только ты.",
+   "Долгая память: «запомни: код от калитки 4512» — и потом «какой код от калитки?»; Трой ищет и по всей переписке за год.",
+   "Траты: пришли фото чека — Трой запишет покупку по категориям; «сколько я потратил на продукты в этом месяце», таблица для Excel.",
+   "Утренняя сводка: погода, напоминания и календарь на сегодня, задачи Битрикса, траты за месяц — /brief 7:30.",
+   "Трой пишет сам: за час до срока задачи в Битриксе, о новых личных сообщениях там и о письмах от важных отправителей (/alerts). Ночью молчит и рассказывает утром.",
+   "GigaChat (Сбер) в «Подключениях»: сильная русскоязычная модель, для физлиц — бесплатный пакет на год. Отвечает первой, модели Groq и Mistral остаются запасными."],
+  "fixed": [
+   "Короткие простые вопросы отвечает быстрая модель — за 1–2 секунды.",
+   "На «спасибо» Трой отвечает сразу и не повторяет прошлый поиск; пробки, погоду и курсы называет только по свежим данным, без выдумок.",
+   "Время в другом городе Трой считает сам, а не ищет в интернете (поиск давал устаревшее время).",
+   "Список проектов с идеями обновляется в фоне — ответы не ждут GitHub.",
+   "На сервере: сторож раз в 2 минуты проверяет Троя и перезапускает, если тот завис; ключи и переписка закрыты от других пользователей сервера."]
+ },
  {
   "version": "0.7.0",
   "added": [
@@ -1354,6 +1689,23 @@ def open_site(remote: "Remote", arg: str):
     return True, f"открыл {host} {'через сервер' if mode == 'server' else 'напрямую'}"
 
 
+def web_task(remote: "Remote", arg: str, report):
+    """Дело на сайте: вкладка в окне Троя, шаги придумывает сервер (web_agent.py)."""
+    import web_agent
+    sh = _shell()
+    if IS_MAC or not sh or not (sh.started() or sh.available()):
+        return False, "дела на сайтах работают во вкладках окна Троя (нужен WebView2 — он ставится вместе с Edge)"
+
+    def open_tab(url: str):
+        if not sh.visible():
+            open_window(APP_URL)
+            sh.wait_ready(15)
+        if not sh.started():
+            return False, "окно Троя не открылось"
+        return sh.open_tab(url, url.split("://", 1)[-1].split("/")[0], "direct", 0)
+    return web_agent.start(remote, sh, open_tab, arg, report)
+
+
 # ── команды для этого компьютера ──
 def pc_worker(remote: Remote) -> None:
     """Каждые 4 секунды спрашиваем сервер, нет ли команд (заодно сервер видит, что компьютер в сети)."""
@@ -1373,6 +1725,8 @@ def pc_worker(remote: Remote) -> None:
                                 ok, text = pc_control.file_send(remote, cmd["id"], cmd.get("arg", ""))
                             elif cmd["action"] == "file_get":     # забрать файл, присланный с другого компьютера
                                 ok, text = pc_control.file_get(remote, cmd.get("arg", ""))
+                            elif cmd["action"] == "web_task":     # дело на сайте — во вкладке Троя
+                                ok, text = web_task(remote, cmd.get("arg", ""), late)
                             elif cmd["action"] == "open_site":    # окно браузера: напрямую или через сервер
                                 ok, text = open_site(remote, cmd.get("arg", ""))
                             else:
@@ -1655,7 +2009,9 @@ def repair_server(remote: "Remote", address: str, password: str) -> None:
         try:
             cli.exec_command("rm -rf /tmp/troyfix && mkdir -p /tmp/troyfix")[1].channel.recv_exit_status()
             sftp = cli.open_sftp()
-            for name in ("bot.py", "bitrix.py", "connectors.py", "desktop_api.py", "backup.py", "requirements.txt"):
+            for name in setup_wizard.SERVER_FILES:
+                if not name.endswith((".py", ".txt")):
+                    continue
                 with sftp.open(f"/tmp/troyfix/{name}", "wb") as f:
                     f.write((SERVER_SRC / name).read_bytes().replace(b"\r\n", b"\n"))
             with sftp.open("/tmp/troyfix/fix.sh", "wb") as f:
@@ -1773,8 +2129,11 @@ def main():
     APP_URL = f"http://127.0.0.1:{port}/{key}/"
     INSTANCE.write_text(json.dumps({"port": port, "key": key}), encoding="utf-8")
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    if not IS_MAC and VOICE.local.installed():           # голос Евгений уже стоит — запускаем заранее
+        threading.Thread(target=VOICE.local.ensure, daemon=True).start()
 
     def on_close(icon, _item):            # закрыть программу, вход сохраняется
+        VOICE.local.stop()
         sh = _shell()
         if sh and sh.started():
             sh.exit_app()

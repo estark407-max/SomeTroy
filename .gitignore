@@ -8,3 +8,6 @@ dist/
 *.spec
 *.exe
 build.log
+.venv-voice/
+v4_ru.pt
+build-voice.log

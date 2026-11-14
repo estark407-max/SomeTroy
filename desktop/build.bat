@@ -39,7 +39,7 @@ if /i "%DEF%"=="Y" (
 echo [1/4] Готовлю окружение...
 if not exist ".venv\Scripts\python.exe" %PY% -m venv .venv
 ".venv\Scripts\python.exe" -m pip install -q --upgrade pip
-".venv\Scripts\python.exe" -m pip install -q requests[socks] pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf
+".venv\Scripts\python.exe" -m pip install -q requests[socks] pystray pillow pyinstaller paramiko python-dotenv tzdata pypdf edge-tts==7.2.3
 if errorlevel 1 (
     echo Не удалось установить библиотеки. Проверьте интернет.
     pause
@@ -66,14 +66,36 @@ if exist "dist\SomeTroy" rmdir /s /q "dist\SomeTroy" >nul 2>&1
     --version-file version.txt --icon troy.ico --hidden-import pystray._win32 --add-data "ui.html;." --add-data "favicon.png;." %WVOPT% ^
     --paths "..\server" --hidden-import bot --hidden-import bitrix --hidden-import connectors --hidden-import desktop_api --hidden-import backup ^
     --hidden-import setup_wizard --hidden-import local_server --hidden-import socks --collect-data tzdata ^
+    --hidden-import notes --hidden-import expenses --hidden-import alerts --hidden-import gigachat --hidden-import speech_text --hidden-import voice --hidden-import web_agent --hidden-import edge_tts --collect-submodules edge_tts --add-data "silero_service.py;." ^
     --add-data "..\server\bot.py;server_src" --add-data "..\server\bitrix.py;server_src" --add-data "..\server\connectors.py;server_src" ^
-    --add-data "..\server\desktop_api.py;server_src" --add-data "..\server\backup.py;server_src" --add-data "..\server\requirements.txt;server_src" ^
+    --add-data "..\server\desktop_api.py;server_src" --add-data "..\server\backup.py;server_src" --add-data "..\server\notes.py;server_src" --add-data "..\server\expenses.py;server_src" --add-data "..\server\alerts.py;server_src" --add-data "..\server\gigachat.py;server_src" --add-data "..\server\speech_text.py;server_src" --add-data "..\server\watchdog.py;server_src" --add-data "..\server\requirements.txt;server_src" ^
     --add-data "..\server\install.sh;server_src" --add-data "..\server\uninstall.sh;server_src" ^
     --add-data "..\server\settings.env.example;server_src" troy_desktop.py >build.log 2>&1
 if errorlevel 1 (
     echo Сборка не удалась. Пришлите файл build.log из папки desktop.
     pause
     exit /b 1
+)
+
+echo [2b] Собираю голос Евгений (первый раз дольше: скачается ~250 МБ)...
+rem отдельное окружение: torch большой, программе он не нужен — голос работает своим процессом
+if not exist ".venv-voice\Scripts\python.exe" %PY% -m venv .venv-voice
+".venv-voice\Scripts\python.exe" -m pip install -q --upgrade pip
+".venv-voice\Scripts\python.exe" -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+".venv-voice\Scripts\python.exe" -m pip install -q numpy pyinstaller
+if not exist "v4_ru.pt" powershell -NoProfile -Command "Invoke-WebRequest https://models.silero.ai/models/tts/ru/v4_ru.pt -OutFile v4_ru.pt"
+set "VOICEOK="
+if exist "v4_ru.pt" (
+    if exist "dist\troy-voice" rmdir /s /q "dist\troy-voice" >nul 2>&1
+    ".venv-voice\Scripts\python.exe" -m PyInstaller --noconfirm --clean --onedir --console --name troy-voice ^
+        --add-data "v4_ru.pt;." silero_service.py >build-voice.log 2>&1
+    if not errorlevel 1 if exist "dist\troy-voice\troy-voice.exe" set "VOICEOK=1"
+)
+if defined VOICEOK (
+    xcopy /e /i /q /y "dist\troy-voice" "dist\SomeTroy\voice-engine" >nul
+    echo        Голос Евгений вшит в программу.
+) else (
+    echo        Голос не собрался ^(см. build-voice.log^) - программа будет без него, ставлю дальше.
 )
 
 echo [3/4] Ищу Inno Setup (сборщик установщиков)...

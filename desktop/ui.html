@@ -395,6 +395,15 @@ textarea::placeholder { color: var(--muted); }
 .hk-pop .hk-row button:first-child:hover { background: var(--accent-hover); }
 .hk-err { color: var(--danger); font-size: 12.5px; margin-top: 8px; min-height: 0; }
 #hk-btn.on { color: var(--accent); }
+#voice-btn.on { color: var(--accent); }
+#voice-btn.listening { color: var(--accent); animation: earpulse 2.4s ease-in-out infinite; }
+@keyframes earpulse { 50% { opacity: .55; } }
+.voice-pop { min-width: 300px; }
+.voice-pop .hk-desc.lbl { margin: 12px 0 6px; }
+.voice-pop .seg { flex-wrap: wrap; }
+.voice-pop .seg button { white-space: nowrap; }
+.voice-pop .hk-row { margin-top: 12px; }
+.voice-note { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.4; min-height: 0; }
 
 /* узкое окно */
 @media (max-width: 640px) {
@@ -546,6 +555,26 @@ THEME_DARK.addEventListener("change", applyTheme);
     <div class="hk-cur" id="hk-cur">Не назначена</div>
     <div class="hk-row"><button id="hk-set">Назначить</button><button id="hk-del">Убрать</button></div>
     <div class="hk-err" id="hk-err"></div>
+  </div>
+  </div>
+  <div class="snd-wrap">
+  <button class="icon-btn" id="voice-btn" title="Голос Троя">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 6v12"/></svg>
+  </button>
+  <div class="snd-menu hk-pop theme-pop voice-pop" id="voice-pop">
+    <div class="hk-title">Голос Троя</div>
+    <div class="hk-desc lbl">Читать ответы вслух</div>
+    <div class="seg" id="v-read"><button data-v="off">Нет</button><button data-v="voice" title="Если спросил голосом">На голосовые</button><button data-v="all">Все</button></div>
+    <div class="hk-desc lbl">Звучание</div>
+    <div class="seg" id="v-style"><button data-v="plain" title="Голос как есть, без обработки">Обычный</button><button data-v="mind" title="Бархатный низкий машинный голос: «расщепление», металл и эхо">Сверхразум</button><button data-v="station" title="Холодный металл, эхо и цифровые сбои">ИИ станции</button><button data-v="ship" title="Спокойный приглушённый голос корабля">Бортовой</button></div>
+    <div class="hk-desc lbl">Голос</div>
+    <div class="seg" id="v-name"><button data-v="ru-RU-SvetlanaNeural" title="Живой голос (нужен интернет)">Светлана</button></div>
+    <div class="hk-desc lbl">Без интернета (проще)</div>
+    <div class="seg" id="v-name2"><button data-v="dmitri">Дмитрий</button><button data-v="ruslan">Руслан</button><button data-v="denis">Денис</button><button data-v="irina">Ирина</button></div>
+    <div class="hk-desc lbl">Слушать «Трой, …» без кнопок</div>
+    <div class="seg" id="v-wake"><button data-v="off">Выкл</button><button data-v="on" title="Скажи «Трой» и сразу вопрос — пока окно Троя открыто">Вкл</button></div>
+    <div class="hk-row"><button id="v-test">Послушать</button><button id="v-stop">Замолчи</button></div>
+    <div class="voice-note" id="v-note"></div>
   </div>
   </div>
   <div class="snd-wrap">
@@ -705,10 +734,11 @@ function drawSound() {
   $("sound").title = "Звуки: " + SOUND_LABEL[soundMode];
   document.querySelectorAll("#snd-menu button").forEach((b) => b.classList.toggle("on", b.dataset.mode === soundMode));
 }
-$("sound").onclick = (e) => { e.stopPropagation(); $("hk-pop").classList.remove("show"); $("about-pop").classList.remove("show"); $("snd-menu").classList.toggle("show"); };
+$("sound").onclick = (e) => { e.stopPropagation(); $("hk-pop").classList.remove("show"); $("about-pop").classList.remove("show"); $("voice-pop").classList.remove("show"); $("snd-menu").classList.toggle("show"); };
 document.querySelectorAll("#snd-menu button").forEach((b) => (b.onclick = () => {
   soundMode = b.dataset.mode; try { localStorage.setItem("troy-sound", soundMode); } catch {}
   drawSound(); $("snd-menu").classList.remove("show");
+  if (soundMode !== "all") stopSpeak();          // выключили звук — Трой сразу замолкает
   if (soundMode === "all") play("received"); else if (soundMode === "reminders") play("reminder");
 }));
 document.addEventListener("click", (e) => { if (!e.target.closest(".snd-wrap")) $("snd-menu").classList.remove("show"); });
@@ -958,6 +988,8 @@ async function saveDownload(d) {
 async function send(voice) {
   if (busy) return;
   if (wizard) { if (!voice) wizardSend(input.value.trim()); return; }
+  stopSpeak();
+  const spoken = !!voice || viaWake; viaWake = false;
   const text = voice ? "" : input.value.trim();
   const files = voice ? [voice] : pending;
   if (!text && !files.length) return;
@@ -967,8 +999,14 @@ async function send(voice) {
   if (!voice) { input.value = ""; pending = []; drawFiles(); autosize(); }
   busy = true; updateSend(); showTyping(true);
   try {
-    const res = await api("/message", { text, reply_to: quote, files: files.map(({ name, mime, data }) => ({ name, mime, data })) });
-    showTyping(false); addTroy(res.reply || "…", Date.now() / 1000); play("received");
+    // «Без звука» и «Только напоминания» — ответы только текстом, голос молчит
+    const willSpeak = soundMode === "all" && (voiceCfg.read === "all" || (voiceCfg.read === "voice" && spoken));
+    const res = await api("/message", { text, reply_to: quote, files: files.map(({ name, mime, data }) => ({ name, mime, data })),
+      speak: willSpeak ? { voice: voiceCfg.name, style: voiceCfg.style } : undefined });
+    if (willSpeak && res.reply) {                 // текст и голос — вместе: ждём первую фразу (не дольше 5 с)
+      await new Promise((ok) => { speak(res.reply, ok); setTimeout(ok, 5000); });
+      showTyping(false); addTroy(res.reply, Date.now() / 1000);
+    } else { showTyping(false); addTroy(res.reply || "…", Date.now() / 1000); play("received"); }
     if (res.hist) lastHist = Math.max(lastHist, res.hist);
     if (res.choice) addPcChoice(res.choice);
     if (res.download) saveDownload(res.download);
@@ -1131,6 +1169,319 @@ document.addEventListener("keydown", (e) => {
 }, true);
 document.addEventListener("click", (e) => { if (!e.target.closest(".snd-wrap")) $("hk-pop").classList.remove("show"); });
 fetch(BASE + "/settings").then((r) => r.json()).then((s) => drawHotkey(s.hotkey)).catch(() => {});
+
+// ── голос Троя: озвучка ответов и «Трой, …» без кнопок ──
+// по умолчанию: живой голос Дмитрий без обработки, читаем вслух ответы на голосовые (запасной голос — Евгений на компьютере)
+let voiceCfg = { read: "voice", style: "plain", name: "ru-RU-DmitryNeural", wake: "off" };
+try { Object.assign(voiceCfg, JSON.parse(localStorage.getItem("troy-voice") || "{}")); } catch {}
+let liveVoices = null;                          // какие живые голоса сейчас работают (проверяет сервер)
+async function loadVoices() {
+  if (liveVoices && liveVoices.length) return;
+  voiceNote("Проверяю, какие живые голоса сейчас работают…");
+  try {
+    const r = await fetch(BASE + "/tts/voices");
+    const j = await r.json();
+    if (!r.ok || !Array.isArray(j.voices)) { liveVoices = null; voiceNote(""); return; }   // ещё не вошли — спросим позже
+    liveVoices = j.voices;
+  } catch { liveVoices = null; voiceNote(""); return; }
+  const box = $("v-name");
+  if (liveVoices.length) {
+    box.innerHTML = "";
+    for (const v of liveVoices) {
+      const b = document.createElement("button"); b.dataset.v = v.id; b.textContent = v.name;
+      b.title = (v.sex === "м" ? "мужской" : "женский") + (v.id.startsWith("ru-") ? "" : ", многоязычный — говорит и по-русски");
+      b.onclick = (e) => { e.stopPropagation(); voiceCfg.name = v.id; saveVoice(); drawVoice(); speak("Привет. Теперь я говорю так."); };
+      box.appendChild(b);
+    }
+    const ids = liveVoices.map((v) => v.id);
+    const offline = ["dmitri", "ruslan", "denis", "irina"].includes(voiceCfg.name);
+    if (!offline && !ids.includes(voiceCfg.name) && voiceCfg.name !== "silero:eugene") {   // Евгений может ещё ставиться            // прежний голос перестал работать — берём первый мужской
+      voiceCfg.name = (liveVoices.find((v) => v.sex === "м") || liveVoices[0]).id; saveVoice();
+    }
+    voiceNote("");
+  } else voiceNote("Живые голоса сейчас недоступны — работают голоса без интернета.");
+  drawVoice();
+}
+let curAudio = null, speaking = false, viaWake = false, sayLater = "", dlTimer = null;
+function saveVoice() { try { localStorage.setItem("troy-voice", JSON.stringify(voiceCfg)); } catch {} }
+function drawVoice() {
+  for (const [id, key] of [["v-read", "read"], ["v-style", "style"], ["v-name", "name"], ["v-name2", "name"], ["v-wake", "wake"]])
+    document.querySelectorAll(`#${id} button`).forEach((b) => b.classList.toggle("on", b.dataset.v === voiceCfg[key]));
+  $("voice-btn").classList.toggle("on", voiceCfg.read !== "off");
+  $("voice-btn").classList.toggle("listening", wake.on);
+  $("voice-btn").title = "Голос Троя" + (wake.on ? " · слушаю «Трой, …»" : "");
+}
+function voiceNote(text) { $("v-note").textContent = text || ""; }
+let voiceCtx = null, curNodes = [], speakSeq = 0;
+function stopSpeak() {
+  speakSeq++;
+  for (const n of curNodes) { try { n.stop(); } catch {} }
+  curNodes = [];
+  if (curAudio) { try { curAudio.pause(); } catch {} curAudio = null; }
+  speaking = false;
+}
+// Длинный ответ режем на фразы: первая начинает звучать, пока готовятся следующие.
+function speechParts(text) {
+  let t = text.replace(/https?:\/\/\S+|magnet:\S+/g, " ").replace(/\s+/g, " ").trim();
+  if (t.length > 1400) { const cut = t.slice(0, 1400); t = cut.slice(0, Math.max(cut.lastIndexOf(". "), 600) + 1) + " Остальное — на экране."; }
+  const sents = t.match(/[^.!?…\n]+[.!?…]*\s*/g) || [t];
+  const out = []; let cur = "";
+  for (const s of sents) {
+    if (cur && (cur.length + s.length > 260 || (out.length === 0 && cur.length > 25))) { out.push(cur.trim()); cur = ""; }
+    cur += s;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+async function ttsChunk(text) {
+  const t0 = performance.now();
+  const r = await fetch(BASE + "/tts", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice: voiceCfg.name, style: voiceCfg.style }) });
+  if (r.status === 409) { const e = new Error("install"); e.install = await r.json(); throw e; }
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || ("код " + r.status)); }
+  const j = await r.json();
+  const t1 = performance.now();
+  const bufs = await Promise.all((j.files || []).map((f) => fetch(BASE + "/tts/file/" + f)
+    .then((x) => x.arrayBuffer()).then((b) => voiceCtx.decodeAudioData(b))));
+  return { bufs, fx: j.fx || {}, tts: Math.round(t1 - t0), decode: Math.round(performance.now() - t1) };
+}
+// «Расщепление» без помощи Microsoft: тот же голос ниже (ratio < 1) при той же длине — пересэмплирование
+// и сжатие обратно кусочками внахлёст. Лёгкая «зернистость» здесь к месту: тихий слой звучит механичнее.
+function synthLayer(ac, buf, ratio) {
+  const x = buf.getChannelData(0), n = x.length, sr = buf.sampleRate;
+  const ylen = Math.floor(n / ratio), y = new Float32Array(ylen);
+  for (let i = 0; i < ylen; i++) { const p = i * ratio, j = p | 0, f = p - j; y[i] = x[j] * (1 - f) + (j + 1 < n ? x[j + 1] : 0) * f; }
+  const N = 1024, Hs = 256, Ha = Hs / ratio, w = new Float32Array(N);
+  for (let i = 0; i < N; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
+  const out = new Float32Array(n), norm = new Float32Array(n);
+  for (let k = 0; k * Hs < n; k++) {
+    const o = k * Hs, a = Math.round(k * Ha);
+    for (let i = 0; i < N && o + i < n && a + i < ylen; i++) { out[o + i] += y[a + i] * w[i]; norm[o + i] += w[i]; }
+  }
+  for (let i = 0; i < n; i++) out[i] = norm[i] > 1e-3 ? out[i] / norm[i] : 0;
+  const b = ac.createBuffer(1, n, sr); b.copyToChannel(out, 0); return b;
+}
+// Общий выход «Сверхразума»: металл (резонансы, гудящая вибрация, флэнджер), бархат, ровная громкость
+// и реверберация металлического зала. Вернёт вход и узлы, которые нужно остановить в конце.
+function voiceOut(ac, fx, nodes) {
+  const master = ac.createGain(); master.gain.value = 0.95;
+  let tail = master;
+  const chain = (node) => { tail.connect(node); tail = node; return node; };
+  if (fx.metal) {
+    const sum = ac.createGain(); sum.gain.value = 0.85;                      // два коротких резонанса — «жесть»
+    tail.connect(sum);
+    for (const [ms, g] of [[1.6, 0.5], [3.1, 0.35]]) {
+      const d = ac.createDelay(0.01); d.delayTime.value = ms / 1000;
+      const gg = ac.createGain(); gg.gain.value = g; tail.connect(d); d.connect(gg); gg.connect(sum);
+    }
+    tail = sum;
+    const trem = chain(ac.createGain()); trem.gain.value = 0.89;             // электрическая вибрация 95 Гц
+    const osc = ac.createOscillator(); osc.frequency.value = 95;
+    const od = ac.createGain(); od.gain.value = 0.11; osc.connect(od); od.connect(trem.gain); osc.start(); nodes.push(osc);
+    const fl = ac.createGain();                                             // флэнджер: плавающая задержка 1±0.75 мс
+    const fd = ac.createDelay(0.01); fd.delayTime.value = 0.00175;
+    const flo = ac.createOscillator(); flo.frequency.value = 0.25;
+    const fdep = ac.createGain(); fdep.gain.value = 0.00075; flo.connect(fdep); fdep.connect(fd.delayTime); flo.start(); nodes.push(flo);
+    const fb = ac.createGain(); fb.gain.value = 0.25; fd.connect(fb); fb.connect(fd);
+    const wet = ac.createGain(); wet.gain.value = 0.4;
+    tail.connect(fl); tail.connect(fd); fd.connect(wet); wet.connect(fl); tail = fl;
+  }
+  if (fx.warm) {
+    const low = chain(ac.createBiquadFilter()); low.type = "lowshelf"; low.frequency.value = fx.bass_f || 180; low.gain.value = fx.bass ?? 3;
+    if (fx.presence) {                                                      // «звон»: подъём 2.5–5 кГц
+      const pr = chain(ac.createBiquadFilter()); pr.type = "peaking"; pr.frequency.value = fx.presence_f || 3500;
+      pr.Q.value = 0.9; pr.gain.value = fx.presence;
+    }
+    const high = chain(ac.createBiquadFilter()); high.type = "highshelf"; high.frequency.value = fx.treble_f || 6500; high.gain.value = fx.treble ?? (fx.metal ? -1 : -2.5);
+    const comp = chain(ac.createDynamicsCompressor());
+    comp.threshold.value = -22; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.2;
+  }
+  if (fx.hall) {                                                            // зал: отражения через 45, 90 и 150 мс
+    const sum = ac.createGain(); sum.gain.value = 0.75; tail.connect(sum);
+    for (const [ms, g] of [[45, 0.28], [90, 0.2], [150, 0.12]]) {
+      const d = ac.createDelay(0.5); d.delayTime.value = ms / 1000;
+      const gg = ac.createGain(); gg.gain.value = g; tail.connect(d); d.connect(gg); gg.connect(sum);
+    }
+    tail = sum;
+  }
+  const vol = chain(ac.createGain()); vol.gain.value = fx.metal ? 0.9 : 1;
+  vol.connect(ac.destination);
+  return master;
+}
+function playChunk(ac, master, c, t0) {           // одна фраза: голос, слой «расщепления», удвоение; вернёт время конца
+  const fx = c.fx, nodes = [];
+  const rate = fx.lower || 1;                       // ниже голос: играем чуть медленнее — тон и тембр опускаются
+  const main = ac.createBufferSource(); main.buffer = c.bufs[0]; main.playbackRate.value = rate;
+  main.connect(master); nodes.push(main);
+  const layerBuf = c.bufs[1] || (fx.synth_layer ? synthLayer(ac, c.bufs[0], fx.synth_layer) : null);
+  if (layerBuf && fx.layer) {
+    const l = ac.createBufferSource(); l.buffer = layerBuf; l.playbackRate.value = rate;
+    const lp = ac.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = fx.layer_lp || 2200;
+    const g = ac.createGain(); g.gain.value = fx.layer;
+    l.connect(lp); lp.connect(g); g.connect(master); nodes.push(l);
+  }
+  const end = t0 + c.bufs[0].duration / rate;
+  if (fx.chorus) {
+    const d = ac.createDelay(0.05); d.delayTime.value = fx.delay || 0.012;
+    const lfo = ac.createOscillator(); lfo.frequency.value = 0.3;
+    const depth = ac.createGain(); depth.gain.value = 0.003;
+    lfo.connect(depth); depth.connect(d.delayTime);
+    const g = ac.createGain(); g.gain.value = fx.chorus;
+    main.connect(d); d.connect(g); g.connect(master); lfo.start(t0); lfo.stop(end + 0.1);
+    nodes.push(lfo);
+  }
+  for (const n of nodes) if (n.buffer) { n.start(t0); if (n !== main) n.stop(end); }   // слой не длиннее голоса
+  curNodes.push(...nodes);
+  return end;
+}
+async function speak(text, onStart) {
+  const started = () => { if (onStart) { const f = onStart; onStart = null; f(); } };
+  text = String(text || "").trim(); if (!text || soundMode !== "all") return started();
+  stopSpeak(); const my = speakSeq; speaking = true; const tSpeak = performance.now();
+  try {
+    voiceCtx = voiceCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (voiceCtx.state === "suspended") await voiceCtx.resume();
+    const ac = voiceCtx, parts = speechParts(text);
+    let next = ttsChunk(parts[0]), t = 0, master = null;
+    for (let i = 0; i < parts.length; i++) {
+      let c;
+      try { c = await next; }
+      catch (e) {
+        if (my !== speakSeq) return;
+        if (e.install) { speaking = false; sayLater = text; voiceDownload(e.install); return started(); }
+        voiceNote("Не получилось озвучить: " + e.message);
+        if (i === 0) { speaking = false; return started(); }
+        break;
+      }
+      if (my !== speakSeq) return;                 // пока готовили — попросили замолчать
+      if (i + 1 < parts.length) next = ttsChunk(parts[i + 1]);
+      if (!master) {
+        master = voiceOut(ac, c.fx, curNodes);
+        fetch(`${BASE}/tts/timing?total=${Math.round(performance.now() - tSpeak)}&tts=${c.tts}&decode=${c.decode}`).catch(() => {});
+        setTimeout(started, Math.max(0, (Math.max(t, ac.currentTime + 0.03) - ac.currentTime) * 1000));
+      }
+      t = Math.max(t, ac.currentTime + 0.03);
+      t = playChunk(ac, master, c, t) + 0.12;
+    }
+    setTimeout(() => {
+      if (my !== speakSeq) return;
+      for (const n of curNodes) { try { n.stop(); } catch {} }               // вибрация и флэнджер — тоже стоп
+      curNodes = []; speaking = false;
+      if (wake.on) wake.followUntil = Date.now() + 8000;
+    }, Math.max(0, (t - ac.currentTime) * 1000) + 500);                    // + хвост эха
+  } catch (e) { if (my === speakSeq) { speaking = false; voiceNote("Не получилось озвучить: " + (e && e.message || e)); } }
+  started();
+}
+function voiceDownload(st) {                    // голос ещё не скачан — качаем один раз и показываем, сколько осталось
+  if (st && st.error && !st.busy) { voiceNote("⚠️ " + st.error + ". Нажми «Послушать», чтобы попробовать снова."); return; }
+  voiceNote("Скачиваю голос Троя — один раз, около 85 МБ…");
+  if (dlTimer) return;
+  dlTimer = setInterval(async () => {
+    try {
+      const s = await (await fetch(BASE + "/tts/status?voice=" + voiceCfg.name)).json();
+      if (s.ready) { clearInterval(dlTimer); dlTimer = null; voiceNote("Голос готов."); if (sayLater) { const t = sayLater; sayLater = ""; speak(t); } return; }
+      if (s.error && !s.busy) { clearInterval(dlTimer); dlTimer = null; voiceNote("⚠️ " + s.error); return; }
+      voiceNote(`Скачиваю ${s.step || "голос"}${s.pct ? " — " + s.pct + "%" : "…"} (один раз)`);
+    } catch {}
+  }, 1500);
+}
+for (const [id, key] of [["v-read", "read"], ["v-style", "style"], ["v-name", "name"], ["v-name2", "name"], ["v-wake", "wake"]])
+  document.querySelectorAll(`#${id} button`).forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation(); voiceCfg[key] = b.dataset.v;
+    if (key === "style" && b.dataset.v === "mind" && voiceCfg.name === "irina") voiceCfg.name = "dmitri";   // сверхразуму — мужской голос
+    saveVoice(); drawVoice();
+    if (key === "wake") { if (b.dataset.v === "on") wakeStart(); else wakeStop(); }
+    if (key === "style" || key === "name") speak(key === "name" ? "Привет. Теперь я говорю так." : "Я слушаю. Все системы под контролем.");
+  }));
+$("v-test").onclick = (e) => { e.stopPropagation(); if (soundMode !== "all") return flash("Звук выключен (колокольчик в шапке) — включи «Все звуки», чтобы послушать голос."); speak(`Привет. Я ${botName}. Все системы работают штатно.`); };
+$("v-stop").onclick = (e) => { e.stopPropagation(); stopSpeak(); };
+$("voice-btn").onclick = (e) => {
+  e.stopPropagation(); $("snd-menu").classList.remove("show"); $("hk-pop").classList.remove("show"); $("about-pop").classList.remove("show");
+  $("voice-pop").classList.toggle("show");
+  if ($("voice-pop").classList.contains("show")) loadVoices();
+};
+$("voice-pop").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", (e) => { if (!e.target.closest(".snd-wrap")) $("voice-pop").classList.remove("show"); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && speaking) stopSpeak(); });
+
+// «Трой, …»: микрофон слушает тишину; заговорили — пишем фразу, замолчали — сервер распознаёт.
+// Начинается с «Трой» — выполняем. После ответа вслух 8 секунд можно продолжать без «Трой».
+const wake = { on: false, stream: null, ac: null, an: null, rec: null, chunks: [], started: 0, speech: 0, loud: 0,
+  loudSince: 0, inSpeech: false, floor: 0.008, timer: null, followUntil: 0 };
+const WAKE_RE = /^[\s"«]*(?:(?:эй|хей|окей|ок)[\s,]+)?(?:трой|трои|троя|трою|трое|строй|трэй|трей|троий|troy)(?=[\s,.!?:;—-]|$)[\s,.!?:;—-]*(.*)$/i;
+async function wakeStart() {
+  if (wake.on) return;
+  try { wake.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+  catch (e) { micError(e); voiceCfg.wake = "off"; saveVoice(); drawVoice(); return; }
+  wake.ac = new (window.AudioContext || window.webkitAudioContext)();
+  wake.an = wake.ac.createAnalyser(); wake.an.fftSize = 1024;
+  wake.ac.createMediaStreamSource(wake.stream).connect(wake.an);
+  wake.on = true; wakeNewRec(); wake.timer = setInterval(wakeTick, 50); drawVoice();
+  voiceNote("Слушаю: скажи «Трой» и вопрос. Работает, пока окно Троя открыто.");
+}
+function wakeStop() {
+  wake.on = false; clearInterval(wake.timer);
+  try { if (wake.rec && wake.rec.state !== "inactive") { wake.rec.onstop = null; wake.rec.stop(); } } catch {}
+  if (wake.stream) wake.stream.getTracks().forEach((t) => t.stop());
+  if (wake.ac) wake.ac.close().catch(() => {});
+  Object.assign(wake, { stream: null, ac: null, rec: null }); drawVoice(); voiceNote("");
+}
+function wakeNewRec() {
+  if (!wake.on) return;
+  wake.chunks = []; wake.inSpeech = false; wake.loudSince = 0;
+  wake.rec = new MediaRecorder(wake.stream, { mimeType: "audio/webm" });
+  wake.rec.ondataavailable = (e) => e.data.size && wake.chunks.push(e.data);
+  wake.rec.start(250); wake.started = Date.now();
+}
+function wakeRestart() { try { wake.rec.onstop = null; wake.rec.stop(); } catch {} wakeNewRec(); }
+function wakeLevel() {
+  const a = new Float32Array(wake.an.fftSize); wake.an.getFloatTimeDomainData(a);
+  let s = 0; for (const v of a) s += v * v; return Math.sqrt(s / a.length);
+}
+function wakeTick() {
+  if (!wake.on || !wake.rec) return;
+  const now = Date.now();
+  if (busy || speaking || rec) { if (!wake.inSpeech && now - wake.started > 1000) wakeRestart(); return; }   // сам Трой говорит — не слушаем
+  const level = wakeLevel(), thr = Math.max(0.012, wake.floor * 3);
+  if (level > thr) {
+    if (!wake.inSpeech) { wake.loudSince = wake.loudSince || now; if (now - wake.loudSince > 150) { wake.inSpeech = true; wake.speech = now; } }
+    wake.loud = now;
+  } else {
+    wake.loudSince = 0;
+    if (!wake.inSpeech) wake.floor = wake.floor * 0.98 + level * 0.02;      // подстраиваемся под шум в комнате
+  }
+  if (wake.inSpeech && (now - wake.loud > 1100 || now - wake.speech > 20000)) wakeFinish();
+  else if (!wake.inSpeech && now - wake.started > 8000) wakeRestart();     // тишина — запись не копим
+}
+function wakeFinish() {
+  const r = wake.rec; wake.rec = null;
+  r.onstop = () => { const blob = new Blob(wake.chunks, { type: "audio/webm" }); wakeNewRec(); if (blob.size > 3000) wakeHeard(blob); };
+  try { r.stop(); } catch { wakeNewRec(); }
+}
+async function wakeHeard(blob) {
+  const follow = Date.now() < wake.followUntil;
+  let text = "";
+  try {
+    const r = await fetch(BASE + "/stt", { method: "POST", body: blob });
+    if (!r.ok) return;
+    text = ((await r.json()).text || "").trim();
+  } catch { return; }
+  if (!text) return;
+  const m = text.match(WAKE_RE);
+  let cmd = "";
+  if (m) {
+    cmd = m[1].trim();
+    if (!cmd) { play("sent"); wake.followUntil = Date.now() + 8000; voiceNote("Слушаю…"); return; }   // просто «Трой» — ждём вопрос
+  } else if (follow && !/^(продолжение следует|субтитры|спасибо за просмотр|редактор субтитров)/i.test(text)) {
+    cmd = text;                                                    // продолжение разговора — без «Трой»
+  }
+  if (!cmd || busy) return;
+  wake.followUntil = 0; voiceNote("Слушаю: скажи «Трой» и вопрос.");
+  input.value = cmd; viaWake = true; send();
+}
+drawVoice();
+if (voiceCfg.wake === "on") wakeStart();
+for (const ms of [5000, 30000]) setTimeout(() => loadVoices().catch(() => {}), ms);   // заранее узнать рабочие живые голоса (после входа)
 // нажатие клавиши (в любой программе) → как кнопка 🎤
 // клавиша голоса: держишь — пишет, отпустил — отправил; короткое нажатие — закрепить, следующее — отправить
 let hkPressAt = 0;
@@ -1311,6 +1662,7 @@ async function poll() {
       const reminder = e.text.startsWith("⏰");
       addBox(reminder ? "alert" : "info", e.text, e.ts);
       if (reminder) toast(e.text);
+      if (voiceCfg.read === "all") speak(e.text);
       play(reminder ? "reminder" : "received");
     }
     setStatus(true, "на связи");
