@@ -24,6 +24,9 @@ SetupIconFile=troy.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName} — личный ассистент Трой
 WizardStyle=modern
+; картинки установщика: Трой слева на первой и последней страницах и в углу шапки (под разный масштаб экрана)
+WizardImageFile=installer\wizard-164x314.bmp,installer\wizard-192x386.bmp,installer\wizard-246x459.bmp,installer\wizard-273x556.bmp,installer\wizard-328x604.bmp,installer\wizard-355x700.bmp,installer\wizard-410x797.bmp
+WizardSmallImageFile=installer\wizard-small-55x55.bmp,installer\wizard-small-64x68.bmp,installer\wizard-small-83x80.bmp,installer\wizard-small-92x97.bmp,installer\wizard-small-110x106.bmp,installer\wizard-small-119x123.bmp,installer\wizard-small-138x140.bmp
 VersionInfoVersion={#AppVersion}
 VersionInfoCompany=Claude и Egor Zhidetskiy
 VersionInfoCopyright=© 2026 Claude и Egor Zhidetskiy
