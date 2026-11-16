@@ -975,7 +975,8 @@ THINK_RE = re.compile(r"<think>.*?</think>", re.S)
 
 
 def clean_answer(text: Optional[str]) -> str:
-    return THINK_RE.sub("", text or "").strip()
+    """Ответ модели без её «размышлений» и без ссылок на источники вида [sources=[1]], [1]."""
+    return speech_text.strip_cites(THINK_RE.sub("", text or "")).strip()
 
 
 def pdf_text(data: bytes) -> str:

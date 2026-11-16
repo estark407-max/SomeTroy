@@ -1224,7 +1224,8 @@ function stopSpeak() {
 function speechParts(text) {
   let t = text.replace(/https?:\/\/\S+|magnet:\S+/g, " ").replace(/\s+/g, " ").trim();
   if (t.length > 1400) { const cut = t.slice(0, 1400); t = cut.slice(0, Math.max(cut.lastIndexOf(". "), 600) + 1) + " Остальное — на экране."; }
-  const sents = t.match(/[^.!?…\n]+[.!?…]*\s*/g) || [t];
+  // фраза кончается точкой и следующая начинается с заглавной или цифры: «мм рт. ст., влажность» — не разрыв
+  const sents = t.split(/(?<=[.!?…])\s+(?=[А-ЯЁA-Z0-9«"(+\-–—])/).map((s) => s + " ");
   const out = []; let cur = "";
   for (const s of sents) {
     if (cur && (cur.length + s.length > 260 || (out.length === 0 && cur.length > 25))) { out.push(cur.trim()); cur = ""; }
