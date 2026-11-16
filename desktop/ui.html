@@ -178,6 +178,17 @@ main { flex: 1; overflow-y: auto; scroll-behavior: smooth; }
 .tabs button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tabs button i { font-style: normal; opacity: .6; padding: 0 2px; border-radius: 4px; }
 .tabs button i:hover { opacity: 1; background: var(--accent-soft); }
+.tabs button.plus { padding: 6px 11px; color: var(--muted); }
+/* кнопки браузера над вкладкой сайта */
+.tabnav { display: flex; align-items: center; gap: 4px; padding: 5px 12px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.tabnav[hidden] { display: none; }
+.tabnav button { width: 30px; height: 28px; flex: none; border: 0; border-radius: 8px; background: transparent; color: var(--text);
+  font: inherit; font-size: 16px; line-height: 1; cursor: pointer; }
+.tabnav button:hover:not(:disabled) { background: var(--chip); }
+.tabnav button:disabled { opacity: .3; cursor: default; }
+.tabnav input { flex: 1; min-width: 0; height: 28px; border: 1px solid var(--line); border-radius: 8px; padding: 0 10px;
+  background: var(--chip); color: var(--text); font: inherit; font-size: 13px; }
+.tabnav input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
 .msg.user .bubble {
   background: var(--user); color: var(--user-text);
   padding: 9px 15px; border-radius: 18px 18px 6px 18px;
@@ -636,6 +647,12 @@ THEME_DARK.addEventListener("change", applyTheme);
 <div class="grip n" data-edge="n"></div><div class="grip s" data-edge="s"></div><div class="grip w" data-edge="w"></div><div class="grip e" data-edge="e"></div>
 <div class="grip nw" data-edge="nw"></div><div class="grip ne" data-edge="ne"></div><div class="grip sw" data-edge="sw"></div><div class="grip se" data-edge="se"></div>
 <nav class="tabs" id="tabs" hidden></nav>
+<div class="tabnav" id="tabnav" hidden>
+  <button type="button" id="nav-back" title="Назад (Alt+←)">←</button>
+  <button type="button" id="nav-fwd" title="Вперёд (Alt+→)">→</button>
+  <button type="button" id="nav-reload" title="Обновить (F5)">⟳</button>
+  <input id="nav-url" type="text" spellcheck="false" autocomplete="off" placeholder="Адрес сайта или что найти">
+</div>
 
 <main id="scroller">
   <div class="feed" id="feed"></div>
@@ -782,22 +799,61 @@ function addDay(ts) {
 }
 // ── вкладки сайтов: окно сайта встаёт под этой полоской, «💬 Чат» — обратно к переписке ──
 let tabsSig = "";
-function tabsTop() {                                    // где кончается полоска вкладок — в настоящих пикселях
-  const t = $("tabs"); return Math.round(t.getBoundingClientRect().bottom * (window.devicePixelRatio || 1));
+function tabsTop() {                                    // где кончается полоска вкладок (и кнопок браузера) — в настоящих пикселях
+  const t = $("tabnav").hidden ? $("tabs") : $("tabnav");
+  return Math.round(t.getBoundingClientRect().bottom * (window.devicePixelRatio || 1));
 }
+let navTab = null;                                       // вкладка, к которой относятся кнопки браузера
+function drawNav(list) {
+  const cur = list.find((x) => x.active && x.nav);
+  const bar = $("tabnav"), wasHidden = bar.hidden;
+  bar.hidden = !cur; navTab = cur ? cur.id : null;
+  if (!cur) return wasHidden;
+  $("nav-back").disabled = !cur.back; $("nav-fwd").disabled = !cur.fwd;
+  const rl = $("nav-reload"); rl.textContent = cur.loading ? "✕" : "⟳";
+  rl.title = cur.loading ? "Остановить загрузку (Esc)" : "Обновить (F5)";
+  const u = $("nav-url"); if (document.activeElement !== u) u.value = cur.url || "";
+  return wasHidden;
+}
+function tabNav(action, url) {
+  if (navTab == null) return;
+  fetch(BASE + "/tabs/nav", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: navTab, action, url: url || "" }) }).then((x) => x.json()).then((r) => r && drawTabs(r.tabs || [])).catch(() => {});
+}
+function sendTabsTop() {
+  fetch(BASE + "/tabs/layout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ top: tabsTop() }) }).catch(() => {});
+}
+$("nav-back").onclick = () => tabNav("back");
+$("nav-fwd").onclick = () => tabNav("forward");
+$("nav-reload").onclick = () => tabNav($("nav-reload").textContent === "✕" ? "stop" : "reload");
+$("nav-url").onkeydown = (e) => {
+  if (e.key === "Enter" && e.target.value.trim()) { tabNav("go", e.target.value.trim()); e.target.blur(); }
+  if (e.key === "Escape") { e.target.blur(); tabsSig = ""; pollTabs(); }
+};
+$("nav-url").onfocus = (e) => setTimeout(() => e.target.select(), 0);
 function drawTabs(list) {
   const t = $("tabs"); const sig = JSON.stringify(list);
   if (sig === tabsSig) return; tabsSig = sig;
   t.hidden = !list.length;
+  const navWasHidden = drawNav(list);
   const any = list.some((x) => x.active);
+  const canNew = list.some((x) => x.nav);              // новая вкладка — только во вкладках окна (WebView2)
   t.innerHTML = `<button data-id="" class="${any ? "" : "on"}">💬 <span>Чат</span></button>` + list.map((x) =>
-    `<button data-id="${x.id}" class="${x.active ? "on" : ""}" title="${esc(x.title)}">${x.mode === "server" ? "🛡" : "🌐"} <span>${esc(x.title || x.host)}</span><i data-close="${x.id}" title="Закрыть">×</i></button>`).join("");
+    `<button data-id="${x.id}" class="${x.active ? "on" : ""}" title="${esc(x.title)}">${x.mode === "server" ? "🛡" : "🌐"} <span>${esc(x.title || x.host)}</span><i data-close="${x.id}" title="Закрыть">×</i></button>`).join("") +
+    (canNew ? `<button class="plus" data-new="1" title="Новая вкладка">+</button>` : "");
   t.querySelectorAll("button").forEach((b) => (b.onclick = async (e) => {
+    if (b.dataset.new) {                                 // «+»: новая вкладка, адрес — в строке сверху
+      const r = await fetch(BASE + "/tabs/new", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" })
+        .then((x) => x.json()).catch(() => null);
+      if (r) { drawTabs(r.tabs || []); setTimeout(() => $("nav-url").focus(), 300); }
+      return;
+    }
     const close = e.target.closest("[data-close]");
     const r = await fetch(BASE + (close ? "/tabs/close" : "/tabs/show"), { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: close ? +close.dataset.close : (b.dataset.id ? +b.dataset.id : null), top: tabsTop() }) }).then((x) => x.json()).catch(() => null);
     if (r) drawTabs(r.tabs || []);
   }));
+  if (navWasHidden !== $("tabnav").hidden) sendTabsTop();   // строка кнопок появилась или спряталась — сайт сдвигаем
 }
 let siteActive = false;
 function toChat() {                                     // окно сайта закрывает собой страницу Троя: меню и окна — только в чате
@@ -811,9 +867,7 @@ async function pollTabs() {
   if (!r) return;
   const had = !$("tabs").hidden; drawTabs(r.tabs || []);
   siteActive = (r.tabs || []).some((t) => t.active);
-  if (!had && !$("tabs").hidden || (r.tabs || []).length) {   // полоска только что появилась или сменилась — сообщаем высоту
-    fetch(BASE + "/tabs/layout", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ top: tabsTop() }) }).catch(() => {});
-  }
+  if (!had && !$("tabs").hidden || (r.tabs || []).length) sendTabsTop();   // полоска появилась или сменилась — сообщаем высоту
 }
 setInterval(pollTabs, 1200);
 window.addEventListener("resize", () => { if (!$("tabs").hidden) pollTabs(); });
@@ -1222,7 +1276,9 @@ function stopSpeak() {
 }
 // Длинный ответ режем на фразы: первая начинает звучать, пока готовятся следующие.
 function speechParts(text) {
-  let t = text.replace(/https?:\/\/\S+|magnet:\S+/g, " ").replace(/\s+/g, " ").trim();
+  let t = text.replace(/^[ \t]*(?:[-•*][ \t]*)?(?:источник(?:и)?|sources?|ссылк[аи]|подробнее)[ \t]*[:—-].*$/gim, "")   // источники не читаем
+    .replace(/\[([^\]]+)\]\((?:https?:\/\/|www\.)[^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+|magnet:\S+|\bwww\.\S+/g, " ").replace(/\s+/g, " ").trim();
   if (t.length > 1400) { const cut = t.slice(0, 1400); t = cut.slice(0, Math.max(cut.lastIndexOf(". "), 600) + 1) + " Остальное — на экране."; }
   // фраза кончается точкой и следующая начинается с заглавной или цифры: «мм рт. ст., влажность» — не разрыв
   const sents = t.split(/(?<=[.!?…])\s+(?=[А-ЯЁA-Z0-9«"(+\-–—])/).map((s) => s + " ");

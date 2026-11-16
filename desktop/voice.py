@@ -348,8 +348,19 @@ CITE_RE = re.compile(r"\s*\[(?:sources?|source_ids?|источники?|ref)\s*[
                      r"\s*\[\d{1,2}(?:\s*[,–-]\s*\d{1,2})*\](?!\()", re.I)
 
 
+# строки «Источник: …» и ссылки голос не читает: источник виден на экране
+SOURCE_LINE = re.compile(r"(?im)^[ \t]*(?:[-•*][ \t]*)?(?:источник(?:и)?|sources?|ссылк[аи]|подробнее)[ \t]*[:—-].*$")
+
+
+def no_sources(text: str) -> str:
+    t = strip_cites(text)
+    t = SOURCE_LINE.sub("", t)
+    t = re.sub(r"\((?:источник|по данным|данные)[^)]*\)", "", t, flags=re.I)
+    return re.sub(r"\[([^\]]+)\]\((?:https?://|www\.)[^)]*\)", r"\1", t)        # [текст](ссылка) → текст
+
+
 def clean(text: str, limit: int = 900) -> str:
-    t = re.sub(r"https?://\S+|magnet:\S+", " ссылка ", strip_cites(text))
+    t = re.sub(r"https?://\S+|magnet:\S+|\bwww\.\S+", " ", no_sources(text))   # ссылки и источники не читаем
     t = EMOJI.sub("", t)
     t = re.sub(r"[*_`#>|]+", "", t)
     t = say_units(t.replace("№", "номер "))

@@ -28,7 +28,7 @@ log = logging.getLogger("troy.shell")
 
 S = {"form": None, "ui": None, "url": "", "ready": threading.Event(), "failed": False, "error": "",
      "top": 0, "active": None, "on_fail": None, "visible": False, "bg": (11, 15, 23)}
-TABS: dict = {}                           # id -> {"view", "url", "host", "mode", "title"}
+TABS: dict = {}                           # id -> {"view", "url", "host", "mode", "title", "port", "loading", "back", "fwd"}
 _ids = itertools.count(1)
 _lock = threading.Lock()
 _NET: dict = {}                           # загруженные классы .NET
@@ -416,7 +416,8 @@ def open_tab(url: str, host: str, mode: str, proxy_port: int = 0) -> tuple:
         S["top"] = int(100 * _dpi_scale())
     with _lock:
         tid = next(_ids)
-        TABS[tid] = {"view": None, "url": url, "host": host, "mode": mode, "title": host}
+        TABS[tid] = {"view": None, "url": url, "host": host, "mode": mode, "title": host, "port": proxy_port,
+                     "loading": True, "back": False, "fwd": False}
 
     def run():
         N = _NET
@@ -439,11 +440,36 @@ def open_tab(url: str, host: str, mode: str, proxy_port: int = 0) -> tuple:
                 if t:
                     t["title"] = (str(core.DocumentTitle) or host)[:60]
 
-            def new_win(_s2, e):                              # «открыть в новом окне» — в этой же вкладке
+            def new_win(_s2, e):                              # «открыть в новом окне» — новой вкладкой рядом
                 e.Handled = True
-                core.Navigate(e.Uri)
+                u = str(e.Uri)
+                if not u.startswith(("http://", "https://")):
+                    return
+                threading.Thread(target=open_tab, args=(u, u.split("://", 1)[-1].split("/")[0], mode, proxy_port),
+                                 daemon=True).start()
+
+            def state(*_):                                    # для кнопок «назад», «вперёд», «обновить/стоп»
+                t = TABS.get(tid)
+                if t:
+                    t["back"], t["fwd"] = bool(core.CanGoBack), bool(core.CanGoForward)
+                    t["url"] = str(core.Source) or t["url"]
+
+            def started_nav(*_):
+                t = TABS.get(tid)
+                if t:
+                    t["loading"] = True
+
+            def done_nav(*_):
+                t = TABS.get(tid)
+                if t:
+                    t["loading"] = False
+                state()
             core.DocumentTitleChanged += _safe(title)
             core.NewWindowRequested += _safe(new_win)
+            core.HistoryChanged += _safe(state)
+            core.SourceChanged += _safe(state)
+            core.NavigationStarting += _safe(started_nav)
+            core.NavigationCompleted += _safe(done_nav)
             core.WindowCloseRequested += _safe(lambda *_: threading.Thread(target=close, args=(tid,), daemon=True).start())
         v.CoreWebView2InitializationCompleted += _safe(ready)
         S["form"].Controls.Add(v)
@@ -492,8 +518,39 @@ def close(tid) -> None:
 
 def listing() -> list:
     with _lock:
-        return [{"id": i, "title": t["title"], "host": t["host"], "mode": t["mode"], "active": i == S["active"]}
-                for i, t in list(TABS.items())]
+        return [{"id": i, "title": t["title"], "host": t["host"], "mode": t["mode"], "active": i == S["active"],
+                 "url": t["url"], "loading": t.get("loading", False), "back": t.get("back", False),
+                 "fwd": t.get("fwd", False), "nav": True} for i, t in list(TABS.items())]
+
+
+def nav(tid, action: str, url: str = "") -> None:
+    """Кнопки браузера над вкладкой сайта: назад, вперёд, обновить, остановить загрузку."""
+    def run():
+        t = TABS.get(tid)
+        core = t["view"].CoreWebView2 if t and t["view"] is not None else None
+        if core is None:
+            return
+        if action == "back" and core.CanGoBack:
+            core.GoBack()
+        elif action == "forward" and core.CanGoForward:
+            core.GoForward()
+        elif action == "reload":
+            t["loading"] = True
+            core.Reload()
+        elif action == "stop":
+            core.Stop()
+            t["loading"] = False
+        elif action == "go" and url:
+            t["loading"] = True
+            core.Navigate(url)
+    _ui(run)
+
+
+def new_tab(url: str) -> tuple:
+    """Новая вкладка рядом с текущей — в том же режиме (напрямую или через сервер)."""
+    cur = TABS.get(S["active"]) or (TABS[max(TABS)] if TABS else None)
+    mode, port = (cur["mode"], cur.get("port", 0)) if cur else ("direct", 0)
+    return open_tab(url, url.split("://", 1)[-1].split("/")[0], mode, port)
 
 
 def wait_ready(timeout: float = 15) -> bool:

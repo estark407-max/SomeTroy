@@ -26,7 +26,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -953,6 +953,25 @@ def make_handler(remote: Remote, key: str):
                         threading.Thread(target=close_window, daemon=True).start()
                 self.send(200, jbytes({"max": window_frame.is_max(hwnd)}))
                 return
+            if path in ("/tabs/nav", "/tabs/new") and _shell() and _shell().started():    # кнопки браузера и «+»
+                sh = _shell()
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                ok, text = True, ""
+                url = str(data.get("url") or "").strip()
+                if url and not re.match(r"^[a-z]+://", url, re.I):      # адрес без https:// или просто слова — поиск
+                    url = ("https://" + url) if re.match(r"^[\w.-]+\.[a-zа-яё]{2,}(?:[/:?#]|$)", url, re.I) \
+                        else "https://ya.ru/search/?text=" + quote(url)
+                if url and not re.match(r"^https?://", url, re.I):
+                    ok, text = False, "открываю только сайты (http и https)"
+                elif path == "/tabs/nav":
+                    sh.nav(data.get("id"), str(data.get("action") or ""), url)
+                else:
+                    ok, text = sh.new_tab(url or "https://ya.ru/")
+                self.send(200, jbytes({"ok": ok, "text": text, "tabs": sh.listing()}))
+                return
             if path in ("/tabs/show", "/tabs/close", "/tabs/layout") and _shell() and _shell().started():
                 sh = _shell()
                 try:
@@ -1249,9 +1268,11 @@ WHATS_NEW = [
    "Траты: пришли фото чека — Трой запишет покупку по категориям; «сколько я потратил на продукты в этом месяце», таблица для Excel.",
    "Утренняя сводка: погода, напоминания и календарь на сегодня, задачи Битрикса, траты за месяц — /brief 7:30.",
    "Трой пишет сам: за час до срока задачи в Битриксе, о новых личных сообщениях там и о письмах от важных отправителей (/alerts). Ночью молчит и рассказывает утром.",
+   "Браузер Троя: над открытым сайтом — «назад», «вперёд», «обновить/остановить» и строка адреса; «+» — новая вкладка, ссылки «в новом окне» открываются отдельной вкладкой.",
    "GigaChat (Сбер) в «Подключениях»: сильная русскоязычная модель, для физлиц — бесплатный пакет на год. Отвечает первой, модели Groq и Mistral остаются запасными."],
   "fixed": [
    "Короткие простые вопросы отвечает быстрая модель — за 1–2 секунды.",
+   "Ссылки и строки «Источник: …» голос не зачитывает — они остаются на экране.",
    "Голос читает сокращения словами и в нужной форме: «5 м/с» — «пять метров в секунду», «−3°C» — «минус три градуса», «81%»; из ответов убраны пометки вроде [sources=[1]].",
    "На «спасибо» Трой отвечает сразу и не повторяет прошлый поиск; пробки, погоду и курсы называет только по свежим данным, без выдумок.",
    "Время в другом городе Трой считает сам, а не ищет в интернете (поиск давал устаревшее время).",
